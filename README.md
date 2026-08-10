@@ -162,6 +162,8 @@ this list grows as they are confirmed.
 | Thinknode M7 | Meshtastic | ✅ | ⚠️ |
 | RAK WisMesh Pocket V2 | Meshtastic | ✅ | ⬜ |
 | Seeed Studio T1000-E | Meshtastic | ✅ | ⬜ |
+| Seeed Studio MeshTracker X1 | Meshtastic | ✅ | ⬜ |
+| Seeed Studio MeshTracker X1 | MeshCore | ✅ | ⬜ |
 
 Key: ✅ confirmed reliable, ⚠️ works but the link is unreliable, ⬜ not tested yet.
 
