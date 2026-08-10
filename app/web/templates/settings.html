@@ -118,6 +118,25 @@
       {% set radio='meshcore' %}{% set live_field='meshcore_channel' %}{% set test_field='meshcore_test_channel' %}{% set live_val=mc_channel %}{% set test_val=mc_test %}{% set channels=mc_channels %}{% set connected=mc_connected %}{% set model=mc_model %}{% set error='' %}
       <div style="margin-top:10px;">{% include "_radio_channels.html" %}</div>
     </div>
+
+    <div class="radio-card">
+      <label class="chk"><input type="checkbox" name="bridge_enabled" {% if br_enabled %}checked{% endif %}> <b>Meridian bridge</b></label>
+      <p class="hint">Transmit through an existing <a href="https://github.com/aebconsulting/mesh-ai-bridge">mesh-ai-bridge</a>
+        instead of opening a radio here. The bridge stays the single owner of its radio; alerts get its
+        delivery tracking and appear in the Meridian dashboard feed. Test sends go as a <b>direct message</b>
+        to the node below, keeping tests off the live channel.</p>
+      <label>Bridge send API URL</label>
+      <input name="bridge_url" value="{{ br_url }}" placeholder="http://nomad_custom_mesh_ai_bridge:8700">
+      <div class="row" style="margin-top:8px;">
+        <div><label>Send token (the bridge's <code>SEND_TOKEN</code>)</label>
+          <input name="bridge_token" type="password" autocomplete="off" value="{{ br_token }}"></div>
+        <div><label>Test DM target (node id)</label>
+          <input name="bridge_test_dm" value="{{ br_test_dm }}" placeholder="!1d1ea7ae"></div>
+      </div>
+
+      {% set radio='bridge' %}{% set live_field='bridge_channel' %}{% set test_field='bridge_test_channel' %}{% set live_val=br_channel %}{% set test_val=br_test %}{% set channels=br_channels %}{% set connected=br_connected %}{% set model=br_model %}{% set error='' %}
+      <div style="margin-top:10px;">{% include "_radio_channels.html" %}</div>
+    </div>
   </div>
 
   <script>

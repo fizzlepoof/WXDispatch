@@ -81,6 +81,14 @@ DEFAULT_SETTINGS: dict = {
     "meshcore_channel": 0,
     "meshcore_repeat": 2,
     "meshcore_test_channel": 1,
+    # Meridian bridge: send through an existing mesh-ai-bridge (the single radio
+    # owner) over its token-gated HTTP send API instead of opening a radio here.
+    "bridge_enabled": False,
+    "bridge_url": "",           # e.g. http://nomad_custom_mesh_ai_bridge:8700
+    "bridge_token": "",         # the bridge's SEND_TOKEN
+    "bridge_test_dm": "",       # node id (!hex8) that receives Troubleshoot test sends as a DM
+    "bridge_channel": 0,
+    "bridge_test_channel": -1,  # -1 = DM the test node (BridgeTransmitter sentinel)
     "dry_run": True,
     "test_channel": 1,   # tests + manual sends use this channel (keep off the live alert channel 0)
     "display_timezone": "",   # blank = use this computer's local time zone
@@ -97,7 +105,7 @@ POLL_INTERVAL_MIN = 60
 # timeout x a few retries), so exceeding this means something hung (DB lock,
 # wedged await, a bug). The watchdog aborts the poll so the loop always recovers.
 POLL_HARD_TIMEOUT = 180
-MAX_PAYLOAD_BYTES = 195
+MAX_PAYLOAD_BYTES = 190  # mesh-ai-bridge caps /api/send text at CHUNK_BYTES=190; keep every transport under it
 BURST_GAP_SECONDS = 30
 
 # Where this app lives, for the "Check for updates" button in Settings. The

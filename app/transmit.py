@@ -189,6 +189,102 @@ class MeshtasticTransmitter(Transmitter):
         return await asyncio.get_event_loop().run_in_executor(None, _read)
 
 
+class BridgeTransmitter(Transmitter):
+    """Sends through a mesh-ai-bridge (Meridian) HTTP send API instead of owning
+    a radio. The bridge is the single owner of its radio; this transport is just
+    another token-gated client of `POST /api/send`, so its messages get the
+    bridge's own delivery tracking (msg_log ack_state) and show up in the
+    Meridian dashboard feed.
+
+    Channel semantics: channel >= 0 broadcasts on that mesh channel (the bridge
+    gates allowed channels server-side); channel -1 is the TEST sentinel and
+    sends a direct message to `test_dm` instead, keeping tests off the live
+    channel on meshes that only run ch0."""
+
+    label = "Meridian bridge"
+
+    def __init__(self, url: str, token: str, test_dm: str = ""):
+        self.url = (url or "").rstrip("/")
+        self.token = token or ""
+        self.test_dm = (test_dm or "").strip()
+        self._client = None
+        self._node = ""   # bridge radio's long name, from /api/health
+
+    async def connect(self) -> None:
+        if self._client is not None:
+            await self.close()
+        import httpx
+        client = httpx.AsyncClient(base_url=self.url, timeout=10.0)
+        try:
+            r = await client.get("/api/health")
+            r.raise_for_status()
+            body = r.json() if r.content else {}
+            self._node = str(body.get("node") or "")
+        except Exception:
+            await client.aclose()
+            raise
+        self._client = client
+
+    async def send_text(self, text: str, channel: int) -> None:
+        if self._client is None:
+            raise RuntimeError("not connected")
+        import httpx
+        if channel < 0:
+            if not self.test_dm:
+                raise TxUnsent("no_channel", "no test DM target configured")
+            payload = {"text": text, "to": self.test_dm}
+        else:
+            payload = {"text": text, "channel": channel}
+        try:
+            r = await self._client.post("/api/send", json=payload,
+                                        headers={"X-Send-Token": self.token})
+        except httpx.HTTPError as exc:
+            raise TxUnsent("link", "bridge unreachable: %s" % exc)
+        if r.status_code == 200:
+            return
+        try:
+            detail = str((r.json() or {}).get("error") or "")
+        except Exception:
+            detail = (r.text or "")[:120]
+        msg = "bridge %d: %s" % (r.status_code, detail or "error")
+        if r.status_code == 429:
+            # per-minute bucket / send cooldown: wait it out, then retry
+            raise TxUnsent("duty_cycle", msg)
+        if r.status_code == 503:
+            # bridge up but its radio is down: reconnect path re-probes health
+            raise TxUnsent("link", msg)
+        if r.status_code == 401:
+            raise TxUnsent("no_channel", msg + " (check the bridge send token)")
+        if r.status_code == 400:
+            if "over" in detail and "byte" in detail:
+                raise TxUnsent("too_large", msg)
+            raise TxUnsent("no_channel", msg)   # bad destination/channel: config, not retryable
+        raise TxUnsent("unsent", msg)           # 502 radio send failed and friends: retry
+
+    async def close(self) -> None:
+        if self._client is not None:
+            client, self._client = self._client, None
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    @property
+    def connected(self) -> bool:
+        return self._client is not None
+
+    async def read_channels(self) -> list:
+        # Not a real channel table: the two rows mirror this transport's channel
+        # semantics so the standard live/test dropdowns stay meaningful.
+        dm = self.test_dm or "test node (set one above)"
+        return [{"index": 0, "name": "Mesh channel 0 (broadcast via bridge)"},
+                {"index": -1, "name": "Direct message to %s" % dm}]
+
+    async def read_info(self) -> dict:
+        return {"model": ("Meridian bridge via %s" % self._node) if self._node
+                else "Meridian bridge"}
+
+
 class MeshCoreTransmitter(Transmitter):
     label = "MeshCore"
 
@@ -357,7 +453,17 @@ def _build_transports(db) -> dict:
         make=lambda: MeshCoreTransmitter(mc_conn, g("meshcore_port", "") or "", g("meshcore_host", "") or ""),
         repeat=rep("meshcore_repeat"), test_channel=num("meshcore_test_channel", 1),
     )
-    return {"meshtastic": mt, "meshcore": mc}
+    br = Transport(
+        name="bridge", label="Meridian bridge",
+        enabled=bool(g("bridge_enabled", False)),
+        conn="http", channel=num("bridge_channel", 0),
+        target=(g("bridge_url", "") or "").strip(),
+        make=lambda: BridgeTransmitter((g("bridge_url", "") or "").strip(),
+                                       (g("bridge_token", "") or "").strip(),
+                                       (g("bridge_test_dm", "") or "").strip()),
+        repeat=1, test_channel=num("bridge_test_channel", -1),
+    )
+    return {"meshtastic": mt, "meshcore": mc, "bridge": br}
 
 
 class TransmitManager:
@@ -644,8 +750,14 @@ class TransmitManager:
                 except Exception:
                     pass
                 t.tx, t.connected = None, False
-            maker = MeshtasticTransmitter if name == "meshtastic" else MeshCoreTransmitter
-            tx = maker(conn or "serial", port or "", host or "")
+            if name == "bridge":
+                # the bridge backend has no serial side: `host` carries the API
+                # URL and `port` smuggles the send token (see routes._RADIO_FIELDS)
+                tx = BridgeTransmitter(host or "", port or "",
+                                       self._db.get_setting("bridge_test_dm", "") or "")
+            else:
+                maker = MeshtasticTransmitter if name == "meshtastic" else MeshCoreTransmitter
+                tx = maker(conn or "serial", port or "", host or "")
             try:
                 await tx.connect()
                 channels = await tx.read_channels()

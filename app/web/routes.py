@@ -483,6 +483,15 @@ async def settings_page(request: Request):
         mc_connected=_status_flag(request, "meshcore"),
         mt_model=s.get("meshtastic_model", "") or "",
         mc_model=s.get("meshcore_model", "") or "",
+        br_enabled=bool(s.get("bridge_enabled", False)),
+        br_url=s.get("bridge_url", "") or "",
+        br_token=s.get("bridge_token", "") or "",
+        br_test_dm=s.get("bridge_test_dm", "") or "",
+        br_channel=int(s.get("bridge_channel", 0) or 0),
+        br_test=int(s.get("bridge_test_channel", -1) if s.get("bridge_test_channel", -1) is not None else -1),
+        br_channels=s.get("bridge_channels", []) or [],
+        br_connected=_status_flag(request, "bridge"),
+        br_model=s.get("bridge_model", "") or "",
     )
 
 
@@ -512,6 +521,12 @@ async def save_settings(
     meshcore_channel: int = Form(0),
     meshtastic_test_channel: int = Form(1),
     meshcore_test_channel: int = Form(1),
+    bridge_enabled: str = Form(""),
+    bridge_url: str = Form(""),
+    bridge_token: str = Form(""),
+    bridge_test_dm: str = Form(""),
+    bridge_channel: int = Form(0),
+    bridge_test_channel: int = Form(-1),
 ):
     def _rep(v):
         try:
@@ -547,6 +562,15 @@ async def save_settings(
     db.set_setting("meshcore_channel", int(meshcore_channel))
     db.set_setting("meshtastic_test_channel", int(meshtastic_test_channel))
     db.set_setting("meshcore_test_channel", int(meshcore_test_channel))
+    dm = bridge_test_dm.strip()
+    if re.fullmatch(r"[0-9a-fA-F]{8}", dm):
+        dm = "!" + dm                     # accept a bare hex id; the bridge wants !hex8
+    db.set_setting("bridge_enabled", bool(bridge_enabled))
+    db.set_setting("bridge_url", bridge_url.strip().rstrip("/"))
+    db.set_setting("bridge_token", bridge_token.strip())
+    db.set_setting("bridge_test_dm", dm.lower() if dm.startswith("!") else dm)
+    db.set_setting("bridge_channel", int(bridge_channel))
+    db.set_setting("bridge_test_channel", int(bridge_test_channel))
 
     # Rebuild transports from the new settings and (re)connect the enabled ones.
     await tx.reconfigure()
@@ -569,13 +593,21 @@ _RADIO_FIELDS = {
                    "channel_index", "meshtastic_test_channel"),
     "meshcore":   ("meshcore_conn", "meshcore_port", "meshcore_host",
                    "meshcore_channel", "meshcore_test_channel"),
+    # bridge has no conn/serial side: the "port" slot carries the send token so
+    # the generic load-channels plumbing needs no second path (see transmit.py)
+    "bridge":     ("bridge_conn", "bridge_token", "bridge_url",
+                   "bridge_channel", "bridge_test_channel"),
 }
 
 
 _INCLUDE_SEL = {
     "meshtastic": "[name='meshtastic_conn'],[name='serial_port'],[name='meshtastic_host']",
     "meshcore": "[name='meshcore_conn'],[name='meshcore_port'],[name='meshcore_host']",
+    "bridge": "[name='bridge_url'],[name='bridge_token']",
 }
+
+# Channel dropdown defaults per field; the bridge test slot is the DM sentinel.
+_CHAN_DEFAULTS = {"bridge_test_channel": -1}
 
 
 def _channel_ctx(db, tx, name, channels=None, model=None, error="", connected=None):
@@ -586,12 +618,17 @@ def _channel_ctx(db, tx, name, channels=None, model=None, error="", connected=No
         model = db.get_setting(name + "_model", "") or ""
     if connected is None:  # reflect the live transport's real state
         connected = any(s["connected"] for s in tx.status() if s["name"] == name)
+    def _num(key, default):
+        try:
+            return int(db.get_setting(key, default))
+        except (TypeError, ValueError):
+            return default
     return dict(
         radio=name, channels=channels, error=error, connected=connected, model=model,
         include_sel=_INCLUDE_SEL[name],
         live_field=live_f, test_field=test_f,
-        live_val=int(db.get_setting(live_f, 0) or 0),
-        test_val=int(db.get_setting(test_f, 1) or 1),
+        live_val=_num(live_f, _CHAN_DEFAULTS.get(live_f, 0)),
+        test_val=_num(test_f, _CHAN_DEFAULTS.get(test_f, 1)),
     )
 
 
