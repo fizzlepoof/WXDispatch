@@ -15,6 +15,7 @@ class Alert:
     effective: str
     expires: str
     message_type: str  # "Alert", "Update", "Cancel"
+    status: str = "Actual"  # CAP status: Actual | Exercise | System | Test | Draft
     ends: str = ""      # when the HAZARD ends (for "until"); falls back to expires
     onset: str = ""     # when the hazard STARTS (for the upcoming-window display)
     detail: str = ""    # SPS threat summary, e.g. "Strong thunderstorm (60 mph wind)"
@@ -38,6 +39,7 @@ class Alert:
             effective=props.get("effective") or props.get("onset") or "",
             expires=props.get("expires") or props.get("ends") or "",
             message_type=(props.get("messageType") or "Alert").strip(),
+            status=(props.get("status") or "Actual").strip(),
             ends=props.get("ends") or props.get("expires") or "",
             onset=props.get("onset") or props.get("effective") or "",
             detail=cls._sps_detail(props) if event == "Special Weather Statement" else "",

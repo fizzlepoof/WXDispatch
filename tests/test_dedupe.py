@@ -86,3 +86,34 @@ def test_excluded_event_is_filtered(feature):
     a = Alert.from_feature(feature("severe_tstorm_watch"))
     d = decide(a, RULES, state.lookup)
     assert d.disposition == "filtered" and d.transmit is False
+
+
+def test_cap_test_status_is_filtered(feature):
+    # 2026-08-11 incident: the NWS National Tsunami Warning Center's monthly
+    # communications drill is a real-looking "Tsunami Warning" spanning 400+
+    # coastal zones (including ours); only status="Test" marks it as a drill.
+    state = FakeState()
+    f = feature("flash_flood_warning")
+    f["properties"]["event"] = "Tsunami Warning"
+    f["properties"]["status"] = "Test"
+    d = decide(Alert.from_feature(f), RULES, state.lookup)
+    assert d.disposition == "filtered" and d.transmit is False
+    assert "Test" in d.detail
+
+
+def test_cap_exercise_status_is_filtered(feature):
+    state = FakeState()
+    f = feature("flash_flood_warning")
+    f["properties"]["status"] = "Exercise"
+    d = decide(Alert.from_feature(f), RULES, state.lookup)
+    assert d.disposition == "filtered" and d.transmit is False
+
+
+def test_cap_actual_status_still_sends(feature):
+    # Guard the guard: a real alert (status Actual, or absent per from_feature's
+    # default) must keep flowing.
+    state = FakeState()
+    a = Alert.from_feature(feature("flash_flood_warning"))
+    assert a.status == "Actual"
+    d = decide(a, RULES, state.lookup)
+    assert d.disposition == "sent" and d.transmit is True

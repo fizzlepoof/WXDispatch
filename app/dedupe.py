@@ -36,6 +36,11 @@ def _is_sent(state: Optional[dict]) -> bool:
 
 
 def decide(alert: Alert, rules: FilterRules, lookup: StateLookup) -> Decision:
+    # CAP status gates everything: NWS communications drills arrive as real-looking
+    # events (e.g. the monthly "Tsunami Warning" test spanning 400+ coastal zones)
+    # distinguishable ONLY by status != "Actual". 2026-08-11: one reached the mesh.
+    if alert.status != "Actual":
+        return Decision("filtered", False, f"non-actual CAP status ({alert.status})")
     if not should_include(alert.event, rules):
         return Decision("filtered", False, "event not in include rules")
 
