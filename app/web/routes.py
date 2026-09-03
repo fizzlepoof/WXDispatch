@@ -828,6 +828,16 @@ def _safe_channel(result: dict) -> dict | None:
     return {"index": channel.get("index"), "name": channel.get("name") or ""}
 
 
+def _safe_channel_slots(result: dict) -> list[dict]:
+    slots = result.get("slots")
+    if not isinstance(slots, list):
+        return []
+    return [
+        {"index": slot.get("index"), "name": slot.get("name") or ""}
+        for slot in slots if isinstance(slot, dict)
+    ]
+
+
 @router.post("/openhop/channels/inspect", response_class=HTMLResponse)
 async def inspect_openhop_channel(request: Request):
     index = _channel_index(await request.form())
@@ -842,6 +852,22 @@ async def inspect_openhop_channel(request: Request):
         request, "_channel_operation.html", ok=True,
         message="Channel metadata read and verified by the companion.",
         channel=_safe_channel(result),
+    )
+
+
+@router.post("/openhop/channels/inspect-all", response_class=HTMLResponse)
+async def inspect_all_openhop_channels(
+    request: Request, _admin: None = Depends(_require_channel_admin),
+):
+    result = await _tx(request).inspect_meshcore_channels()
+    if not result.get("ok"):
+        return _channel_form_error(
+            request, result.get("error") or "The companion channels could not be loaded.", 502,
+        )
+    slots = _safe_channel_slots(result)
+    return render(
+        request, "_channel_inventory.html", slots=slots,
+        model=str(result.get("model") or ""),
     )
 
 

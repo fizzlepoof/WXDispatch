@@ -36,6 +36,24 @@ class DummyTx:
         self.channel_calls.append(("inspect", index))
         return {"ok": True, "error": "", "channel": {"index": index, "name": "County WX"}}
 
+    async def inspect_meshcore_channels(self):
+        self.channel_calls.append(("inspect_all",))
+        return {
+            "ok": True,
+            "error": "",
+            "slots": [
+                {"index": 0, "name": "Public", "secret": "DO NOT RENDER"},
+                {"index": 1, "name": ""},
+                {"index": 2, "name": "#county-wx"},
+            ],
+            "channels": [
+                {"index": 0, "name": "Public"},
+                {"index": 2, "name": "#county-wx"},
+            ],
+            "model": "OpenHop (fw test)",
+            "max_channels": 3,
+        }
+
     async def set_meshcore_channel(self, index, name):
         self.channel_calls.append(("set", index, name))
         return {"ok": True, "error": "", "channel": {"index": index, "name": name}}
@@ -337,6 +355,20 @@ def test_routing_page_reports_disabled_channel_administration_without_exposing_p
     assert "Channel administration enabled" in enabled.text
 
 
+def test_routing_page_has_load_all_channels_control(web, monkeypatch):
+    client, _db, _tx = web
+
+    enabled = client.get("/routing")
+    monkeypatch.delenv("MESHWX_ADMIN_PASSWORD")
+    disabled = client.get("/routing")
+
+    assert 'action="/openhop/channels/inspect-all"' in enabled.text
+    assert 'hx-post="/openhop/channels/inspect-all"' in enabled.text
+    assert "Load all channels" in enabled.text
+    assert "requires administrator authentication" in enabled.text
+    assert '<button class="secondary" disabled>Load all channels</button>' in disabled.text
+
+
 def test_dashboard_broadcast_counts_include_routed_accepted_and_partial_outcomes(web):
     client, db, _tx = web
     for index, disposition in enumerate(
@@ -452,6 +484,43 @@ def test_openhop_channel_inspect_returns_only_safe_metadata(web):
     assert tx.channel_calls == [("inspect", 9)]
     assert "Slot 9" in response.text
     assert "County WX" in response.text
+    assert "secret" not in response.text.lower()
+
+
+def test_openhop_all_channel_inventory_requires_admin_and_lists_every_slot(web):
+    client, _db, tx = web
+    token = csrf(client)
+
+    tampered = client.post(
+        "/openhop/channels/inspect-all",
+        headers=admin_auth(),
+        data={"csrf_token": "tampered"},
+    )
+
+    assert tampered.status_code == 403
+    assert tx.channel_calls == []
+
+    unauthenticated = client.post(
+        "/openhop/channels/inspect-all", data={"csrf_token": token}
+    )
+
+    assert unauthenticated.status_code == 401
+    assert tx.channel_calls == []
+
+    response = client.post(
+        "/openhop/channels/inspect-all",
+        headers=admin_auth(),
+        data={"csrf_token": token},
+    )
+
+    assert response.status_code == 200
+    assert tx.channel_calls == [("inspect_all",)]
+    assert "All 3 companion slots loaded" in response.text
+    assert "OpenHop (fw test)" in response.text
+    assert "Slot 0" in response.text and "Public" in response.text
+    assert "Slot 1" in response.text and "(empty)" in response.text
+    assert "Slot 2" in response.text and "#county-wx" in response.text
+    assert "DO NOT RENDER" not in response.text
     assert "secret" not in response.text.lower()
 
 

@@ -1,0 +1,16 @@
+<div class="health-banner ok" role="status">
+  <div class="hb-title">All {{ slots|length }} companion slots loaded</div>
+  {% if model %}<div>{{ model }}</div>{% endif %}
+</div>
+<table>
+  <thead><tr><th>Slot</th><th>Channel name</th><th>Status</th></tr></thead>
+  <tbody>
+    {% for slot in slots %}
+    <tr>
+      <td>Slot {{ slot.index }}</td>
+      <td>{{ slot.name or '(empty)' }}</td>
+      <td><span class="pill {{ 'ok' if slot.name else 'muted' }}">{{ 'configured' if slot.name else 'empty' }}</span></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>

@@ -42,7 +42,7 @@ class FakeCommands:
         self.get_calls = []
         self.set_result_type = EventType.OK
         self.readback = None
-        self.readback_index = None
+        self.readback_index: int | None = None
         self.device_result_type = EventType.DEVICE_INFO
         self.device_payload: object = {
             "fw ver": 3, "max_channels": self.max_channels,
@@ -179,6 +179,33 @@ async def test_read_channels_enumerates_every_device_reported_slot_beyond_eight(
     assert info["max_channels"] == 40
 
 
+async def test_read_all_channels_returns_every_slot_without_secrets():
+    commands = FakeCommands(max_channels=4)
+    commands.channels[0] = ("Public", b"p" * 16)
+    commands.channels[2] = ("#county-wx", SECRET_SENTINEL)
+    tx = transmitter(commands)
+
+    channels = await tx.read_all_channels()
+
+    assert channels == [
+        {"index": 0, "name": "Public"},
+        {"index": 1, "name": ""},
+        {"index": 2, "name": "#county-wx"},
+        {"index": 3, "name": ""},
+    ]
+    assert commands.get_calls == list(range(4))
+    assert SECRET_SENTINEL not in repr(channels).encode("utf-8")
+
+
+async def test_read_all_channels_rejects_mismatched_slot_readback():
+    commands = FakeCommands(max_channels=4)
+    commands.readback_index = 3
+    tx = transmitter(commands)
+
+    with pytest.raises(RuntimeError, match="channel index"):
+        await tx.read_all_channels()
+
+
 @pytest.mark.parametrize("result_type", [EventType.ERROR, EventType.CHANNEL_INFO, None])
 async def test_channel_operations_reject_non_device_info_responses(result_type):
     commands = FakeCommands()
@@ -298,6 +325,36 @@ async def test_manager_set_uses_configured_meshcore_and_caches_only_safe_metadat
     assert "secret" not in repr(result).lower()
     assert db.query_transmit_log() == []
     assert db.recent_errors() == []
+
+
+async def test_manager_inspects_every_channel_slot_and_caches_configured_only():
+    commands = FakeCommands(max_channels=4)
+    commands.channels[0] = ("Public", b"p" * 16)
+    commands.channels[2] = ("#county-wx", SECRET_SENTINEL)
+    db, manager, _transport = configured_manager(commands)
+
+    result = await manager.inspect_meshcore_channels()
+
+    assert result == {
+        "ok": True,
+        "error": "",
+        "slots": [
+            {"index": 0, "name": "Public"},
+            {"index": 1, "name": ""},
+            {"index": 2, "name": "#county-wx"},
+            {"index": 3, "name": ""},
+        ],
+        "channels": [
+            {"index": 0, "name": "Public"},
+            {"index": 2, "name": "#county-wx"},
+        ],
+        "model": "OpenHop (fw test)",
+        "max_channels": 4,
+    }
+    assert db.get_setting("meshcore_channels") == result["channels"]
+    assert db.get_setting("meshcore_model") == result["model"]
+    assert db.get_setting("meshcore_max_channels") == 4
+    assert SECRET_SENTINEL not in repr(result).encode("utf-8")
 
 
 async def test_binary_secret_never_reaches_public_state_logs_or_errors(caplog):

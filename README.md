@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <b>Status: v2.0.0.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
+  <b>Status: v2.1.0.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
 </p>
 
 ---
@@ -225,7 +225,7 @@ lives in the UI and the database.
 | `MESH_WX_PORT` | `8000` (`8110` for the systemd service)  | HTTP port          |
 | `MESH_WX_HOST` | `0.0.0.0`                                | HTTP bind address  |
 || `MESH_WX_DB`   | per-OS data dir (see below)              | SQLite file path   |
-|| `MESHWX_ADMIN_PASSWORD` | unset | Enables destructive MeshCore companion channel set/clear; HTTP Basic username is `admin` |
+|| `MESHWX_ADMIN_PASSWORD` | unset | Enables MeshCore companion channel set/clear and all-slot inventory; HTTP Basic username is `admin` |
 
 When `MESHWX_ADMIN_PASSWORD` is unset, channel set/clear fail closed with HTTP 503 and the UI
 marks channel administration disabled. The password is read from the process environment and is
@@ -233,7 +233,9 @@ never stored in the database or rendered in the WebUI. Read-only sanitized chann
 remains available. WXDispatch channel creation is hash-channel-only: names must begin with `#`, and
 MeshCore derives the deterministic 16-byte channel key from the exact UTF-8 channel name. No
 separate channel secret is accepted or stored. Anyone who knows the exact hash-channel name can
-derive the same key.
+derive the same key. **Load all channels** reads every device-reported slot, including empty slots,
+in one operation. That inventory requires administrator authentication because it reveals all exact
+hash-channel names; channel keys are never returned or displayed.
 
 The default database location when `MESH_WX_DB` is unset deliberately retains the original
 MeshWX paths so upgrades reuse existing settings and history:

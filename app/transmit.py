@@ -103,6 +103,10 @@ class Transmitter(abc.ABC):
         """Return the channels configured on the device: [{index, name}]. Optional."""
         return []
 
+    async def read_all_channels(self) -> list:
+        """Return safe metadata for every device slot when supported."""
+        return await self.read_channels()
+
 
 class MeshtasticTransmitter(Transmitter):
     label = "Meshtastic"
@@ -414,16 +418,21 @@ class MeshCoreTransmitter(Transmitter):
         channel = await self._read_channel_at(index)
         return {"index": channel["index"], "name": channel["name"]}
 
-    async def read_channels(self) -> list:
+    async def read_all_channels(self) -> list:
+        """Return safe metadata for every companion slot, including empty slots."""
         if self._mc is None:
             raise RuntimeError("not connected")
         info = await self._device_info()
         out = []
         for idx in range(self._max_channels_from_info(info)):
             channel = await self._read_channel_at(idx)
-            if channel["name"]:
-                out.append({"index": channel["index"], "name": channel["name"]})
+            if channel["index"] != idx:
+                raise RuntimeError("companion returned mismatched channel index")
+            out.append({"index": channel["index"], "name": channel["name"]})
         return out
+
+    async def read_channels(self) -> list:
+        return [channel for channel in await self.read_all_channels() if channel["name"]]
 
     async def read_info(self) -> dict:
         if self._mc is None:
@@ -682,6 +691,48 @@ class TransmitManager:
                             continue
                     return {"ok": False, "error": "MeshCore channel inspection failed"}
             return {"ok": False, "error": "MeshCore channel inspection failed"}
+
+    async def inspect_meshcore_channels(self) -> dict:
+        """Inspect every companion slot under the shared radio lock."""
+        async with self._lock:
+            transport = self._transports["meshcore"]
+            if not transport.enabled:
+                return {"ok": False, "error": "MeshCore is disabled"}
+            if not await self._ensure_meshcore_channel_transport(transport) or transport.tx is None:
+                return {"ok": False, "error": "MeshCore channel inventory failed"}
+            for attempt in range(2):
+                try:
+                    slots = await transport.tx.read_all_channels()
+                    info = await transport.tx.read_info()
+                    model = _fmt_model(info)
+                    max_channels = info.get(
+                        "max_channels", MeshCoreTransmitter.FALLBACK_MAX_CHANNELS,
+                    )
+                    if len(slots) != max_channels:
+                        raise RuntimeError("companion channel inventory size did not match")
+                    channels = [slot for slot in slots if slot["name"]]
+                    self._db.set_setting("meshcore_channels", channels)
+                    self._db.set_setting("meshcore_model", model)
+                    self._db.set_setting("meshcore_max_channels", max_channels)
+                    return {
+                        "ok": True,
+                        "error": "",
+                        "slots": slots,
+                        "channels": channels,
+                        "model": model,
+                        "max_channels": max_channels,
+                    }
+                except Exception as exc:
+                    link_failed = (isinstance(exc, _MeshCoreChannelLinkError)
+                                   or _is_meshcore_link_failure(exc))
+                    if link_failed and transport.conn == "tcp":
+                        transport.connected = False
+                        if (attempt == 0
+                                and await self._reconnect_meshcore_channel(transport)
+                                and transport.tx is not None):
+                            continue
+                    return {"ok": False, "error": "MeshCore channel inventory failed"}
+            return {"ok": False, "error": "MeshCore channel inventory failed"}
 
     async def clear_meshcore_channel(self, index: int) -> dict:
         """Clear one slot on the configured MeshCore companion under the radio lock."""
