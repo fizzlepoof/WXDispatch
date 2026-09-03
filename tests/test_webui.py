@@ -36,8 +36,8 @@ class DummyTx:
         self.channel_calls.append(("inspect", index))
         return {"ok": True, "error": "", "channel": {"index": index, "name": "County WX"}}
 
-    async def set_meshcore_channel(self, index, name, secret):
-        self.channel_calls.append(("set", index, name, secret))
+    async def set_meshcore_channel(self, index, name):
+        self.channel_calls.append(("set", index, name))
         return {"ok": True, "error": "", "channel": {"index": index, "name": name}}
 
     async def clear_meshcore_channel(self, index):
@@ -208,10 +208,9 @@ def test_every_routing_and_channel_mutation_rejects_tampered_csrf_without_state_
     assert tx.channel_calls == []
 
 
-def test_openhop_channel_set_is_write_only_and_companion_worded(web):
+def test_openhop_channel_set_is_hash_only_and_companion_worded(web):
     client, db, tx = web
     token = csrf(client)
-    secret = "00112233445566778899aabbccddeeff"
 
     response = client.post(
         "/openhop/channels/set",
@@ -219,19 +218,62 @@ def test_openhop_channel_set_is_write_only_and_companion_worded(web):
         data={
             "csrf_token": token,
             "index": "17",
-            "name": "County WX",
-            "secret": secret,
+            "name": "#robertson-wx",
         },
     )
 
     assert response.status_code == 200
-    assert tx.channel_calls == [("set", 17, "County WX", bytes.fromhex(secret))]
+    assert tx.channel_calls == [("set", 17, "#robertson-wx")]
     assert "accepted by MeshCore companion" in response.text
     assert "over-air delivery is not confirmed" in response.text
     assert "RF delivered" not in response.text
-    assert secret not in response.text
-    assert secret not in response.url.path
-    assert secret not in "\n".join(db._conn.iterdump())
+    assert "write-only secret" not in response.text.lower()
+    assert "32 hex" not in response.text.lower()
+
+
+def test_openhop_channel_set_rejects_non_hash_name(web):
+    client, _db, tx = web
+    token = csrf(client)
+
+    response = client.post(
+        "/openhop/channels/set",
+        headers=admin_auth(),
+        data={"csrf_token": token, "index": "17", "name": "robertson-wx"},
+    )
+
+    assert response.status_code == 400
+    assert "must begin with #" in response.text
+    assert tx.channel_calls == []
+
+
+def test_openhop_channel_set_rejects_bare_hash_name(web):
+    client, _db, tx = web
+    token = csrf(client)
+
+    response = client.post(
+        "/openhop/channels/set",
+        headers=admin_auth(),
+        data={"csrf_token": token, "index": "17", "name": "#"},
+    )
+
+    assert response.status_code == 400
+    assert "must include a name" in response.text
+    assert tx.channel_calls == []
+
+
+def test_openhop_channel_set_rejects_overlength_utf8_name(web):
+    client, _db, tx = web
+    token = csrf(client)
+
+    response = client.post(
+        "/openhop/channels/set",
+        headers=admin_auth(),
+        data={"csrf_token": token, "index": "17", "name": "#" + "é" * 16},
+    )
+
+    assert response.status_code == 400
+    assert "32 UTF-8 bytes" in response.text
+    assert tx.channel_calls == []
 
 
 @pytest.mark.parametrize("path", ["/openhop/channels/set", "/openhop/channels/clear"])
@@ -483,7 +525,7 @@ def test_openhop_clear_fails_closed_without_complete_reference_api(web):
     assert tx.channel_calls == []
 
 
-def test_routing_page_has_empty_states_and_write_only_channel_form(web):
+def test_routing_page_has_empty_states_and_hash_only_channel_form(web):
     client, _db, _tx = web
 
     response = client.get("/routing")
@@ -491,9 +533,10 @@ def test_routing_page_has_empty_states_and_write_only_channel_form(web):
     assert response.status_code == 200
     assert "No destinations configured" in response.text
     assert "No routing rules configured" in response.text
-    assert 'name="secret"' in response.text
-    assert 'type="password"' in response.text
-    assert 'name="secret" value=' not in response.text
+    assert 'name="secret"' not in response.text
+    assert "MeshWX creates hash channels only" in response.text
+    assert "Anyone who knows the exact channel name can derive its key" in response.text
+    assert 'placeholder="#robertson-wx"' in response.text
     assert db_count(_db, "routing_rules") == 0
     assert db_count(_db, "destinations") == 0
 

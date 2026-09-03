@@ -235,7 +235,10 @@ lives in the UI and the database.
 When `MESHWX_ADMIN_PASSWORD` is unset, channel set/clear fail closed with HTTP 503 and the UI
 marks channel administration disabled. The password is read from the process environment and is
 never stored in the database or rendered in the WebUI. Read-only sanitized channel inspection
-remains available.
+remains available. MeshWX channel creation is hash-channel-only: names must begin with `#`, and
+MeshCore derives the deterministic 16-byte channel key from the exact UTF-8 channel name. No
+separate channel secret is accepted or stored. Anyone who knows the exact hash-channel name can
+derive the same key.
 
 The default database location when `MESH_WX_DB` is unset:
 `/data` in Docker · `%LOCALAPPDATA%\MeshWX` on Windows ·

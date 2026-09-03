@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import hashlib
 import logging
 
 import pytest
@@ -21,6 +22,10 @@ SECRET_SENTINEL = bytes([
     0x00, 0xFF, 0x80, 0xC3, 0xA9, 0x7F, 0x01, 0xFE,
     0x10, 0x90, 0xE2, 0x98, 0x83, 0x42, 0xAA, 0x55,
 ])
+
+
+def hash_secret(name: str) -> bytes:
+    return hashlib.sha256(name.encode("utf-8")).digest()[:16]
 
 
 @dataclass
@@ -77,15 +82,16 @@ def transmitter(commands):
     return tx
 
 
-async def test_set_channel_requires_ok_then_exact_readback():
+async def test_set_channel_derives_hash_secret_then_requires_exact_readback():
     commands = FakeCommands()
     tx = transmitter(commands)
-    secret = bytes(range(16))
+    name = "#robertson-wx"
+    secret = hashlib.sha256(name.encode("utf-8")).digest()[:16]
 
-    channel = await tx.set_channel(17, "Weather Ops", secret)
+    channel = await tx.set_channel(17, name)
 
-    assert commands.set_calls == [(17, "Weather Ops", secret)]
-    assert channel == {"index": 17, "name": "Weather Ops"}
+    assert commands.set_calls == [(17, name, secret)]
+    assert channel == {"index": 17, "name": name}
 
 
 @pytest.mark.parametrize("result_type", [EventType.ERROR, None])
@@ -95,12 +101,12 @@ async def test_set_channel_requires_explicit_ok(result_type):
     tx = transmitter(commands)
 
     with pytest.raises(RuntimeError, match="accept"):
-        await tx.set_channel(2, "Weather", b"s" * 16)
+        await tx.set_channel(2, "#weather")
 
 
 @pytest.mark.parametrize(
     "readback",
-    [("Other", b"s" * 16), ("Weather", b"x" * 16)],
+    [("#other", b"s" * 16), ("#weather", b"x" * 16)],
 )
 async def test_set_channel_rejects_mismatched_readback(readback):
     commands = FakeCommands()
@@ -108,27 +114,27 @@ async def test_set_channel_rejects_mismatched_readback(readback):
     tx = transmitter(commands)
 
     with pytest.raises(RuntimeError, match="readback"):
-        await tx.set_channel(2, "Weather", b"s" * 16)
+        await tx.set_channel(2, "#weather")
 
 
 @pytest.mark.parametrize(
-    ("index", "name", "secret", "message"),
+    ("index", "name", "message"),
     [
-        (2, "Weather", b"short", "exactly 16 bytes"),
-        (2, "#Weather", b"s" * 16, "beginning with #"),
-        (40, "Weather", b"s" * 16, "out of range"),
-        (-1, "Weather", b"s" * 16, "out of range"),
-        (True, "Weather", b"s" * 16, "out of range"),
-        (2, "", b"s" * 16, "required"),
-        (2, "é" * 17, b"s" * 16, "32 UTF-8 bytes"),
+        (2, "Weather", "must begin with #"),
+        (2, "#", "must include a name"),
+        (40, "#weather", "out of range"),
+        (-1, "#weather", "out of range"),
+        (True, "#weather", "out of range"),
+        (2, "", "required"),
+        (2, "#" + "é" * 16, "32 UTF-8 bytes"),
     ],
 )
-async def test_set_channel_validates_wire_values(index, name, secret, message):
+async def test_set_channel_validates_hash_channel_values(index, name, message):
     commands = FakeCommands(max_channels=40)
     tx = transmitter(commands)
 
     with pytest.raises(ValueError, match=message):
-        await tx.set_channel(index, name, secret)
+        await tx.set_channel(index, name)
 
     assert commands.set_calls == []
 
@@ -138,7 +144,7 @@ async def test_set_channel_rejects_embedded_nul_before_writing():
     tx = transmitter(commands)
 
     with pytest.raises(ValueError, match="NUL"):
-        await tx.set_channel(2, "County\x00Hidden", b"s" * 16)
+        await tx.set_channel(2, "#county\x00hidden")
 
     assert commands.set_calls == []
 
@@ -268,17 +274,17 @@ async def test_manager_set_uses_configured_meshcore_and_caches_only_safe_metadat
     commands = FakeCommands(max_channels=40)
     commands.channels[0] = ("Public", b"p" * 16)
     db, manager, transport = configured_manager(commands)
-    secret = b"s" * 16
+    name = "#county-wx"
 
-    result = await manager.set_meshcore_channel(12, "County WX", secret)
+    result = await manager.set_meshcore_channel(12, name)
 
     assert result == {
         "ok": True,
         "error": "",
-        "channel": {"index": 12, "name": "County WX"},
+        "channel": {"index": 12, "name": name},
         "channels": [
             {"index": 0, "name": "Public"},
-            {"index": 12, "name": "County WX"},
+            {"index": 12, "name": name},
         ],
         "model": "OpenHop (fw test)",
         "max_channels": 40,
@@ -288,7 +294,7 @@ async def test_manager_set_uses_configured_meshcore_and_caches_only_safe_metadat
     assert db.get_setting("meshcore_model") == result["model"]
     assert db.get_setting("meshcore_max_channels") == 40
     database_text = "\n".join(db._conn.iterdump())
-    assert (b"s" * 16).decode() not in database_text
+    assert hash_secret(name).hex() not in database_text
     assert "secret" not in repr(result).lower()
     assert db.query_transmit_log() == []
     assert db.recent_errors() == []
@@ -299,12 +305,12 @@ async def test_binary_secret_never_reaches_public_state_logs_or_errors(caplog):
     db, manager, transport = configured_manager(commands)
     caplog.set_level(logging.DEBUG)
 
-    result = await manager.set_meshcore_channel(
-        0, "Sentinel Channel", SECRET_SENTINEL)
+    accepted_name = "#sentinel-channel"
+    rejected_name = "#rejected-channel"
+    result = await manager.set_meshcore_channel(0, accepted_name)
     public_channel = await transport.tx.read_channel(0)
     commands.set_result_type = EventType.ERROR
-    failed_result = await manager.set_meshcore_channel(
-        1, "Rejected Channel", SECRET_SENTINEL)
+    failed_result = await manager.set_meshcore_channel(1, rejected_name)
 
     public_values = {
         "result": result,
@@ -316,9 +322,10 @@ async def test_binary_secret_never_reaches_public_state_logs_or_errors(caplog):
         "errors": db.recent_errors(),
     }
     public_text = repr(public_values)
-    assert SECRET_SENTINEL not in public_text.encode("utf-8")
-    assert repr(SECRET_SENTINEL) not in public_text
-    assert SECRET_SENTINEL.hex() not in public_text
+    for secret in (hash_secret(accepted_name), hash_secret(rejected_name)):
+        assert secret not in public_text.encode("utf-8")
+        assert repr(secret) not in public_text
+        assert secret.hex() not in public_text
     assert all("secret" not in repr(value).lower()
                for key, value in public_values.items() if key != "database")
 
@@ -354,7 +361,7 @@ async def test_manager_channel_errors_never_expose_exception_secrets(
     caplog.set_level(logging.DEBUG)
 
     if operation == "set":
-        result = await manager.set_meshcore_channel(0, "Weather", b"s" * 16)
+        result = await manager.set_meshcore_channel(0, "#weather")
     elif operation == "inspect":
         result = await manager.inspect_meshcore_channel(0)
     else:
@@ -397,7 +404,7 @@ async def test_channel_reconnect_failure_never_returns_connection_exception(
     caplog.set_level(logging.DEBUG)
 
     if operation == "set":
-        result = await manager.set_meshcore_channel(0, "Weather", b"s" * 16)
+        result = await manager.set_meshcore_channel(0, "#weather")
     elif operation == "inspect":
         result = await manager.inspect_meshcore_channel(0)
     else:
@@ -424,6 +431,8 @@ async def test_dependency_debug_logs_suppress_channel_secret_and_restore_logger(
     await dispatcher.start()
     commands = DeviceCommands()
     commands.set_dispatcher(dispatcher)
+    name = "#sentinel-channel"
+    secret = hash_secret(name)
 
     class Connection:
         async def send(self, data):
@@ -436,8 +445,8 @@ async def test_dependency_debug_logs_suppress_channel_secret_and_restore_logger(
             else:
                 event = Event(EventType.CHANNEL_INFO, {
                     "channel_idx": data[1],
-                    "channel_name": "Sentinel Channel",
-                    "channel_secret": SECRET_SENTINEL,
+                    "channel_name": name,
+                    "channel_secret": secret,
                 })
             await dispatcher.dispatch(event)
 
@@ -447,15 +456,15 @@ async def test_dependency_debug_logs_suppress_channel_secret_and_restore_logger(
     try:
         if fail_set:
             with pytest.raises(RuntimeError, match="did not accept"):
-                await tx.set_channel(0, "Sentinel Channel", SECRET_SENTINEL)
+                await tx.set_channel(0, name)
         else:
-            assert await tx.set_channel(0, "Sentinel Channel", SECRET_SENTINEL) == {
-                "index": 0, "name": "Sentinel Channel",
+            assert await tx.set_channel(0, name) == {
+                "index": 0, "name": name,
             }
 
         assert meshcore_logger.disabled is False
-        assert SECRET_SENTINEL.hex() not in caplog.text
-        assert repr(SECRET_SENTINEL) not in caplog.text
+        assert secret.hex() not in caplog.text
+        assert repr(secret) not in caplog.text
     finally:
         meshcore_logger.disabled = original_disabled
         await dispatcher.stop()
@@ -577,13 +586,13 @@ async def test_verified_set_stays_successful_when_cache_refresh_fails():
     original = [{"index": 2, "name": "Existing"}]
     db.set_setting("meshcore_channels", original)
 
-    result = await manager.set_meshcore_channel(0, "Weather", b"s" * 16)
+    result = await manager.set_meshcore_channel(0, "#weather")
 
-    assert commands.set_calls == [(0, "Weather", b"s" * 16)]
+    assert commands.set_calls == [(0, "#weather", hash_secret("#weather"))]
     assert result == {
         "ok": True,
         "error": "",
-        "channel": {"index": 0, "name": "Weather"},
+        "channel": {"index": 0, "name": "#weather"},
         "cache_refreshed": False,
         "warning": "Channel updated, but channel cache refresh failed",
     }
@@ -647,7 +656,7 @@ async def test_channel_crud_reconnects_stale_tcp_before_one_retry(operation):
     manager._reconnect = reconnect
 
     if operation == "set":
-        result = await manager.set_meshcore_channel(0, "New", b"n" * 16)
+        result = await manager.set_meshcore_channel(0, "#new")
     elif operation == "inspect":
         result = await manager.inspect_meshcore_channel(0)
     else:
@@ -752,12 +761,12 @@ async def test_set_reconnects_and_retries_after_tcp_reset_before_command():
 
     manager._reconnect = reconnect
 
-    result = await manager.set_meshcore_channel(0, "Weather", b"s" * 16)
+    result = await manager.set_meshcore_channel(0, "#weather")
 
     assert result["ok"] is True
     assert device_queries == 1
     assert initial_commands.set_calls == []
-    assert recovered_commands.set_calls == [(0, "Weather", b"s" * 16)]
+    assert recovered_commands.set_calls == [(0, "#weather", hash_secret("#weather"))]
     assert reconnects == 1
 
 
@@ -830,8 +839,8 @@ async def test_mutation_timeout_is_ambiguous_and_never_retries_command(
     caplog.set_level(logging.DEBUG)
 
     if operation == "set":
-        result = await manager.set_meshcore_channel(0, "Weather", b"s" * 16)
-        expected_call = (0, "Weather", b"s" * 16)
+        result = await manager.set_meshcore_channel(0, "#weather")
+        expected_call = (0, "#weather", hash_secret("#weather"))
     else:
         result = await manager.clear_meshcore_channel(0)
         expected_call = (0, "", b"\x00" * 16)
@@ -867,8 +876,8 @@ async def test_reset_after_mutation_ok_never_repeats_verified_command(operation)
     manager._reconnect = reconnect
 
     if operation == "set":
-        result = await manager.set_meshcore_channel(0, "Weather", b"s" * 16)
-        expected_call = (0, "Weather", b"s" * 16)
+        result = await manager.set_meshcore_channel(0, "#weather")
+        expected_call = (0, "#weather", hash_secret("#weather"))
     else:
         result = await manager.clear_meshcore_channel(0)
         expected_call = (0, "", b"\x00" * 16)
@@ -915,7 +924,7 @@ async def test_send_and_channel_crud_serialize_under_manager_lock():
     await send_entered.wait()
 
     crud_task = asyncio.create_task(
-        manager.set_meshcore_channel(0, "Weather", b"w" * 16))
+        manager.set_meshcore_channel(0, "#weather"))
     await asyncio.sleep(0)
 
     assert commands.set_calls == []
@@ -923,4 +932,4 @@ async def test_send_and_channel_crud_serialize_under_manager_lock():
     send_result, crud_result = await asyncio.gather(send_task, crud_task)
     assert send_result == (True, "")
     assert crud_result["ok"] is True
-    assert commands.set_calls == [(0, "Weather", b"w" * 16)]
+    assert commands.set_calls == [(0, "#weather", hash_secret("#weather"))]

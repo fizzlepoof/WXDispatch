@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import hashlib
 import logging
 import threading
 import time
@@ -291,7 +292,7 @@ class MeshCoreTransmitter(Transmitter):
             "secret": payload.get("channel_secret"),
         }
 
-    async def set_channel(self, index: int, name: str, secret: bytes) -> dict:
+    async def set_channel(self, index: int, name: str) -> dict:
         if self._mc is None:
             raise RuntimeError("not connected")
         from meshcore import EventType
@@ -304,10 +305,11 @@ class MeshCoreTransmitter(Transmitter):
             raise ValueError("channel name must not contain NUL")
         if len(name.encode("utf-8")) > 32:
             raise ValueError("channel name must be at most 32 UTF-8 bytes")
-        if name.startswith("#"):
-            raise ValueError("channel names beginning with # are not supported")
-        if not isinstance(secret, bytes) or len(secret) != 16:
-            raise ValueError("channel secret must be exactly 16 bytes")
+        if not name.startswith("#"):
+            raise ValueError("hash channel name must begin with #")
+        if len(name) == 1:
+            raise ValueError("hash channel must include a name after #")
+        secret = hashlib.sha256(name.encode("utf-8")).digest()[:16]
         try:
             with _suppress_meshcore_dependency_logging():
                 res = await self._mc.commands.set_channel(index, name, secret)
@@ -618,8 +620,8 @@ class TransmitManager:
             transport.error = "MeshCore channel connection failed"
         return reconnected
 
-    async def set_meshcore_channel(self, index: int, name: str, secret: bytes) -> dict:
-        """Set one channel on the configured MeshCore companion under the radio lock."""
+    async def set_meshcore_channel(self, index: int, name: str) -> dict:
+        """Set one deterministic hash channel under the shared radio lock."""
         async with self._lock:
             transport = self._transports["meshcore"]
             if not transport.enabled:
@@ -628,7 +630,7 @@ class TransmitManager:
                 return {"ok": False, "error": "MeshCore channel update failed"}
             for attempt in range(2):
                 try:
-                    channel = await transport.tx.set_channel(index, name, secret)
+                    channel = await transport.tx.set_channel(index, name)
                     break
                 except Exception as exc:
                     retry_safe = (isinstance(exc, _MeshCoreChannelLinkError)

@@ -853,12 +853,15 @@ async def set_openhop_channel(
     if index is None:
         return _channel_form_error(request, "Channel index must be a whole number.")
     name = str(form.get("name", "")).strip()
-    secret_hex = str(form.get("secret", ""))
-    if not re.fullmatch(r"[0-9a-fA-F]{32}", secret_hex):
-        return _channel_form_error(request, "Channel secret must be exactly 32 hexadecimal characters.")
     if not name:
         return _channel_form_error(request, "Channel name is required.")
-    result = await _tx(request).set_meshcore_channel(index, name, bytes.fromhex(secret_hex))
+    if len(name.encode("utf-8")) > 32:
+        return _channel_form_error(request, "Channel name must be at most 32 UTF-8 bytes.")
+    if not name.startswith("#"):
+        return _channel_form_error(request, "Hash channel name must begin with #.")
+    if len(name) == 1:
+        return _channel_form_error(request, "Hash channel must include a name after #.")
+    result = await _tx(request).set_meshcore_channel(index, name)
     if not result.get("ok"):
         return _channel_form_error(
             request, result.get("error") or "The companion did not accept the channel update.", 502,
