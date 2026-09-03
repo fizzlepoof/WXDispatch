@@ -1,6 +1,6 @@
 name: Release
 
-# Cut a release by pushing a version tag:  git tag v1.1.0 && git push origin v1.1.0
+# Cut a release by pushing a version tag:  git tag v2.0.0 && git push origin v2.0.0
 on:
   push:
     tags: ["v*"]
@@ -27,7 +27,9 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: |
+            ghcr.io/${{ github.repository }}
+            ghcr.io/fizzlepoof/meshwx
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -56,11 +58,11 @@ jobs:
       - name: Build
         run: pyinstaller packaging/meshwx.spec
       - name: Zip bundle
-        run: Compress-Archive -Path dist/MeshWX/* -DestinationPath MeshWX-windows-${{ github.ref_name }}.zip
+        run: Compress-Archive -Path dist/WXDispatch/* -DestinationPath WXDispatch-windows-${{ github.ref_name }}.zip
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: MeshWX-windows-${{ github.ref_name }}.zip
+          files: WXDispatch-windows-${{ github.ref_name }}.zip
           generate_release_notes: true
           # A tag with a hyphen (e.g. v1.0.3-rc1) is a prerelease: keep it out of
           # "Latest" so test builds never supersede a real release.

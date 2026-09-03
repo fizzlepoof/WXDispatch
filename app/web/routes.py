@@ -82,7 +82,7 @@ def _require_channel_admin(
         raise HTTPException(
             status_code=401,
             detail="Administrator authentication required.",
-            headers={"WWW-Authenticate": 'Basic realm="MeshWX channel administration"'},
+            headers={"WWW-Authenticate": 'Basic realm="WXDispatch channel administration"'},
         )
 
 
@@ -436,7 +436,7 @@ _STATES = [
     ("PR","Puerto Rico"),("VI","U.S. Virgin Islands"),("GU","Guam"),
 ]
 
-# Timezones offered in Settings. MeshWX serves the US NWS, so this is the US /
+# Timezones offered in Settings. WXDispatch serves the US NWS, so this is the US /
 # territories set plus an "Automatic" option (blank = the device's local zone).
 _TIMEZONES = [
     ("", "Automatic (this device's time zone)"),
@@ -470,7 +470,8 @@ _EVENT_GROUPS = {
 
 
 async def _fetch_counties(state: str, contact: str):
-    ua = "mesh-wx/1.0 (%s)" % contact if contact else "mesh-wx/1.0"
+    ua = "WXDispatch/%s (%s)" % (__version__, contact) if contact \
+        else "WXDispatch/%s" % __version__
     url = "https://api.weather.gov/zones?area=%s&type=county" % state
     async with httpx.AsyncClient(timeout=20,
             headers={"User-Agent": ua, "Accept": "application/geo+json"}) as c:
@@ -525,7 +526,7 @@ async def check_updates(request: Request):
     try:
         async with httpx.AsyncClient(
                 timeout=10,
-                headers={"User-Agent": "MeshWX-update-check",
+                headers={"User-Agent": "WXDispatch-update-check",
                          "Accept": "application/vnd.github+json"}) as client:
             r = await client.get(GITHUB_LATEST_RELEASE_API)
         if r.status_code == 200:
@@ -762,7 +763,7 @@ async def clear_errors(request: Request):
 @router.post("/troubleshoot/test", response_class=HTMLResponse)
 async def send_test(request: Request):
     tx = _tx(request)
-    text = "[WX] mesh-wx test message"
+    text = "[WX] WXDispatch test message"
     ok = await tx.send_test(text)   # goes on each radio's TEST channel
     return render(
         request, "_manual_result.html", ok=ok,
@@ -776,7 +777,7 @@ async def send_test(request: Request):
 async def send_test_one(request: Request, name: str):
     tx = _tx(request)
     label = {t["name"]: t["label"] for t in tx.status()}.get(name, name)
-    text = "[WX] mesh-wx test via %s" % label
+    text = "[WX] WXDispatch test via %s" % label
     ok, err = await tx.send_to(name, text)
     return render(
         request, "_manual_result.html", ok=ok,

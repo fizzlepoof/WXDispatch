@@ -1,14 +1,17 @@
-# PyInstaller spec — MeshWX standalone (onedir) build.
+# PyInstaller spec — WXDispatch standalone (onedir) build.
 # Build from the repo root:   pyinstaller packaging/meshwx.spec
-# Produces dist/MeshWX/ containing MeshWX(.exe) plus everything it needs.
+# Produces dist/WXDispatch/ containing WXDispatch(.exe) plus everything it needs.
 import os
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 ROOT = os.path.abspath(os.path.join(SPECPATH, os.pardir))
 
 # Jinja templates must ship as data at the path routes.py expects.
-datas = [(os.path.join(ROOT, "app", "web", "templates"),
-          os.path.join("app", "web", "templates"))]
+datas = [
+    (os.path.join(ROOT, "app", "web", "templates"),
+     os.path.join("app", "web", "templates")),
+    (os.path.join(ROOT, "LICENSE"), "."),
+]
 binaries = []
 hiddenimports = collect_submodules("app")
 
@@ -37,7 +40,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="MeshWX",
+    name="WXDispatch",
     console=True,
     disable_windowed_traceback=False,
 )
@@ -47,5 +50,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="MeshWX",
+    name="WXDispatch",
 )

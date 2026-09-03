@@ -30,7 +30,7 @@ class NWSClient:
 
     def _user_agent(self) -> str:
         # NWS asks for "app/version (contact)".
-        return f"mesh-wx/{__version__} ({self.contact})"
+        return f"WXDispatch/{__version__} ({self.contact})"
 
     async def fetch_active(
         self, zones: str, max_retries: int = 4

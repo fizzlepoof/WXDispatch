@@ -14,7 +14,7 @@ say()  { printf '\033[1;36m>> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m!! %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[1;31m!! %s\033[0m\n' "$*" >&2; exit 1; }
 
-say "MeshWX install"
+say "WXDispatch install"
 echo "   dir:  $DIR"
 echo "   user: $SVC_USER"
 
@@ -28,7 +28,7 @@ fi
 # tracked files, so the gitignored data/ database + .venv/ are left alone), then
 # re-exec the (possibly updated) installer once.
 if [ -z "${MESHWX_NO_SELFUPDATE:-}" ] && [ -d "$DIR/.git" ] && command -v git >/dev/null 2>&1; then
-  say "updating MeshWX to the latest version"
+  say "updating WXDispatch to the latest version"
   git config --global --add safe.directory "$DIR" 2>/dev/null || true
   if git -C "$DIR" fetch --quiet origin 2>/dev/null \
      && git -C "$DIR" reset --hard --quiet '@{u}' 2>/dev/null; then :; \
@@ -63,7 +63,7 @@ say "using Python $PYVER"
 say "creating virtualenv"
 "$PY" -m venv "$DIR/.venv" || die "could not create venv (is python3-venv installed?)"
 "$DIR/.venv/bin/python" -m pip install --upgrade --quiet pip
-say "installing MeshWX dependencies (this can take a couple of minutes)"
+say "installing WXDispatch dependencies (this can take a couple of minutes)"
 "$DIR/.venv/bin/pip" install --quiet -r "$DIR/requirements.txt" \
   || die "dependency install failed. Re-run, or report the output at the project's Issues page."
 
@@ -83,7 +83,7 @@ systemctl enable --now mesh-wx.service
 
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo ""
-say "done. MeshWX is running at  http://${IP:-<this-host>}:8110"
+say "done. WXDispatch is running at  http://${IP:-<this-host>}:8110"
 echo "   logs:    journalctl -u mesh-wx -f"
 echo "   restart: sudo systemctl restart mesh-wx"
 echo "   status:  systemctl status mesh-wx"

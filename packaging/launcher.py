@@ -1,6 +1,6 @@
 """Desktop launcher for the packaged (PyInstaller) builds.
 
-Starts the MeshWX web server and opens the dashboard in the default browser.
+Starts the WXDispatch web server and opens the dashboard in the default browser.
 Used as the entry point for the Windows/Linux standalone bundles; the Docker
 image and `python -m app.main` path do NOT use this.
 """
@@ -40,9 +40,9 @@ def main() -> None:
     browse_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
     url = f"http://{browse_host}:{port}"
     print("=" * 60)
-    print(f"  MeshWX is starting - your browser will open at {url}")
+    print(f"  WXDispatch is starting - your browser will open at {url}")
     print("  (first launch can take a few seconds)")
-    print("  Keep this window open. Close it to stop MeshWX.")
+    print("  Keep this window open. Close it to stop WXDispatch.")
     print("=" * 60)
     threading.Thread(target=_open_browser, args=(browse_host, int(port), url),
                      daemon=True).start()

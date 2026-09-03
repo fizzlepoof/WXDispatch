@@ -10,6 +10,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+# Preserve legacy data directories so upgrading from MeshWX never strands the
+# existing database. This is intentionally not the public product name.
 APP_DIRNAME = "MeshWX"
 
 
@@ -66,7 +68,7 @@ def load_bootstrap() -> BootstrapConfig:
 DEFAULT_SETTINGS: dict = {
     "zones": "SCZ050",
     "poll_interval": 120,
-    "nws_contact": "mesh-wx (change-me@example.com)",
+    "nws_contact": "WXDispatch (change-me@example.com)",
     "channel_index": 0,
     "serial_port": "",
     "meshtastic_enabled": True,
@@ -103,7 +105,7 @@ BURST_GAP_SECONDS = 30
 # Where this app lives, for the "Check for updates" button in Settings. The
 # check hits GitHub's public releases API (unauthenticated) and compares the
 # latest published (non-prerelease) tag against the running __version__.
-GITHUB_REPO = "fizzlepoof/MeshWX"
+GITHUB_REPO = "fizzlepoof/WXDispatch"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO
 GITHUB_RELEASES_URL = "https://github.com/%s/releases" % GITHUB_REPO
 

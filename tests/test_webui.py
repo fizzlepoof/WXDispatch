@@ -292,7 +292,7 @@ def test_channel_mutations_require_admin_basic_auth(web, path):
     wrong = client.post(path, data=data, headers=admin_auth("wrong password"))
 
     assert unauthenticated.status_code == 401
-    assert unauthenticated.headers["www-authenticate"] == 'Basic realm="MeshWX channel administration"'
+    assert unauthenticated.headers["www-authenticate"] == 'Basic realm="WXDispatch channel administration"'
     assert wrong.status_code == 401
     assert tx.channel_calls == []
 
@@ -534,7 +534,7 @@ def test_routing_page_has_empty_states_and_hash_only_channel_form(web):
     assert "No destinations configured" in response.text
     assert "No routing rules configured" in response.text
     assert 'name="secret"' not in response.text
-    assert "MeshWX creates hash channels only" in response.text
+    assert "WXDispatch creates hash channels only" in response.text
     assert "Anyone who knows the exact channel name can derive its key" in response.text
     assert 'placeholder="#robertson-wx"' in response.text
     assert db_count(_db, "routing_rules") == 0

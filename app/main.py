@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from . import __version__
 from .config import load_bootstrap
 from .db import Database
 from .logging_setup import setup_logging
@@ -51,7 +52,7 @@ async def _startup_serial(db: Database, tx: TransmitManager) -> None:
 async def lifespan(app: FastAPI):
     cfg = load_bootstrap()
     setup_logging()
-    logger.info("starting mesh-wx (db=%s)", cfg.db_path)
+    logger.info("starting WXDispatch (db=%s)", cfg.db_path)
 
     db = Database(cfg.db_path)
     tx = TransmitManager(db)
@@ -81,7 +82,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        logger.info("shutting down mesh-wx")
+        logger.info("shutting down WXDispatch")
         liveness.stop()          # first: never force-exit during a clean shutdown
         beat_task.cancel()
         if not startup_task.done():
@@ -93,7 +94,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="mesh-wx", lifespan=lifespan)
+    app = FastAPI(title="WXDispatch", version=__version__, lifespan=lifespan)
     app.include_router(router)
     return app
 

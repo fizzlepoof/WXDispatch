@@ -1,3 +1,3 @@
-"""mesh-wx: NWS weather alerts broadcast over a Meshtastic node."""
+"""WXDispatch: route NWS and IPAWS alerts over mesh radios."""
 
-__version__ = "1.1.2"
+__version__ = "2.0.0"

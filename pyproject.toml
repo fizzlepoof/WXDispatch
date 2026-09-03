@@ -1,17 +1,18 @@
 [project]
-name = "meshwx"
-version = "1.1.2"
-description = "Poll NWS weather alerts and broadcast them over Meshtastic and/or MeshCore radios"
+name = "wxdispatch"
+version = "2.0.0"
+description = "Route county-aware NWS and IPAWS alerts over Meshtastic and MeshCore radios"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "BrokenSignal" }]
+maintainers = [{ name = "fizzlepoof" }]
 keywords = ["meshtastic", "meshcore", "nws", "weather", "alerts", "emergency", "lora"]
 
 [project.urls]
-Homepage = "https://github.com/fizzlepoof/MeshWX"
-Repository = "https://github.com/fizzlepoof/MeshWX"
-Issues = "https://github.com/fizzlepoof/MeshWX/issues"
+Homepage = "https://github.com/fizzlepoof/WXDispatch"
+Repository = "https://github.com/fizzlepoof/WXDispatch"
+Issues = "https://github.com/fizzlepoof/WXDispatch/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -75,13 +75,13 @@ def test_endpoint_queries_maintained_fork_release_api(client):
     _Client.resp = _Resp(404)
     client.get("/settings/check-updates")
     assert _Client.requested_urls == [
-        "https://api.github.com/repos/fizzlepoof/MeshWX/releases/latest"
+        "https://api.github.com/repos/fizzlepoof/WXDispatch/releases/latest"
     ]
 
 
 def test_endpoint_reports_update_available(client):
     _Client.resp = _Resp(200, {"tag_name": "v1.2.0",
-                               "html_url": "https://github.com/fizzlepoof/MeshWX/releases/tag/v1.2.0"})
+                               "html_url": "https://github.com/fizzlepoof/WXDispatch/releases/tag/v1.2.0"})
     r = client.get("/settings/check-updates")
     assert r.status_code == 200
     assert "Update available" in r.text
