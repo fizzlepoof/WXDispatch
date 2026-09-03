@@ -2,7 +2,9 @@
 {% block title %} &middot; Settings{% endblock %}
 {% block content %}
 <h2>Settings</h2>
+{% if not routing_ready %}<div class="health-banner critical"><div class="hb-title">Automated delivery is inactive</div>{{ routing_inactive_message }} <a href="/routing">Configure routing</a>.</div>{% endif %}
 <form method="post" action="/settings">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
   <div class="panel">
     <h3>Coverage area</h3>

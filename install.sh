@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # MeshWX one-line installer for Debian / Ubuntu / Raspberry Pi:
 #
-#   curl -fsSL https://raw.githubusercontent.com/BrokenSignal/MeshWX/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/fizzlepoof/MeshWX/main/install.sh | sudo bash
 #
 # Installs git, clones the repo to /opt/MeshWX (override with MESHWX_DIR=...),
 # and runs the full native installer.
@@ -11,7 +11,7 @@ set -euo pipefail
   echo "Run with sudo:  curl -fsSL <url>/install.sh | sudo bash" >&2; exit 1; }
 
 DEST="${MESHWX_DIR:-/opt/MeshWX}"
-REPO="https://github.com/BrokenSignal/MeshWX.git"
+REPO="https://github.com/fizzlepoof/MeshWX.git"
 
 if command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive

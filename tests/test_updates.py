@@ -37,6 +37,7 @@ class _Resp:
 
 class _Client:
     resp = _Resp(200, {})
+    requested_urls = []
 
     def __init__(self, *a, **k):
         pass
@@ -48,6 +49,7 @@ class _Client:
         return False
 
     async def get(self, url):
+        _Client.requested_urls.append(url)
         return _Client.resp
 
 
@@ -58,6 +60,7 @@ def client(monkeypatch):
     from fastapi.testclient import TestClient
     monkeypatch.setattr(routes.httpx, "AsyncClient", _Client)
     monkeypatch.setattr(routes, "__version__", "1.1.1")
+    _Client.requested_urls = []
 
     class _FakeDb:
         def get_setting(self, k, default=None):
@@ -68,9 +71,17 @@ def client(monkeypatch):
     return TestClient(app)
 
 
+def test_endpoint_queries_maintained_fork_release_api(client):
+    _Client.resp = _Resp(404)
+    client.get("/settings/check-updates")
+    assert _Client.requested_urls == [
+        "https://api.github.com/repos/fizzlepoof/MeshWX/releases/latest"
+    ]
+
+
 def test_endpoint_reports_update_available(client):
     _Client.resp = _Resp(200, {"tag_name": "v1.2.0",
-                               "html_url": "https://github.com/BrokenSignal/MeshWX/releases/tag/v1.2.0"})
+                               "html_url": "https://github.com/fizzlepoof/MeshWX/releases/tag/v1.2.0"})
     r = client.get("/settings/check-updates")
     assert r.status_code == 200
     assert "Update available" in r.text

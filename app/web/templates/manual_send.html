@@ -3,11 +3,13 @@
 {% block content %}
 <h2>Manual Send</h2>
 <div class="panel">
-  <p class="hint">Manual messages <strong>always transmit</strong> on your
+  <p class="hint">Manual messages are submitted to each enabled radio interface on its
     <strong>live channel</strong> (the same one real alerts use), even when
-    broadcasting is paused. They are logged in the transmit log flagged as manual.</p>
-  <form hx-post="/manual/send" hx-target="#result" hx-swap="innerHTML"
-        onsubmit="return confirm('Transmit this message now?');">
+    automated delivery is paused. Interface acceptance does not confirm over-air delivery.
+    Attempts are logged in the transmit log as manual.</p>
+  <form method="post" hx-post="/manual/send" hx-target="#result" hx-swap="innerHTML"
+        onsubmit="return confirm('Submit this message to the enabled radio interfaces now?');">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label>Message (max {{ max_bytes }} bytes)</label>
     <div class="msgwrap">
       <textarea id="msg" name="text" rows="3" oninput="updateCount()" required></textarea>

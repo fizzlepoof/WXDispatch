@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %} &middot; Edit destination{% endblock %}
+{% block content %}
+<div class="topbar"><div><h2 class="pt">Edit destination</h2><p class="sub">Update this reusable routing destination.</p></div></div>
+<div class="panel">
+<form method="post" action="/routing/destinations/{{ destination.id }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<label>Name</label><input name="name" value="{{ destination.name }}" required maxlength="80">
+<label>Transport</label><select name="transport"><option value="meshcore"{% if destination.transport == 'meshcore' %} selected{% endif %}>MeshCore / OpenHop</option><option value="meshtastic"{% if destination.transport == 'meshtastic' %} selected{% endif %}>Meshtastic</option></select>
+<label>Channel</label><input name="channel" type="number" min="0" max="255" value="{{ destination.channel }}" required>
+<label class="chk"><input name="enabled" type="checkbox"{% if destination.enabled %} checked{% endif %}> Enabled</label>
+<button>Save destination</button> <a class="btn secondary" href="/routing">Cancel</a>
+</form>
+</div>
+{% endblock %}

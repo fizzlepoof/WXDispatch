@@ -5,10 +5,10 @@
 
 <div class="panel">
   <h3>Send test message</h3>
-  <p class="hint">Keys up a radio with <code>[WX] mesh-wx test</code>. It always sends,
-    even when broadcasting is paused, and goes out on the <strong>test channel</strong>
-    (channel 1, the second channel), never the live alert channel. Use this to confirm
-    a radio actually transmits before you rely on it.</p>
+  <p class="hint">Submits <code>[WX] mesh-wx test</code> to a radio interface even when
+    automated delivery is paused. It uses the configured <strong>test channel</strong>,
+    never the live alert channel. MeshCore companion or Meshtastic node acceptance does
+    not confirm over-air delivery; verify reception on another node.</p>
   {% set on = transports | selectattr("enabled") | list %}
   {% if on %}
   <div style="display:flex;flex-wrap:wrap;gap:10px;">

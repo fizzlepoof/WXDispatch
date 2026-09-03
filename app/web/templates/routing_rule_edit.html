@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %} &middot; Edit routing rule{% endblock %}
+{% block content %}
+<div class="topbar"><div><h2 class="pt">Edit routing rule</h2><p class="sub">Update this manually created rule and its associations.</p></div></div>
+<div class="panel">
+<form method="post" action="/routing/rules/{{ rule.id }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="row">
+    <div><label>Name</label><input name="name" value="{{ rule.name }}" required maxlength="80"></div>
+    <div><label>Priority (lower runs first)</label><input name="priority" type="number" value="{{ rule.priority }}" required></div>
+  </div>
+  <label>Counties, one per line as <code>zone_code | county_name</code></label>
+  <textarea name="counties" rows="4" required>{% for county in rule.counties %}{{ county.zone_code }} | {{ county.county_name }}{% if not loop.last %}
+{% endif %}{% endfor %}</textarea>
+  <label class="chk"><input name="all_warnings" type="checkbox"{% if rule.all_warnings %} checked{% endif %}> Match all warning products</label>
+  {% for group, events in event_groups.items() %}
+  <div class="grp-title">{{ group }}</div>
+  <div class="checkgrid">{% for event in events %}<label class="chk"><input type="checkbox" name="events" value="{{ event }}"{% if event in selected_events %} checked{% endif %}> {{ event }}</label>{% endfor %}</div>
+  {% endfor %}
+  <span class="fld-lbl">Destinations</span>
+  <div class="checkgrid">{% for destination in destinations %}<label class="chk"><input type="checkbox" name="destination_ids" value="{{ destination.id }}"{% if destination.id in selected_destinations %} checked{% endif %}> {{ destination.name }} ({{ destination.transport }} ch {{ destination.channel }})</label>{% else %}<span class="hint">Create a destination first.</span>{% endfor %}</div>
+  <label class="chk"><input name="enabled" type="checkbox"{% if rule.enabled %} checked{% endif %}> Enabled</label>
+  <button>Save rule</button> <a class="btn" href="/routing">Cancel</a>
+</form>
+</div>
+{% endblock %}

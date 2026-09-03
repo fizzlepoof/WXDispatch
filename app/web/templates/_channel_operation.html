@@ -1,0 +1,5 @@
+<div class="health-banner {{ 'ok' if ok else 'critical' }}" role="status">
+  <div class="hb-title">{{ 'Success' if ok else 'Channel operation failed' }}</div>
+  <div>{{ message }}</div>
+  {% if channel %}<div class="hint">Slot {{ channel.index }}: {{ channel.name or '(empty)' }}</div>{% endif %}
+</div>

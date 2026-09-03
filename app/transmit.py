@@ -11,8 +11,10 @@ from __future__ import annotations
 import abc
 import asyncio
 import logging
+import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from .config import BURST_GAP_SECONDS, REPEAT_GAP_SECONDS, QUEUE_MAX, MAX_PAYLOAD_BYTES
@@ -34,7 +36,53 @@ class TxUnsent(Exception):
         self.category = category
         self.detail = detail
 
+
+def _is_meshcore_link_failure(exc: BaseException) -> bool:
+    return isinstance(exc, (
+        ConnectionError,
+        EOFError,
+        asyncio.TimeoutError,
+        asyncio.IncompleteReadError,
+    ))
+
+
+class _MeshCoreChannelLinkError(RuntimeError):
+    """A sanitized channel-link failure with mutation retry safety metadata."""
+
+    def __init__(self, *, retry_safe: bool):
+        super().__init__("MeshCore channel connection failed")
+        self.retry_safe = retry_safe
+
 logger = logging.getLogger("mesh_wx.tx")
+
+_meshcore_log_suppression_lock = threading.RLock()
+_meshcore_log_suppression_depth = 0
+_meshcore_log_prior_disabled = False
+
+
+@contextmanager
+def _suppress_meshcore_dependency_logging():
+    """Silence secret-bearing dependency frames across overlapping operations."""
+    global _meshcore_log_suppression_depth, _meshcore_log_prior_disabled
+    meshcore_logger = logging.getLogger("meshcore")
+    with _meshcore_log_suppression_lock:
+        if _meshcore_log_suppression_depth == 0:
+            _meshcore_log_prior_disabled = meshcore_logger.disabled
+            meshcore_logger.disabled = True
+        _meshcore_log_suppression_depth += 1
+    try:
+        yield
+    finally:
+        with _meshcore_log_suppression_lock:
+            _meshcore_log_suppression_depth -= 1
+            if _meshcore_log_suppression_depth == 0:
+                meshcore_logger.disabled = _meshcore_log_prior_disabled
+
+
+def _cap_text(text: str) -> str:
+    while len(text.encode("utf-8")) > MAX_PAYLOAD_BYTES:
+        text = text[:-1]
+    return text
 
 
 class Transmitter(abc.ABC):
@@ -191,10 +239,120 @@ class MeshtasticTransmitter(Transmitter):
 
 class MeshCoreTransmitter(Transmitter):
     label = "MeshCore"
+    # Older companion firmware does not report its slot count. Preserve the
+    # app's previous eight-slot behavior rather than probing arbitrary indexes.
+    FALLBACK_MAX_CHANNELS = 8
 
     def __init__(self, conn: str, port: str = "", host: str = "", baud: int = 115200):
         self.conn, self.port, self.host, self.baud = conn, port, host, baud
         self._mc = None
+
+    async def _device_info(self) -> dict:
+        if self._mc is None:
+            raise RuntimeError("not connected")
+        from meshcore import EventType
+        try:
+            res = await self._mc.commands.send_device_query()
+        except Exception as exc:
+            if _is_meshcore_link_failure(exc):
+                raise _MeshCoreChannelLinkError(retry_safe=True) from None
+            raise
+        if getattr(res, "type", None) != EventType.DEVICE_INFO:
+            raise RuntimeError("companion did not return device information")
+        payload = getattr(res, "payload", None)
+        if not isinstance(payload, dict):
+            raise RuntimeError("companion returned an invalid device information payload")
+        return payload
+
+    @staticmethod
+    def _max_channels_from_info(info: dict) -> int:
+        if "max_channels" not in info:
+            return MeshCoreTransmitter.FALLBACK_MAX_CHANNELS
+        value = info["max_channels"]
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise RuntimeError("companion returned invalid max_channels")
+        return value
+
+    async def _read_channel_at(self, index: int) -> dict:
+        from meshcore import EventType
+        try:
+            with _suppress_meshcore_dependency_logging():
+                res = await self._mc.commands.get_channel(index)
+        except Exception as exc:
+            if _is_meshcore_link_failure(exc):
+                raise _MeshCoreChannelLinkError(retry_safe=True) from None
+            raise
+        if getattr(res, "type", None) != EventType.CHANNEL_INFO:
+            raise RuntimeError("companion did not return channel information")
+        payload = getattr(res, "payload", {}) or {}
+        return {
+            "index": int(payload.get("channel_idx", index)),
+            "name": payload.get("channel_name") or "",
+            "secret": payload.get("channel_secret"),
+        }
+
+    async def set_channel(self, index: int, name: str, secret: bytes) -> dict:
+        if self._mc is None:
+            raise RuntimeError("not connected")
+        from meshcore import EventType
+        max_channels = self._max_channels_from_info(await self._device_info())
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < max_channels:
+            raise ValueError("channel index is out of range")
+        if not isinstance(name, str) or not name:
+            raise ValueError("channel name is required")
+        if "\x00" in name:
+            raise ValueError("channel name must not contain NUL")
+        if len(name.encode("utf-8")) > 32:
+            raise ValueError("channel name must be at most 32 UTF-8 bytes")
+        if name.startswith("#"):
+            raise ValueError("channel names beginning with # are not supported")
+        if not isinstance(secret, bytes) or len(secret) != 16:
+            raise ValueError("channel secret must be exactly 16 bytes")
+        try:
+            with _suppress_meshcore_dependency_logging():
+                res = await self._mc.commands.set_channel(index, name, secret)
+        except Exception as exc:
+            if _is_meshcore_link_failure(exc):
+                raise _MeshCoreChannelLinkError(retry_safe=False) from None
+            raise
+        with _suppress_meshcore_dependency_logging():
+            if getattr(res, "type", None) != EventType.OK:
+                raise RuntimeError("companion did not accept channel update")
+            try:
+                readback = await self._read_channel_at(index)
+            except _MeshCoreChannelLinkError:
+                raise _MeshCoreChannelLinkError(retry_safe=False) from None
+            if (readback["index"] != index or readback["name"] != name
+                    or readback["secret"] != secret):
+                raise RuntimeError("channel readback did not match requested update")
+        return {"index": index, "name": name}
+
+    async def clear_channel(self, index: int) -> dict:
+        if self._mc is None:
+            raise RuntimeError("not connected")
+        from meshcore import EventType
+        max_channels = self._max_channels_from_info(await self._device_info())
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < max_channels:
+            raise ValueError("channel index is out of range")
+        zero_secret = b"\x00" * 16
+        try:
+            with _suppress_meshcore_dependency_logging():
+                res = await self._mc.commands.set_channel(index, "", zero_secret)
+        except Exception as exc:
+            if _is_meshcore_link_failure(exc):
+                raise _MeshCoreChannelLinkError(retry_safe=False) from None
+            raise
+        with _suppress_meshcore_dependency_logging():
+            if getattr(res, "type", None) != EventType.OK:
+                raise RuntimeError("companion did not accept channel clear")
+            try:
+                readback = await self._read_channel_at(index)
+            except _MeshCoreChannelLinkError:
+                raise _MeshCoreChannelLinkError(retry_safe=False) from None
+            if (readback["index"] != index or readback["name"] != ""
+                    or readback["secret"] != zero_secret):
+                raise RuntimeError("channel readback did not match requested clear")
+        return {"index": index, "name": ""}
 
     async def connect(self) -> None:
         from meshcore import MeshCore  # lazy: optional dependency
@@ -217,38 +375,16 @@ class MeshCoreTransmitter(Transmitter):
     async def send_text(self, text: str, channel: int) -> None:
         if self._mc is None:
             raise RuntimeError("not connected")
-        # The device's OK/timeout is NOT proof of RF -- a channel broadcast has no
-        # ACK, so an "OK" only means the command was accepted, not that the radio
-        # keyed up. Confirm the actual transmission by watching the radio's own
-        # flood-TX counter advance (proven: it ticks by 1 per real send, and stays
-        # flat when the radio does not transmit).
         from meshcore import EventType
-        before = await self._flood_tx()
         res = await self._mc.commands.send_chan_msg(channel, text)
-        # Capture the device's own error reason, if it gave one, for diagnostics.
-        reason = ""
-        if getattr(res, "type", None) == EventType.ERROR:
+        result_type = getattr(res, "type", None)
+        if result_type != EventType.OK:
             payload = getattr(res, "payload", {}) or {}
             reason = payload.get("reason", "") if isinstance(payload, dict) else ""
-        if before is None:
-            return  # counter unreadable: fall back to best-effort (never block sends)
-        for _ in range(15):                       # poll up to ~4.5s
-            await asyncio.sleep(0.3)
-            after = await self._flood_tx()
-            if after is not None and after > before:
-                return                            # verified on the air (flood_tx advanced)
-        detail = "radio did not transmit (TX counter did not advance%s)" % (
-            "; %s" % reason if reason else "")
-        raise TxUnsent("unsent", detail)
-
-    async def _flood_tx(self):
-        try:
-            res = await self._mc.commands.get_stats_packets()
-            p = getattr(res, "payload", {}) or {}
-            v = p.get("flood_tx")
-            return int(v) if v is not None else None
-        except Exception:
-            return None
+            detail = "companion rejected channel message" if result_type == EventType.ERROR \
+                else "no OK confirmation from companion"
+            raise TxUnsent("unsent", detail + ((": " + reason) if reason else ""))
+        logger.info("MeshCore channel message accepted by companion")
 
     async def close(self) -> None:
         if self._mc is not None:
@@ -260,37 +396,40 @@ class MeshCoreTransmitter(Transmitter):
 
     @property
     def connected(self) -> bool:
-        return self._mc is not None
+        if self._mc is None:
+            return False
+        if self.conn == "tcp":
+            manager = getattr(self._mc, "connection_manager", None)
+            if manager is not None:
+                return bool(getattr(manager, "is_connected", False))
+        return True
+
+    async def read_channel(self, index: int) -> dict:
+        """Inspect one slot while keeping protocol secrets private."""
+        max_channels = self._max_channels_from_info(await self._device_info())
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < max_channels:
+            raise ValueError("channel index is out of range")
+        channel = await self._read_channel_at(index)
+        return {"index": channel["index"], "name": channel["name"]}
 
     async def read_channels(self) -> list:
         if self._mc is None:
             raise RuntimeError("not connected")
-        from meshcore import EventType
+        info = await self._device_info()
         out = []
-        for idx in range(0, 8):
-            res = await self._mc.commands.get_channel(idx)
-            if getattr(res, "type", None) != EventType.CHANNEL_INFO:
-                break  # device ran out of channel slots
-            p = getattr(res, "payload", {}) or {}
-            name = (p.get("channel_name") or "").strip()
-            if not name:
-                continue  # empty/unconfigured slot
-            out.append({"index": int(p.get("channel_idx", idx)), "name": name})
+        for idx in range(self._max_channels_from_info(info)):
+            channel = await self._read_channel_at(idx)
+            if channel["name"]:
+                out.append({"index": channel["index"], "name": channel["name"]})
         return out
 
     async def read_info(self) -> dict:
         if self._mc is None:
             return {}
-        from meshcore import EventType
-        try:
-            res = await self._mc.commands.send_device_query()
-        except Exception:
-            return {}
-        if getattr(res, "type", None) != EventType.DEVICE_INFO:
-            return {}
-        p = getattr(res, "payload", {}) or {}
-        return {"model": (p.get("model") or "").strip(),
-                "firmware": (p.get("ver") or "").strip()}
+        payload = await self._device_info()
+        return {"model": (payload.get("model") or "").strip(),
+                "firmware": (payload.get("ver") or "").strip(),
+                "max_channels": self._max_channels_from_info(payload)}
 
 
 def _fmt_model(info: dict) -> str:
@@ -324,6 +463,11 @@ class QueueItem:
     on_test: bool = False      # False = live channel (weather), True = test channel (IPAWS)
     log_tx: bool = True        # write the weather transmit_log (False for IPAWS -- logged separately)
     on_result: object = None   # optional callable(ok: bool, err: str) invoked after the send
+    transport: str | None = None
+    channel: int | None = None
+    destination_id: int | None = None
+    correlation_key: object = None
+    require_prior_success: bool = False
 
 
 def _build_transports(db) -> dict:
@@ -373,6 +517,8 @@ class TransmitManager:
         self._worker_task: asyncio.Task | None = None
         self._reconnect_delay = 2.0
         self._stopped = False
+        self._chain_results: dict[object, bool] = {}
+        self._meshcore_channel_reconnect_depth = 0
 
     # ---- lifecycle ------------------------------------------------------
     def start(self) -> None:
@@ -440,6 +586,139 @@ class TransmitManager:
         self._db.set_setting("serial_port", port or "")
         await self.reconfigure()
 
+    async def _refresh_meshcore_channel_cache(self, tx) -> dict:
+        channels = await tx.read_channels()
+        info = await tx.read_info()
+        model = _fmt_model(info)
+        max_channels = info.get("max_channels", MeshCoreTransmitter.FALLBACK_MAX_CHANNELS)
+        self._db.set_setting("meshcore_channels", channels)
+        self._db.set_setting("meshcore_model", model)
+        self._db.set_setting("meshcore_max_channels", max_channels)
+        return {"channels": channels, "model": model, "max_channels": max_channels}
+
+    async def _ensure_meshcore_channel_transport(self, transport: Transport) -> bool:
+        """Reconnect a configured TCP link whose backend reports it stale."""
+        if (transport.conn == "tcp" and transport.tx is not None
+                and not transport.tx.connected):
+            transport.connected = False
+            return await self._reconnect_meshcore_channel(transport)
+        return await self._ensure(transport)
+
+    async def _reconnect_meshcore_channel(self, transport: Transport) -> bool:
+        """Reconnect without publishing errors from a secret-bearing operation."""
+        self._meshcore_channel_reconnect_depth += 1
+        try:
+            try:
+                reconnected = await self._reconnect(transport)
+            except Exception:
+                reconnected = False
+        finally:
+            self._meshcore_channel_reconnect_depth -= 1
+        if not reconnected:
+            transport.error = "MeshCore channel connection failed"
+        return reconnected
+
+    async def set_meshcore_channel(self, index: int, name: str, secret: bytes) -> dict:
+        """Set one channel on the configured MeshCore companion under the radio lock."""
+        async with self._lock:
+            transport = self._transports["meshcore"]
+            if not transport.enabled:
+                return {"ok": False, "error": "MeshCore is disabled"}
+            if not await self._ensure_meshcore_channel_transport(transport) or transport.tx is None:
+                return {"ok": False, "error": "MeshCore channel update failed"}
+            for attempt in range(2):
+                try:
+                    channel = await transport.tx.set_channel(index, name, secret)
+                    break
+                except Exception as exc:
+                    retry_safe = (isinstance(exc, _MeshCoreChannelLinkError)
+                                  and exc.retry_safe)
+                    link_failed = (isinstance(exc, _MeshCoreChannelLinkError)
+                                   or _is_meshcore_link_failure(exc))
+                    if link_failed and transport.conn == "tcp":
+                        transport.connected = False
+                        reconnected = await self._reconnect_meshcore_channel(transport)
+                        if (attempt == 0 and retry_safe and reconnected
+                                and transport.tx is not None):
+                            continue
+                    return {"ok": False, "error": "MeshCore channel update failed"}
+            else:
+                return {"ok": False, "error": "MeshCore channel update failed"}
+            try:
+                snapshot = await self._refresh_meshcore_channel_cache(transport.tx)
+            except Exception:
+                return {
+                    "ok": True,
+                    "error": "",
+                    "channel": channel,
+                    "cache_refreshed": False,
+                    "warning": "Channel updated, but channel cache refresh failed",
+                }
+            return {"ok": True, "error": "", "channel": channel, **snapshot}
+
+    async def inspect_meshcore_channel(self, index: int) -> dict:
+        """Inspect a configured slot while keeping its wire secret internal."""
+        async with self._lock:
+            transport = self._transports["meshcore"]
+            if not transport.enabled:
+                return {"ok": False, "error": "MeshCore is disabled"}
+            if not await self._ensure_meshcore_channel_transport(transport) or transport.tx is None:
+                return {"ok": False, "error": "MeshCore channel inspection failed"}
+            for attempt in range(2):
+                try:
+                    channel = await transport.tx.read_channel(index)
+                    snapshot = await self._refresh_meshcore_channel_cache(transport.tx)
+                    return {"ok": True, "error": "", "channel": channel, **snapshot}
+                except Exception as exc:
+                    link_failed = (isinstance(exc, _MeshCoreChannelLinkError)
+                                   or _is_meshcore_link_failure(exc))
+                    if link_failed and transport.conn == "tcp":
+                        transport.connected = False
+                        if (attempt == 0
+                                and await self._reconnect_meshcore_channel(transport)
+                                and transport.tx is not None):
+                            continue
+                    return {"ok": False, "error": "MeshCore channel inspection failed"}
+            return {"ok": False, "error": "MeshCore channel inspection failed"}
+
+    async def clear_meshcore_channel(self, index: int) -> dict:
+        """Clear one slot on the configured MeshCore companion under the radio lock."""
+        async with self._lock:
+            transport = self._transports["meshcore"]
+            if not transport.enabled:
+                return {"ok": False, "error": "MeshCore is disabled"}
+            if not await self._ensure_meshcore_channel_transport(transport) or transport.tx is None:
+                return {"ok": False, "error": "MeshCore channel clear failed"}
+            for attempt in range(2):
+                try:
+                    channel = await transport.tx.clear_channel(index)
+                    break
+                except Exception as exc:
+                    retry_safe = (isinstance(exc, _MeshCoreChannelLinkError)
+                                  and exc.retry_safe)
+                    link_failed = (isinstance(exc, _MeshCoreChannelLinkError)
+                                   or _is_meshcore_link_failure(exc))
+                    if link_failed and transport.conn == "tcp":
+                        transport.connected = False
+                        reconnected = await self._reconnect_meshcore_channel(transport)
+                        if (attempt == 0 and retry_safe and reconnected
+                                and transport.tx is not None):
+                            continue
+                    return {"ok": False, "error": "MeshCore channel clear failed"}
+            else:
+                return {"ok": False, "error": "MeshCore channel clear failed"}
+            try:
+                snapshot = await self._refresh_meshcore_channel_cache(transport.tx)
+            except Exception:
+                return {
+                    "ok": True,
+                    "error": "",
+                    "channel": channel,
+                    "cache_refreshed": False,
+                    "warning": "Channel cleared, but channel cache refresh failed",
+                }
+            return {"ok": True, "error": "", "channel": channel, **snapshot}
+
     # ---- connection -----------------------------------------------------
     async def _ensure(self, t: Transport) -> bool:
         if t.connected and t.tx is not None:
@@ -481,9 +760,47 @@ class TransmitManager:
     # ---- sending --------------------------------------------------------
     def enqueue(self, text: str, channel: int | None = None, on_result=None) -> bool:
         """Queue a weather alert (HIGH priority, live channel). on_result(ok, err)
-        fires after the send with the REAL verified outcome."""
+        fires after the send with the transport-reported outcome."""
         return self._enqueue(self._queue, text, on_test=False, log_tx=True,
                              on_result=on_result)
+
+    def enqueue_destination(self, text: str, transport: str, channel: int,
+                            destination_id: int, on_result=None) -> bool:
+        if transport not in self._transports:
+            if on_result:
+                self._safe_result(on_result, False, "unknown transport")
+            return False
+        return self._enqueue(self._queue, text, on_test=False, log_tx=True,
+                             on_result=on_result, transport=transport,
+                             channel=channel, destination_id=destination_id)
+
+    def enqueue_destination_chain(self, text: str, transport: str, channel: int,
+                                  destination_id: int, correlation_key,
+                                  require_prior_success: bool = False,
+                                  on_result=None) -> bool:
+        if transport not in self._transports:
+            if on_result:
+                self._safe_result(on_result, False, "unknown transport")
+            return False
+        return self._enqueue(
+            self._queue, text, on_test=False, log_tx=True, on_result=on_result,
+            transport=transport, channel=channel, destination_id=destination_id,
+            correlation_key=correlation_key,
+            require_prior_success=require_prior_success,
+        )
+
+    def cancel_queued_correlation(self, correlation_key) -> int:
+        """Remove unsent items in a delivery chain; an in-flight item is untouched."""
+        removed = []
+        for lane in (self._queue, self._queue_low):
+            kept = [item for item in lane if item.correlation_key != correlation_key]
+            removed.extend(item for item in lane if item.correlation_key == correlation_key)
+            lane.clear()
+            lane.extend(kept)
+        for item in removed:
+            if item.on_result is not None:
+                self._safe_result(item.on_result, False, "superseded")
+        return len(removed)
 
     def enqueue_ipaws(self, text: str, on_test: bool = False, on_result=None) -> bool:
         """Queue an IPAWS alert (LOW priority: weather always sends first). Real
@@ -492,7 +809,9 @@ class TransmitManager:
         return self._enqueue(self._queue_low, text, on_test=on_test, log_tx=False,
                              on_result=on_result)
 
-    def _enqueue(self, lane, text, on_test, log_tx, on_result) -> bool:
+    def _enqueue(self, lane, text, on_test, log_tx, on_result, transport=None,
+                 channel=None, destination_id=None, correlation_key=None,
+                 require_prior_success=False) -> bool:
         dropped = len(lane) == lane.maxlen
         if dropped:
             # The item we are about to drop never gets a send: report it failed so
@@ -500,7 +819,11 @@ class TransmitManager:
             oldest = lane[0] if lane else None
             if oldest is not None and oldest.on_result is not None:
                 self._safe_result(oldest.on_result, False, "dropped (queue full)")
-        lane.append(QueueItem(text=text, on_test=on_test, log_tx=log_tx, on_result=on_result))
+        lane.append(QueueItem(text=_cap_text(text), on_test=on_test, log_tx=log_tx,
+                              on_result=on_result, transport=transport, channel=channel,
+                              destination_id=destination_id,
+                              correlation_key=correlation_key,
+                              require_prior_success=require_prior_success))
         self._queue_event.set()
         if dropped:
             logger.warning("transmit queue full; dropped oldest")
@@ -522,6 +845,7 @@ class TransmitManager:
         can hang on a wedged reader thread. So: close firmly with a timeout, then
         reopen with backoff, waiting out a still-locked port instead of giving up."""
         t.connected = False
+        sanitize_errors = self._meshcore_channel_reconnect_depth > 0
         if t.tx is not None:
             try:
                 await asyncio.wait_for(t.tx.close(), timeout=8)  # don't hang on a stuck close
@@ -540,16 +864,28 @@ class TransmitManager:
                 return True
             last = err
             if self._is_port_locked(err):
-                logger.warning("%s port still locked (try %d/4), waiting: %s",
-                               t.name, i + 1, err)
+                if sanitize_errors:
+                    logger.warning(
+                        "%s port still locked during channel reconnect (try %d/4)",
+                        t.name, i + 1)
+                else:
+                    logger.warning("%s port still locked (try %d/4), waiting: %s",
+                                   t.name, i + 1, err)
+            elif sanitize_errors:
+                logger.warning("%s channel reconnect failed (try %d/4)",
+                               t.name, i + 1)
             else:
                 logger.warning("%s reopen failed (try %d/4): %s", t.name, i + 1, err)
-        t.error = last
-        self._db.add_error(t.name, "link reset failed: %s" % last)
+        if sanitize_errors:
+            t.error = "MeshCore channel connection failed"
+            self._db.add_error(t.name, t.error)
+        else:
+            t.error = last
+            self._db.add_error(t.name, "link reset failed: %s" % last)
         return False
 
     async def _try_send(self, t: Transport, text: str, ch: int) -> tuple[bool, str]:
-        """Send and confirm the radio actually transmitted. On failure, read WHY
+        """Send and require the backend's success confirmation. On failure, read WHY
         (TxUnsent.category) and apply the matching correction before retrying:
         wait out an airtime/queue limit, reconnect a dead link, or stop early on a
         content/config error that a retry cannot fix. Returns (ok, error)."""
@@ -605,10 +941,9 @@ class TransmitManager:
         # each radio's LIVE channel; only the Troubleshoot test uses the test channel.
         use_test = manual if on_test is None else on_test
         async with self._lock:
-            # Each enabled radio gets ONE send that is VERIFIED to have gone out
-            # (the send path retries internally on failure/no-transmit). No blind
-            # repeats: a message is logged "sent" only when the radio confirmed it
-            # actually keyed up, otherwise "failed" so the miss is visible.
+            # Each enabled radio gets one confirmed backend operation. Meshtastic
+            # confirms queue acceptance; MeshCore only confirms that its companion
+            # accepted the command (not that any receiver heard it).
             for t in self._transports.values():
                 if not t.enabled:
                     continue
@@ -618,7 +953,10 @@ class TransmitManager:
                                           error=("" if ok else err), transport=t.name)
                 if ok:
                     any_ok = True
-                    logger.info("transmitted via %s on ch %d (verified)", t.name, ch)
+                    if t.name == "meshcore":
+                        logger.info("accepted by MeshCore companion on ch %d", ch)
+                    else:
+                        logger.info("transmitted via %s on ch %d", t.name, ch)
         return any_ok
 
     async def send_manual(self, text: str) -> bool:
@@ -683,7 +1021,10 @@ class TransmitManager:
             self._db.add_transmit_log(ch, blen, ok, text, True,
                                       error=("" if ok else err), transport=t.name)
             if ok:
-                logger.info("test transmitted via %s on ch %d", t.name, ch)
+                if t.name == "meshcore":
+                    logger.info("test accepted by MeshCore companion on ch %d", ch)
+                else:
+                    logger.info("test transmitted via %s on ch %d", t.name, ch)
             return ok, ("" if ok else err)
 
     async def resend(self, name: str, text: str, channel: int) -> tuple[bool, str]:
@@ -700,23 +1041,30 @@ class TransmitManager:
             self._db.add_transmit_log(channel, blen, ok, text, True,
                                       error=("" if ok else err), transport=t.name)
             if ok:
-                logger.info("resent via %s on ch %d", t.name, channel)
+                if t.name == "meshcore":
+                    logger.info("resend accepted by MeshCore companion on ch %d", channel)
+                else:
+                    logger.info("resent via %s on ch %d", t.name, channel)
             return ok, ("" if ok else err)
 
     async def _transmit_item(self, item: QueueItem) -> tuple[bool, str]:
-        """Send one queued item on the right channel (live vs test), verified per
+        """Send one queued item on the right channel (live vs test), confirmed per
         radio. Weather items also write the transmit_log; IPAWS items do not."""
         blen = len(item.text.encode())
         any_ok, last = False, ""
         async with self._lock:
-            for t in self._transports.values():
+            transports = ([self._transports[item.transport]] if item.transport else
+                          list(self._transports.values()))
+            for t in transports:
                 if not t.enabled:
                     continue
-                ch = t.test_channel if item.on_test else t.channel
+                ch = (item.channel if item.channel is not None else
+                      (t.test_channel if item.on_test else t.channel))
                 ok, err = await self._try_send(t, item.text, ch)
                 if item.log_tx:
                     self._db.add_transmit_log(ch, blen, ok, item.text, False,
-                                              error=("" if ok else err), transport=t.name)
+                                              error=("" if ok else err), transport=t.name,
+                                              destination_id=item.destination_id)
                 any_ok = any_ok or ok
                 if not ok:
                     last = err
@@ -741,17 +1089,32 @@ class TransmitManager:
             # Weather (high) always drains before IPAWS (low), so a real warning
             # never waits behind a backlog of secondary alerts.
             item = self._queue.popleft() if self._queue else self._queue_low.popleft()
+            if (item.require_prior_success and
+                    self._chain_results.get(item.correlation_key) is not True):
+                if item.on_result is not None:
+                    self._safe_result(
+                        item.on_result, False, "predecessor was not accepted"
+                    )
+                first = False
+                continue
             try:
                 ok, err = await self._transmit_item(item)
+                if item.correlation_key is not None:
+                    self._chain_results[item.correlation_key] = ok
                 if item.on_result is not None:
                     self._safe_result(item.on_result, ok, err)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 # A failure here (e.g. a DB write erroring on a full disk) must not
                 # kill the worker -- that would silently stop ALL future broadcasts.
                 logger.exception("transmit worker iteration error")
                 ok = False
+                err = str(exc)
+                if item.correlation_key is not None:
+                    self._chain_results[item.correlation_key] = False
+                if item.on_result is not None:
+                    self._safe_result(item.on_result, False, err)
             first = False
             if not ok:
                 await asyncio.sleep(self._reconnect_delay)

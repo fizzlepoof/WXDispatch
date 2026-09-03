@@ -9,7 +9,9 @@ authors = [{ name = "BrokenSignal" }]
 keywords = ["meshtastic", "meshcore", "nws", "weather", "alerts", "emergency", "lora"]
 
 [project.urls]
-Homepage = "https://brokensignal.tv/MeshWX/"
+Homepage = "https://github.com/fizzlepoof/MeshWX"
+Repository = "https://github.com/fizzlepoof/MeshWX"
+Issues = "https://github.com/fizzlepoof/MeshWX/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

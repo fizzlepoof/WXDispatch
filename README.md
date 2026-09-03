@@ -36,6 +36,12 @@
 > official channel: a NOAA Weather Radio, wireless emergency alerts, or local sirens.
 > Test it in **dry-run mode** before you trust it, and review the settings for your area.
 
+> [!IMPORTANT]
+> **Routing starts empty on both first install and upgrade.** Upgrades intentionally create no
+> automatic destinations or routing rules. Automated delivery remains inactive until you open
+> **Routing**, create and enable a destination and routing rule before disabling dry-run. This
+> prevents an upgrade from silently choosing a radio, channel, county, or audience for you.
+
 ## Why it exists
 
 When a hurricane or flood takes out the towers, a LoRa mesh often keeps working, but the
@@ -72,12 +78,13 @@ Pick the one that matches your box. All three run the exact same app.
 ```bash
 docker run -d --name meshwx \
   -p 8110:8000 \
+  -e MESHWX_ADMIN_PASSWORD='choose-a-long-random-password' \
   -v meshwx-data:/data \
   --device-cgroup-rule='c 188:* rmw' \
   --device-cgroup-rule='c 166:* rmw' \
   -v /dev:/dev \
   --restart unless-stopped \
-  ghcr.io/brokensignal/meshwx:latest
+  ghcr.io/fizzlepoof/meshwx:latest
 ```
 
 Or clone the repo and `docker compose up -d`. Then open `http://<host>:8110`.
@@ -89,7 +96,7 @@ pinning a device path (they renumber on replug). See the compose file for detail
 64-bit Raspberry Pi OS, or any Debian / Ubuntu. Plug in your radio, then run **one command**:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BrokenSignal/MeshWX/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/fizzlepoof/MeshWX/main/install.sh | sudo bash
 ```
 
 That is the whole install. It installs everything it needs (Python, venv, pip, git), puts
@@ -103,7 +110,7 @@ remember and no folder to clean up.
 <details><summary>Advanced: clone and run the installer manually</summary>
 
 ```bash
-git clone https://github.com/BrokenSignal/MeshWX.git
+git clone https://github.com/fizzlepoof/MeshWX.git
 cd MeshWX && sudo ./packaging/install-linux.sh
 ```
 
@@ -133,8 +140,18 @@ No Python install required. Windows may warn about an unrecognized app the first
 3. **Coverage**: pick your state, check your counties.
 4. **What to broadcast**: leave *All Warnings* on; add any watches/advisories you want.
 5. **Radios**: enable Meshtastic and/or MeshCore. For each, choose **USB** or **network (IP/TCP)**, click **Connect and load channels**, then pick which channel carries live alerts and which carries test messages.
-6. Save, then go to **Troubleshoot → Send test** to confirm each radio actually transmits.
-7. When you're confident, turn **dry-run off** on the dashboard to go live.
+6. Save, then open **Routing**. Create and enable at least one destination, then create and
+   enable a county/event rule that uses it. MeshWX never creates routing rules automatically.
+7. Go to **Troubleshoot → Send test**. A success response means the request was accepted by
+   Meshtastic node software or accepted by MeshCore companion software; it does **not** prove
+   over-air delivery. Confirm reception on a separate listening node.
+8. Only after routing and reception are verified, turn **dry-run off** on the dashboard. MeshWX
+   blocks LIVE mode when no enabled rule has an enabled destination.
+
+Upgrading an existing installation uses the same safety rule: **Upgrades intentionally create
+no automatic destinations or routing rules.** Review **Routing**, create and enable a destination
+and routing rule before disabling dry-run. Existing radio settings do not become routes by
+themselves.
 
 <p align="center">
   <a href="docs/settings-1.png"><img src="docs/settings-1.png" alt="MeshWX Settings: coverage area and which alerts to broadcast" width="47%"></a>
@@ -173,20 +190,21 @@ MeshWX keeps testing off the air people are actually watching:
 
 - **Channel 0 is the live channel**: real NWS alerts broadcast there (each radio's
   alert channel, index 0 by default).
-- **Channel 1 is the test channel**: the per-radio **Test** buttons transmit there, so
-  testing never clutters the live alert channel. The manual-send page broadcasts on the
-  **live** channel instead, since those are real messages you compose for people.
+- **Channel 1 is the test channel**: the per-radio **Test** buttons submit there, keeping tests
+  separate from the live alert channel. The manual-send page submits to the **live** channel
+  instead, since those are real messages you compose for people.
 
 Both are set in **Settings** (per-radio alert channel, plus a per-radio **Test channel**).
 Point your listening node at channel 0 for real alerts, or channel 1 to watch tests.
 
-### Verified sends
+### Interface acceptance is not RF delivery
 
-LoRa channel broadcasts are unacknowledged, so a radio can report success without actually
-transmitting. MeshWX confirms each send against the radio's own transmit counter: a message
-is logged **sent** only when the radio really keyed up. A send that does not go out is
-retried and then logged **failed**, so a miss shows in the transmit log rather than being
-silently lost.
+LoRa channel broadcasts are unacknowledged. For MeshCore, a successful WebUI result means the
+request was **accepted by MeshCore companion**; it does not prove that the radio transmitted or
+that another node received it. For Meshtastic, success means the request was **accepted by
+Meshtastic node** software, likewise without proof of over-air delivery. The transmit log records
+interface outcomes and failures, not RF delivery receipts. Verify tests on a separate receiving
+node before relying on the system.
 
 ### IPAWS alerts (FEMA)
 
@@ -204,14 +222,20 @@ come through.
 
 ## Configuration
 
-Only three settings come from the environment (needed to boot). Everything else lives in
-the UI and the database.
+Only bootstrap and channel-administration settings come from the environment. Everything else
+lives in the UI and the database.
 
 | Env var        | Default (native)                         | Purpose            |
 | -------------- | ---------------------------------------- | ------------------ |
 | `MESH_WX_PORT` | `8000` (`8110` for the systemd service)  | HTTP port          |
 | `MESH_WX_HOST` | `0.0.0.0`                                | HTTP bind address  |
-| `MESH_WX_DB`   | per-OS data dir (see below)              | SQLite file path   |
+|| `MESH_WX_DB`   | per-OS data dir (see below)              | SQLite file path   |
+|| `MESHWX_ADMIN_PASSWORD` | unset | Enables destructive MeshCore companion channel set/clear; HTTP Basic username is `admin` |
+
+When `MESHWX_ADMIN_PASSWORD` is unset, channel set/clear fail closed with HTTP 503 and the UI
+marks channel administration disabled. The password is read from the process environment and is
+never stored in the database or rendered in the WebUI. Read-only sanitized channel inspection
+remains available.
 
 The default database location when `MESH_WX_DB` is unset:
 `/data` in Docker · `%LOCALAPPDATA%\MeshWX` on Windows ·

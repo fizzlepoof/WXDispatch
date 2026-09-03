@@ -1,4 +1,5 @@
 <div id="dashtop" hx-get="/partials/status" hx-trigger="every 10s" hx-swap="outerHTML">
+  {% if live_error %}<div class="health-banner critical"><div class="hb-title">Cannot go LIVE</div>{{ live_error }}</div>{% endif %}
   {% if health_problems %}
   <div class="health-banner {{ health_level }}">
     <div class="hb-title">
@@ -18,6 +19,7 @@
     <div class="topbar-right">
       <span class="live-pill{{ ' paused' if dry_run else '' }}"><span class="dot"></span>{{ "PAUSED" if dry_run else "Broadcasting LIVE" }}</span>
       <form method="post" action="/dry-run/toggle" hx-post="/dry-run/toggle" hx-target="#dashtop" hx-swap="outerHTML">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <button class="secondary" type="submit">{{ "Go live" if dry_run else "Pause" }}</button>
       </form>
     </div>
@@ -36,8 +38,8 @@
     </div>
     <div class="hero-metrics">
       <div class="m"><div class="k">Uptime</div><div class="v">{{ uptime_str }}</div></div>
-      <div class="m"><div class="k">Sent &middot; 7d</div><div class="v">{{ sent_7d }}</div></div>
-      <div class="m"><div class="k">Sent today</div><div class="v">{{ sent_today }}</div></div>
+      <div class="m"><div class="k">Accepted &middot; 7d</div><div class="v">{{ sent_7d }}</div></div>
+      <div class="m"><div class="k">Accepted today</div><div class="v">{{ sent_today }}</div></div>
     </div>
     {% if spark_line %}
     <svg class="spark" viewBox="0 0 720 80" preserveAspectRatio="none">
@@ -56,7 +58,7 @@
       <div class="big">{{ zone_count }}</div><div class="s2">{{ forecast_count }} forecast + {{ county_count }} county</div></div>
     <div class="dstat"><div class="top"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span class="t">Poll interval</span></div>
       <div class="big">{{ poll_interval }}<span class="unit">s</span></div><div class="s2">every cycle, automatic</div></div>
-    <div class="dstat"><div class="top"><svg viewBox="0 0 24 24"><path d="M4 8a12 12 0 0116 0"/><path d="M7 12a7 7 0 0110 0"/><circle cx="12" cy="16" r="1.6" fill="currentColor" stroke="none"/></svg><span class="t">Broadcast &middot; 7d</span></div>
+    <div class="dstat"><div class="top"><svg viewBox="0 0 24 24"><path d="M4 8a12 12 0 0116 0"/><path d="M7 12a7 7 0 0110 0"/><circle cx="12" cy="16" r="1.6" fill="currentColor" stroke="none"/></svg><span class="t">Accepted &middot; 7d</span></div>
       <div class="big">{{ sent_7d }}</div><div class="s2">{{ sent_today }} today</div></div>
     <div class="dstat"><div class="top"><svg viewBox="0 0 24 24"><path d="M4 8a12 12 0 0116 0"/><path d="M7 12a7 7 0 0110 0"/></svg><span class="t">Radios online</span></div>
       {% set active = transports | selectattr('enabled') | list %}

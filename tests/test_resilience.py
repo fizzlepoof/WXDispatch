@@ -85,12 +85,15 @@ def test_db_pragmas(tmp_path):
 # --------------------------------------------------------------------------
 def test_safe_result_swallows_callback_errors():
     tm = TransmitManager(Database(":memory:"))
+    entered = []
 
-    def boom(ok):
+    def boom(ok, err=""):
+        entered.append((ok, err))
         raise RuntimeError("callback blew up")
 
     # Must not raise -- a broken callback cannot be allowed to crash the worker.
     tm._safe_result(boom, True)
+    assert entered == [(True, "")]
 
 
 def test_liveness_watchdog_forces_exit_when_stalled(monkeypatch):

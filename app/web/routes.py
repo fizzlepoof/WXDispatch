@@ -1,13 +1,20 @@
 """Web UI routes (server-rendered templates + htmx partials)."""
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
 import re
+import secrets
+import sqlite3
 import sys
 from pathlib import Path
+from typing import Any, cast
 import datetime
 
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.templating import Jinja2Templates
 import httpx
 
@@ -25,7 +32,61 @@ def _template_dir() -> Path:
     return Path(__file__).parent / "templates"
 
 
-router = APIRouter()
+_CSRF_COOKIE = "mesh_wx_csrf"
+_CSRF_SECRET = secrets.token_bytes(32)
+_CHANNEL_ADMIN_AUTH = HTTPBasic(auto_error=False)
+
+
+def _new_csrf_token() -> str:
+    nonce = secrets.token_urlsafe(24)
+    signature = hmac.new(_CSRF_SECRET, nonce.encode(), hashlib.sha256).hexdigest()
+    return nonce + "." + signature
+
+
+def _valid_csrf_token(token: str) -> bool:
+    try:
+        nonce, signature = token.rsplit(".", 1)
+    except ValueError:
+        return False
+    expected = hmac.new(_CSRF_SECRET, nonce.encode(), hashlib.sha256).hexdigest()
+    return bool(nonce) and hmac.compare_digest(signature, expected)
+
+
+async def _require_csrf(request: Request) -> None:
+    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return
+    cookie = request.cookies.get(_CSRF_COOKIE, "")
+    submitted = request.headers.get("X-CSRF-Token", "")
+    if not submitted:
+        form = await request.form()
+        submitted = str(form.get("csrf_token", ""))
+    if not (_valid_csrf_token(cookie) and hmac.compare_digest(cookie, submitted)):
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
+
+
+def _require_channel_admin(
+    credentials: HTTPBasicCredentials | None = Depends(_CHANNEL_ADMIN_AUTH),
+) -> None:
+    password = os.environ.get("MESHWX_ADMIN_PASSWORD", "")
+    if not password:
+        raise HTTPException(
+            status_code=503,
+            detail=("Channel administration is disabled until "
+                    "MESHWX_ADMIN_PASSWORD is configured."),
+        )
+    supplied_username = credentials.username if credentials else ""
+    supplied_password = credentials.password if credentials else ""
+    username_ok = hmac.compare_digest(supplied_username.encode(), b"admin")
+    password_ok = hmac.compare_digest(supplied_password.encode(), password.encode())
+    if not (username_ok and password_ok):
+        raise HTTPException(
+            status_code=401,
+            detail="Administrator authentication required.",
+            headers={"WWW-Authenticate": 'Basic realm="MeshWX channel administration"'},
+        )
+
+
+router = APIRouter(dependencies=[Depends(_require_csrf)])
 TEMPLATES = Jinja2Templates(directory=str(_template_dir()))
 
 from ..formatter import fmt_local
@@ -42,7 +103,26 @@ DISP_LABELS = {
     "update": "update",
     "cancelled": "cancelled",
     "duplicate": "duplicate",
+    "no_route": "no route",
+    "queued": "queued",
+    "accepted": "accepted",
+    "partial": "partial",
+    "failed": "failed",
+    "dry_run": "dry run",
+    "cleared": "cleared",
 }
+
+_HISTORY_DISPOSITIONS = [
+    "no_route", "queued", "accepted", "partial", "failed", "dry_run", "cleared",
+    "cancelled", "sent", "update", "filtered", "duplicate",
+]
+_ACCEPTED_HISTORY_DISPOSITIONS = {
+    "accepted", "partial", "cleared", "cancelled", "sent", "update",
+}
+_ROUTING_INACTIVE_MESSAGE = (
+    "Automated delivery is inactive. Create and enable a destination and routing rule "
+    "before going LIVE."
+)
 
 
 def render(request: Request, name: str, **ctx):
@@ -50,11 +130,16 @@ def render(request: Request, name: str, **ctx):
         tz = request.app.state.db.get_setting("display_timezone", "")
     except Exception:
         tz = ""   # fall back to this machine's local time
-    return TEMPLATES.TemplateResponse(
+    token = request.cookies.get(_CSRF_COOKIE, "")
+    if not _valid_csrf_token(token):
+        token = _new_csrf_token()
+    response = TEMPLATES.TemplateResponse(
         request, name,
         {"max_bytes": MAX_PAYLOAD_BYTES, "tz": tz, "disp_label": DISP_LABELS,
-         "version": __version__, **ctx},
+         "version": __version__, "csrf_token": token, **ctx},
     )
+    response.set_cookie(_CSRF_COOKIE, token, httponly=True, samesite="strict", path="/")
+    return response
 
 
 def _db(request: Request):
@@ -67,6 +152,17 @@ def _tx(request: Request):
 
 def _poller(request: Request):
     return request.app.state.poller
+
+
+def _routing_ready(db) -> bool:
+    list_routes = getattr(db, "list_routes", None)
+    if list_routes is None:
+        return False
+    return any(
+        bool(rule.get("enabled"))
+        and any(bool(destination.get("enabled")) for destination in rule.get("destinations", []))
+        for rule in list_routes()
+    )
 
 
 def _status_flag(request: Request, name: str) -> bool:
@@ -120,11 +216,11 @@ def _dash_ctx(request) -> dict:
         except Exception:
             return 999
     rows = db.query_history(limit=1000)
-    sent = [r for r in rows if r["disposition"] in ("sent", "update", "cancelled")]
-    sent_7d = sum(1 for r in sent if _age(r["ts"]) < 7)
-    sent_today = sum(1 for r in sent if _age(r["ts"]) < 1)
+    accepted = [r for r in rows if r["disposition"] in _ACCEPTED_HISTORY_DISPOSITIONS]
+    sent_7d = sum(1 for r in accepted if _age(r["ts"]) < 7)
+    sent_today = sum(1 for r in accepted if _age(r["ts"]) < 1)
     buckets = [0] * 7
-    for r in sent:
+    for r in accepted:
         a = _age(r["ts"])
         if 0 <= a < 7:
             buckets[6 - int(a)] += 1
@@ -153,6 +249,8 @@ def _dash_ctx(request) -> dict:
         except Exception:
             return None
     problems = []          # (level, message); level in {"critical","warn"}
+    if not _routing_ready(db):
+        problems.append(("critical", _ROUTING_INACTIVE_MESSAGE))
     # 1. Are we still reaching NWS? A stale success time = we are blind to alerts.
     succ_age = _age_s(st.last_poll_success_time)
     stale_after = max(interval * 3, 360)
@@ -260,7 +358,15 @@ async def ipaws_history_partial(request: Request):
 @router.post("/dry-run/toggle", response_class=HTMLResponse)
 async def toggle_dry_run(request: Request):
     db = _db(request)
-    db.set_setting("dry_run", not bool(db.get_setting("dry_run", True)))
+    currently_dry = bool(db.get_setting("dry_run", True))
+    if currently_dry and not _routing_ready(db):
+        response = render(
+            request, "_dash_top.html", **_dash_ctx(request),
+            live_error="Cannot go LIVE. " + _ROUTING_INACTIVE_MESSAGE,
+        )
+        response.status_code = 409
+        return response
+    db.set_setting("dry_run", not currently_dry)
     db.add_event("INFO", f"dry-run set to {db.get_setting('dry_run')}")
     return render(request, "_dash_top.html", **_dash_ctx(request))
 
@@ -277,7 +383,7 @@ async def history(request: Request, disposition: str = "", date_from: str = "",
     return render(
         request, "history.html", rows=rows, disposition=disposition,
         date_from=date_from, date_to=date_to,
-        dispositions=["sent", "filtered", "duplicate", "update", "cancelled"],
+        dispositions=_HISTORY_DISPOSITIONS,
     )
 
 
@@ -458,6 +564,7 @@ async def settings_page(request: Request):
         tz_known={v for v, _ in _TIMEZONES},
         counties=county_list, selected=set(counties_sel), extra_zones=", ".join(extra),
         event_groups=_EVENT_GROUPS,
+        routing_ready=_routing_ready(db), routing_inactive_message=_ROUTING_INACTIVE_MESSAGE,
         selected_events=set(s.get("filter_include_exact", []) or []),
         all_warnings=bool(s.get("filter_include_suffix", []) or []), err="",
         ipaws_enabled=bool(s.get("ipaws_enabled", True)),
@@ -632,7 +739,8 @@ async def manual_send(request: Request, text: str = Form(...)):
     while len(text.encode()) > MAX_PAYLOAD_BYTES:
         text = text[:-1]
     ok = await tx.send_manual(text)   # goes on each radio's LIVE channel
-    msg = "sent" if ok else f"failed: {tx.last_error}"
+    msg = ("accepted by configured radio interfaces; over-air delivery is not confirmed"
+           if ok else f"failed: {tx.last_error}")
     return render(request, "_manual_result.html", ok=ok, message=msg,
                   text=text, bytes=len(text.encode()))
 
@@ -658,7 +766,8 @@ async def send_test(request: Request):
     ok = await tx.send_test(text)   # goes on each radio's TEST channel
     return render(
         request, "_manual_result.html", ok=ok,
-        message=("test sent to all radios" if ok else f"failed: {tx.last_error}"),
+        message=("accepted by configured radio interfaces; over-air delivery is not confirmed"
+                 if ok else f"failed: {tx.last_error}"),
         text=text, bytes=len(text.encode()),
     )
 
@@ -671,7 +780,12 @@ async def send_test_one(request: Request, name: str):
     ok, err = await tx.send_to(name, text)
     return render(
         request, "_manual_result.html", ok=ok,
-        message=(f"test sent via {label}" if ok else f"{label} failed: {err}"),
+        message=(
+            ("accepted by MeshCore companion; over-air delivery is not confirmed"
+             if name == "meshcore" else
+             "accepted by Meshtastic node; over-air delivery is not confirmed")
+            if ok else f"{label} failed: {err}"
+        ),
         text=text, bytes=len(text.encode()),
     )
 
@@ -690,4 +804,367 @@ def _split_lines(value: str) -> list[str]:
         if item:
             parts.append(item)
     return parts
+
+
+# ---- OpenHop / MeshCore companion channel operations ------------------
+def _channel_form_error(request: Request, message: str, status_code: int = 400):
+    response = render(request, "_channel_operation.html", ok=False, message=message)
+    response.status_code = status_code
+    return response
+
+
+def _channel_index(form) -> int | None:
+    try:
+        return int(str(form.get("index", "")))
+    except ValueError:
+        return None
+
+
+def _safe_channel(result: dict) -> dict | None:
+    channel = result.get("channel")
+    if not isinstance(channel, dict):
+        return None
+    return {"index": channel.get("index"), "name": channel.get("name") or ""}
+
+
+@router.post("/openhop/channels/inspect", response_class=HTMLResponse)
+async def inspect_openhop_channel(request: Request):
+    index = _channel_index(await request.form())
+    if index is None:
+        return _channel_form_error(request, "Channel index must be a whole number.")
+    result = await _tx(request).inspect_meshcore_channel(index)
+    if not result.get("ok"):
+        return _channel_form_error(
+            request, result.get("error") or "The companion channel could not be inspected.", 502,
+        )
+    return render(
+        request, "_channel_operation.html", ok=True,
+        message="Channel metadata read and verified by the companion.",
+        channel=_safe_channel(result),
+    )
+
+
+@router.post("/openhop/channels/set", response_class=HTMLResponse)
+async def set_openhop_channel(
+    request: Request, _admin: None = Depends(_require_channel_admin),
+):
+    form = await request.form()
+    index = _channel_index(form)
+    if index is None:
+        return _channel_form_error(request, "Channel index must be a whole number.")
+    name = str(form.get("name", "")).strip()
+    secret_hex = str(form.get("secret", ""))
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", secret_hex):
+        return _channel_form_error(request, "Channel secret must be exactly 32 hexadecimal characters.")
+    if not name:
+        return _channel_form_error(request, "Channel name is required.")
+    result = await _tx(request).set_meshcore_channel(index, name, bytes.fromhex(secret_hex))
+    if not result.get("ok"):
+        return _channel_form_error(
+            request, result.get("error") or "The companion did not accept the channel update.", 502,
+        )
+    return render(
+        request, "_channel_operation.html", ok=True,
+        message="Channel update accepted by MeshCore companion; over-air delivery is not confirmed.",
+        channel=_safe_channel(result),
+    )
+
+
+def _channel_reference(db, index: int) -> str | None:
+    """Return any durable reference; fail closed without the complete DB API."""
+    channel_references = getattr(db, "channel_references", None)
+    if not callable(channel_references):
+        return "Channel references cannot be safely checked with this database version."
+    try:
+        references = cast(dict[str, Any], channel_references("meshcore", index))
+    except Exception:
+        return "Channel references cannot be safely checked right now."
+    destinations = references.get("destinations", [])
+    if destinations:
+        return "Destination %s uses this channel." % destinations[0]["name"]
+    snapshots = references.get("active_delivery_snapshots", [])
+    if snapshots:
+        return "An active delivery snapshot uses this channel."
+    if references.get("is_referenced"):
+        return "This channel has a durable reference and cannot be cleared."
+    return None
+
+
+@router.post("/openhop/channels/clear", response_class=HTMLResponse)
+async def clear_openhop_channel(
+    request: Request, _admin: None = Depends(_require_channel_admin),
+):
+    form = await request.form()
+    index = _channel_index(form)
+    if index is None:
+        return _channel_form_error(request, "Channel index must be a whole number.")
+    expected = "CLEAR CHANNEL %d" % index
+    if str(form.get("confirmation", "")) != expected:
+        return _channel_form_error(request, "Type %s to confirm this destructive operation." % expected)
+    blocked = _channel_reference(_db(request), index)
+    if blocked:
+        return _channel_form_error(request, blocked, 409)
+    result = await _tx(request).clear_meshcore_channel(index)
+    if not result.get("ok"):
+        return _channel_form_error(
+            request, result.get("error") or "The companion did not accept the channel clear.", 502,
+        )
+    return render(
+        request, "_channel_operation.html", ok=True,
+        message="Channel clear accepted by MeshCore companion; over-air delivery is not confirmed.",
+        channel=_safe_channel(result),
+    )
+
+
+def _routing_page_rows(db):
+    list_destinations = getattr(db, "list_destinations", None)
+    destinations = list(list_destinations()) if list_destinations else []
+    list_routes = getattr(db, "list_routes", None)
+    rules = list(list_routes()) if list_routes else []
+    return destinations, rules
+
+
+@router.get("/routing", response_class=HTMLResponse)
+async def routing_page(request: Request):
+    db = _db(request)
+    destinations, rules = _routing_page_rows(db)
+    settings = db.all_settings()
+    return render(
+        request, "routing.html", destinations=destinations, rules=rules,
+        event_groups=_EVENT_GROUPS,
+        meshcore_channels=settings.get("meshcore_channels", []) or [],
+        meshcore_max_channels=int(settings.get("meshcore_max_channels", 8) or 8),
+        channel_admin_enabled=bool(os.environ.get("MESHWX_ADMIN_PASSWORD", "")),
+        routing_ready=_routing_ready(db), routing_inactive_message=_ROUTING_INACTIVE_MESSAGE,
+    )
+
+
+@router.get("/routing/destinations/{destination_id}/edit", response_class=HTMLResponse)
+async def edit_routing_destination(request: Request, destination_id: int):
+    destination = _db(request).get_destination(destination_id)
+    if destination is None:
+        raise HTTPException(status_code=404, detail="Destination not found")
+    return render(request, "destination_edit.html", destination=destination)
+
+
+def _destination_form_values(form):
+    name = str(form.get("name", "")).strip()
+    transport = str(form.get("transport", ""))
+    try:
+        channel = int(str(form.get("channel", "")))
+    except ValueError:
+        channel = -1
+    if not name or len(name) > 80:
+        return None, "Destination name is required and must be 80 characters or fewer."
+    if transport not in {"meshcore", "meshtastic"}:
+        return None, "Select a supported destination transport."
+    if not 0 <= channel <= 255:
+        return None, "Destination channel must be between 0 and 255."
+    return (name, transport, channel, bool(form.get("enabled"))), ""
+
+
+@router.post("/routing/destinations", response_class=HTMLResponse)
+async def create_routing_destination(request: Request):
+    values, error = _destination_form_values(await request.form())
+    if error:
+        return _channel_form_error(request, error)
+    assert values is not None
+    try:
+        _db(request).create_destination(*values)
+    except sqlite3.IntegrityError:
+        return _channel_form_error(request, "That transport and channel already has a destination.", 409)
+    except Exception:
+        return _channel_form_error(request, "The destination could not be saved.", 500)
+    return RedirectResponse("/routing", status_code=303)
+
+
+@router.post("/routing/destinations/{destination_id}", response_class=HTMLResponse)
+async def update_routing_destination(request: Request, destination_id: int):
+    values, error = _destination_form_values(await request.form())
+    if error:
+        return _channel_form_error(request, error)
+    assert values is not None
+    try:
+        updated = _db(request).update_destination(destination_id, *values)
+    except sqlite3.IntegrityError:
+        return _channel_form_error(request, "That transport and channel already has a destination.", 409)
+    except Exception:
+        return _channel_form_error(request, "The destination could not be saved.", 500)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Destination not found")
+    return RedirectResponse("/routing", status_code=303)
+
+
+@router.post("/routing/destinations/{destination_id}/toggle", response_class=HTMLResponse)
+async def toggle_routing_destination(request: Request, destination_id: int):
+    if not _db(request).toggle_destination(destination_id):
+        raise HTTPException(status_code=404, detail="Destination not found")
+    return RedirectResponse("/routing", status_code=303)
+
+
+@router.post("/routing/destinations/{destination_id}/delete", response_class=HTMLResponse)
+async def delete_routing_destination(request: Request, destination_id: int):
+    db = _db(request)
+    if db.get_destination(destination_id) is None:
+        raise HTTPException(status_code=404, detail="Destination not found")
+    form = await request.form()
+    expected = "DELETE DESTINATION %d" % destination_id
+    if str(form.get("confirmation", "")) != expected:
+        return _channel_form_error(request, "Type %s to confirm deletion." % expected)
+    try:
+        deleted = db.delete_destination(destination_id)
+    except sqlite3.IntegrityError:
+        return _channel_form_error(
+            request, "This destination is in use and cannot be deleted.", 409,
+        )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Destination not found")
+    return RedirectResponse("/routing", status_code=303)
+
+
+def _parse_route_counties(value: str) -> tuple[list[tuple[str, str]], str]:
+    counties = []
+    seen = set()
+    for line in value.splitlines():
+        if not line.strip():
+            continue
+        parts = [part.strip() for part in line.split("|", 1)]
+        if len(parts) != 2 or not re.fullmatch(r"[A-Z]{2}C\d{3}", parts[0]) or not parts[1]:
+            return [], "Each county must use 'zone_code | county_name' (for example TNC147 | Robertson County)."
+        if len(parts[1]) > 100:
+            return [], "County display names must be 100 characters or fewer."
+        if parts[0] not in seen:
+            counties.append((parts[0], parts[1]))
+            seen.add(parts[0])
+    if not counties:
+        return [], "At least one county is required."
+    return counties, ""
+
+
+@router.get("/routing/rules/{rule_id}/edit", response_class=HTMLResponse)
+async def edit_routing_rule(request: Request, rule_id: int):
+    db = _db(request)
+    rule = db.get_route(rule_id)
+    if rule is None:
+        raise HTTPException(status_code=404, detail="Routing rule not found")
+    return render(
+        request, "routing_rule_edit.html", rule=rule,
+        destinations=db.list_destinations(), event_groups=_EVENT_GROUPS,
+        selected_events=set(rule["events"]),
+        selected_destinations={destination["id"] for destination in rule["destinations"]},
+    )
+
+
+@router.post("/routing/rules", response_class=HTMLResponse)
+async def create_routing_rule(request: Request):
+    form = await request.form()
+    db = _db(request)
+    name = str(form.get("name", "")).strip()
+    try:
+        priority = int(str(form.get("priority", "")))
+        destination_ids = list(dict.fromkeys(int(str(value)) for value in form.getlist("destination_ids")))
+    except ValueError:
+        return _channel_form_error(request, "Priority and destination references must be whole numbers.")
+    counties, county_error = _parse_route_counties(str(form.get("counties", "")))
+    if not name or len(name) > 80:
+        return _channel_form_error(request, "Rule name is required and must be 80 characters or fewer.")
+    if not -10000 <= priority <= 10000:
+        return _channel_form_error(request, "Rule priority must be between -10000 and 10000.")
+    if county_error:
+        return _channel_form_error(request, county_error)
+    if not destination_ids or any(db.get_destination(value) is None for value in destination_ids):
+        return _channel_form_error(request, "Select at least one valid destination.")
+    allowed_events = {event for values in _EVENT_GROUPS.values() for event in values}
+    events = list(dict.fromkeys(str(value) for value in form.getlist("events")))
+    if any(event not in allowed_events for event in events):
+        return _channel_form_error(request, "One or more selected event types is invalid.")
+    all_warnings = bool(form.get("all_warnings"))
+    if not all_warnings and not events:
+        return _channel_form_error(request, "Select all warnings or at least one event type.")
+    try:
+        db.create_routing_rule(
+            name, priority, bool(form.get("enabled")), all_warnings,
+            counties, events, destination_ids,
+        )
+    except sqlite3.IntegrityError as exc:
+        if "routing_rules.name" in str(exc) or "idx_routes_name_unique" in str(exc):
+            return _channel_form_error(request, "A rule with that name already exists.", 409)
+        return _channel_form_error(request, "The rule contains an invalid or duplicate reference.", 409)
+    except Exception:
+        return _channel_form_error(request, "The routing rule could not be saved.", 500)
+    return RedirectResponse("/routing", status_code=303)
+
+
+@router.post("/routing/rules/{rule_id}", response_class=HTMLResponse)
+async def update_routing_rule(request: Request, rule_id: int):
+    form = await request.form()
+    db = _db(request)
+    name = str(form.get("name", "")).strip()
+    try:
+        priority = int(str(form.get("priority", "")))
+        destination_ids = list(dict.fromkeys(
+            int(str(value)) for value in form.getlist("destination_ids")
+        ))
+    except ValueError:
+        return _channel_form_error(request, "Priority and destination references must be whole numbers.")
+    counties, county_error = _parse_route_counties(str(form.get("counties", "")))
+    if not name or len(name) > 80:
+        return _channel_form_error(request, "Rule name is required and must be 80 characters or fewer.")
+    if not -10000 <= priority <= 10000:
+        return _channel_form_error(request, "Rule priority must be between -10000 and 10000.")
+    if county_error:
+        return _channel_form_error(request, county_error)
+    if not destination_ids or any(db.get_destination(value) is None for value in destination_ids):
+        return _channel_form_error(request, "Select at least one valid destination.")
+    allowed_events = {event for values in _EVENT_GROUPS.values() for event in values}
+    events = list(dict.fromkeys(str(value) for value in form.getlist("events")))
+    if any(event not in allowed_events for event in events):
+        return _channel_form_error(request, "One or more selected event types is invalid.")
+    all_warnings = bool(form.get("all_warnings"))
+    if not all_warnings and not events:
+        return _channel_form_error(request, "Select all warnings or at least one event type.")
+    try:
+        updated = db.update_routing_rule(
+            rule_id, name, priority, bool(form.get("enabled")), all_warnings,
+            counties, events, destination_ids,
+        )
+    except sqlite3.IntegrityError as exc:
+        if "routing_rules.name" in str(exc) or "idx_routes_name_unique" in str(exc):
+            return _channel_form_error(request, "A rule with that name already exists.", 409)
+        return _channel_form_error(request, "The rule contains an invalid or duplicate reference.", 409)
+    except Exception:
+        return _channel_form_error(request, "The routing rule could not be saved.", 500)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Routing rule not found")
+    return RedirectResponse("/routing", status_code=303)
+
+
+@router.post("/routing/rules/{rule_id}/toggle", response_class=HTMLResponse)
+async def toggle_routing_rule(request: Request, rule_id: int):
+    if not _db(request).toggle_route(rule_id):
+        raise HTTPException(status_code=404, detail="Routing rule not found")
+    return RedirectResponse("/routing", status_code=303)
+
+
+@router.post("/routing/rules/{rule_id}/move/{direction}", response_class=HTMLResponse)
+async def move_routing_rule(request: Request, rule_id: int, direction: str):
+    if direction not in {"up", "down"}:
+        raise HTTPException(status_code=400, detail="Invalid routing direction")
+    if not _db(request).move_route(rule_id, direction):
+        raise HTTPException(status_code=404, detail="Routing rule not found")
+    return RedirectResponse("/routing", status_code=303)
+
+
+@router.post("/routing/rules/{rule_id}/delete", response_class=HTMLResponse)
+async def delete_routing_rule(request: Request, rule_id: int):
+    db = _db(request)
+    if db.get_route(rule_id) is None:
+        raise HTTPException(status_code=404, detail="Routing rule not found")
+    form = await request.form()
+    expected = "DELETE RULE %d" % rule_id
+    if str(form.get("confirmation", "")) != expected:
+        return _channel_form_error(request, "Type %s to confirm deletion." % expected)
+    if not db.delete_route(rule_id):
+        raise HTTPException(status_code=404, detail="Routing rule not found")
+    return RedirectResponse("/routing", status_code=303)
 

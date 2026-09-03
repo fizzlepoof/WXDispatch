@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from app.config import MAX_PAYLOAD_BYTES
-from app.formatter import format_alert, build_mesh_text
+from app.formatter import format_alert, build_mesh_text, build_routed_mesh_text
 from app.models import Alert
 
 
@@ -21,6 +21,18 @@ def test_single_area(feature):
     msg = format_alert(a.event, a.area_desc, a.ends, "America/New_York", onset_iso=a.onset)
     assert "and surrounding areas" not in msg
     assert msg == "[WX] Lake Wind Advisory for Lake Murray until 8:00 PM"
+
+
+def test_routed_compaction_uses_singular_and_plural_county_grammar():
+    alert = Alert("id", "Tornado Warning", "", "", "", "", "Alert")
+    names = ["A" * 50, "B" * 50, "C" * 50]
+
+    two = build_routed_mesh_text(alert, names[:2], max_bytes=110)
+    three = build_routed_mesh_text(alert, names, max_bytes=110)
+
+    assert "+1 county" in two
+    assert "+1 counties" not in two
+    assert "+2 counties" in three
 
 
 def test_timezone_conversion(feature):

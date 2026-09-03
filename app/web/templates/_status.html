@@ -22,6 +22,7 @@
         {% else %}<span class="pill ok">LIVE</span>{% endif %}
         <form method="post" action="/dry-run/toggle" hx-post="/dry-run/toggle"
               hx-target="#status" hx-swap="outerHTML" style="margin-top:8px;">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button class="secondary" type="submit">
             {{ "Go live" if dry_run else "Pause broadcasting" }}</button>
         </form>

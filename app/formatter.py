@@ -146,6 +146,49 @@ def build_mesh_text(alert, tz_name: str = "America/New_York",
                         onset_iso=alert.onset, sep="for", max_bytes=max_bytes)
 
 
+_COUNTY_ENDINGS = (" county", " parish", " borough", " municipality",
+                   " census area", " city and borough")
+
+
+def _county_label(name: str) -> str:
+    value = name.strip()
+    return value if value.casefold().endswith(_COUNTY_ENDINGS) else value + " County"
+
+
+def build_routed_mesh_text(alert, matched_areas, tz_name: str = "America/New_York",
+                           max_bytes: int = MAX_PAYLOAD_BYTES,
+                           disposition: str = "sent") -> str:
+    """Format only the counties that activated one destination's route."""
+    labels = [_county_label(value) for value in matched_areas if value.strip()]
+    event = alert.event
+    if disposition == "cancelled":
+        event = "CANCELLED: " + event
+    elif disposition == "cleared":
+        event = "CLEARED: " + event
+    when = "" if disposition in ("cancelled", "cleared") else _format_when(alert.onset, alert.ends, tz_name)
+
+    def assemble(area: str) -> str:
+        value = PREFIX + event
+        if area:
+            value += " for " + area
+        if when:
+            value += " " + when
+        return value
+
+    full = ", ".join(labels)
+    msg = assemble(full)
+    if _byte_len(msg) <= max_bytes:
+        return msg
+    if labels:
+        extra = len(labels) - 1
+        suffix = " county" if extra == 1 else " counties"
+        compact = labels[0] + ((" +%d%s" % (extra, suffix)) if extra else "")
+        msg = assemble(compact)
+        if _byte_len(msg) <= max_bytes:
+            return msg
+    return _truncate_bytes(assemble(""), max_bytes)
+
+
 def fmt_local(iso: str, tz_name: str = "America/New_York") -> str:
     """Human-friendly local timestamp for the UI, e.g. "Jul 28, 1:40 AM".
     Falls back to the raw value if it cannot be parsed."""
