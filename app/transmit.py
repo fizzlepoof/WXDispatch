@@ -93,6 +93,8 @@ class Transmitter(abc.ABC):
     async def connect(self) -> None: ...
     @abc.abstractmethod
     async def send_text(self, text: str, channel: int) -> None: ...
+    async def send_binary(self, payload: bytes, channel: int) -> None:
+        raise TxUnsent("unsent", "binary channel data is unsupported by this transport")
     @abc.abstractmethod
     async def close(self) -> None: ...
     @property
@@ -392,6 +394,23 @@ class MeshCoreTransmitter(Transmitter):
             raise TxUnsent("unsent", detail + ((": " + reason) if reason else ""))
         logger.info("MeshCore channel message accepted by companion")
 
+    async def send_binary(self, payload: bytes, channel: int) -> None:
+        """Send raw MeshCore channel data for structured protocols such as MeshWX v4."""
+        if self._mc is None:
+            raise RuntimeError("not connected")
+        max_channels = self._max_channels_from_info(await self._device_info())
+        if not 1 <= channel < max_channels:
+            raise TxUnsent("no_channel", "binary channel data requires a non-Public channel")
+        if not payload or len(payload) > 163:
+            raise TxUnsent("too_large", "binary channel data must contain 1-163 bytes")
+        from meshcore import EventType
+        data = b"\x3e" + bytes([channel, 0xFF]) + (0xFFFF).to_bytes(2, "little") + payload
+        with _suppress_meshcore_dependency_logging():
+            result = await self._mc.commands.send(data, [EventType.OK, EventType.ERROR])
+        if getattr(result, "type", None) != EventType.OK:
+            raise TxUnsent("unsent", "companion rejected binary channel data")
+        logger.info("MeshCore binary channel data accepted by companion on ch %d", channel)
+
     async def close(self) -> None:
         if self._mc is not None:
             mc, self._mc = self._mc, None
@@ -471,6 +490,7 @@ class Transport:
 @dataclass
 class QueueItem:
     text: str
+    binary_payload: bytes | None = None
     on_test: bool = False      # False = live channel (weather), True = test channel (IPAWS)
     log_tx: bool = True        # write the weather transmit_log (False for IPAWS -- logged separately)
     on_result: object = None   # optional callable(ok: bool, err: str) invoked after the send
@@ -827,6 +847,29 @@ class TransmitManager:
                              on_result=on_result, transport=transport,
                              channel=channel, destination_id=destination_id)
 
+    def enqueue_meshwx(self, payload: bytes, channel: int, correlation_key=None,
+                       on_result=None) -> bool:
+        """Queue one structured MeshWX frame on a dedicated MeshCore channel."""
+        if not payload or len(payload) > 163:
+            if on_result:
+                self._safe_result(on_result, False, "invalid MeshWX payload size")
+            return False
+        if len(self._queue_low) == self._queue_low.maxlen:
+            if on_result:
+                self._safe_result(on_result, False, "dropped (secondary queue full)")
+            return False
+        self._queue_low.append(QueueItem(
+            text="MeshWX v4 structured warning",
+            binary_payload=bytes(payload),
+            log_tx=False,
+            on_result=on_result,
+            transport="meshcore",
+            channel=channel,
+            correlation_key=correlation_key,
+        ))
+        self._queue_event.set()
+        return True
+
     def enqueue_destination_chain(self, text: str, transport: str, channel: int,
                                   destination_id: int, correlation_key,
                                   require_prior_success: bool = False,
@@ -982,6 +1025,33 @@ class TransmitManager:
         self._db.add_error(t.name, last)   # a real failure only after all corrections tried
         return False, last
 
+    async def _try_send_binary(self, t: Transport, payload: bytes, ch: int) -> tuple[bool, str]:
+        last = "not connected"
+        for attempt in (1, 2, 3):
+            if t.tx is None or not t.connected:
+                if not await self._ensure(t):
+                    last = t.error or "not connected"
+                    await asyncio.sleep(1)
+                    continue
+            try:
+                await t.tx.send_binary(payload, ch)
+                return True, ""
+            except TxUnsent as exc:
+                last = exc.detail
+                t.error = last
+                if exc.category in ("too_large", "no_channel"):
+                    break
+                if exc.category in ("duty_cycle", "queue_full"):
+                    await asyncio.sleep(3)
+                else:
+                    await self._reconnect(t)
+            except Exception as exc:
+                last = "send failed: %s" % exc
+                t.error = last
+                await self._reconnect(t)
+        self._db.add_error(t.name, last)
+        return False, last
+
     async def _send_all(self, text: str, manual: bool, on_test: bool | None = None) -> bool:
         any_ok = False
         # Validate before keying any radio: trim to the payload cap (multibyte-safe)
@@ -1103,7 +1173,7 @@ class TransmitManager:
     async def _transmit_item(self, item: QueueItem) -> tuple[bool, str]:
         """Send one queued item on the right channel (live vs test), confirmed per
         radio. Weather items also write the transmit_log; IPAWS items do not."""
-        blen = len(item.text.encode())
+        blen = len(item.binary_payload) if item.binary_payload is not None else len(item.text.encode())
         any_ok, last = False, ""
         async with self._lock:
             transports = ([self._transports[item.transport]] if item.transport else
@@ -1113,7 +1183,10 @@ class TransmitManager:
                     continue
                 ch = (item.channel if item.channel is not None else
                       (t.test_channel if item.on_test else t.channel))
-                ok, err = await self._try_send(t, item.text, ch)
+                if item.binary_payload is not None:
+                    ok, err = await self._try_send_binary(t, item.binary_payload, ch)
+                else:
+                    ok, err = await self._try_send(t, item.text, ch)
                 if item.log_tx:
                     self._db.add_transmit_log(ch, blen, ok, item.text, False,
                                               error=("" if ok else err), transport=t.name,

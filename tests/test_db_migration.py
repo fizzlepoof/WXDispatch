@@ -117,4 +117,5 @@ def test_complete_head_database_migrates_reopens_without_data_loss(tmp_path):
         assert db._conn.execute("SELECT COUNT(*) FROM destinations").fetchone()[0] == 0
         assert db._conn.execute("SELECT COUNT(*) FROM routing_rules").fetchone()[0] == 0
         assert db._conn.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] == 0
+        assert db._conn.execute("SELECT COUNT(*) FROM meshwx_delivery_state").fetchone()[0] == 0
         db.close()

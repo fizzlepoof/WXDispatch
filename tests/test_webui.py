@@ -33,6 +33,9 @@ class DummyTx:
     async def send_to(self, name, text):
         return True, ""
 
+    async def reconfigure(self):
+        return None
+
     async def inspect_meshcore_channel(self, index):
         self.channel_calls.append(("inspect", index))
         return {"ok": True, "error": "", "channel": {"index": index, "name": "County WX"}}
@@ -487,6 +490,69 @@ def test_history_filter_lists_every_routed_and_legacy_status(web):
         "cancelled", "sent", "update",
     ):
         assert f'<option value="{status}"' in response.text
+
+
+def test_settings_exposes_optional_meshwx_v4_controls(web):
+    client, db, _tx = web
+    db.set_setting("meshcore_max_channels", 8)
+
+    response = client.get("/settings")
+
+    assert response.status_code == 200
+    assert 'name="meshwx_v4_enabled"' in response.text
+    assert 'name="meshwx_v4_channel"' in response.text
+    assert 'name="meshwx_v4_channel" min="1" max="7"' in response.text
+    assert "normal county text alerts continue unchanged" in response.text
+
+
+def test_settings_round_trip_enables_structured_feed_only_off_public(web):
+    client, db, _tx = web
+    token = csrf(client)
+
+    response = client.post(
+        "/settings",
+        data={
+            "csrf_token": token,
+            "poll_interval": "120",
+            "nws_contact": "operator@example.com",
+            "meshwx_v4_enabled": "on",
+            "meshwx_v4_channel": "7",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert db.get_setting("meshwx_v4_enabled") is True
+    assert db.get_setting("meshwx_v4_channel") == 7
+
+    response = client.post(
+        "/settings",
+        data={
+            "csrf_token": token,
+            "poll_interval": "120",
+            "nws_contact": "operator@example.com",
+            "meshwx_v4_enabled": "on",
+            "meshwx_v4_channel": "0",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert db.get_setting("meshwx_v4_enabled") is False
+
+    response = client.post(
+        "/settings",
+        data={
+            "csrf_token": token,
+            "poll_interval": "120",
+            "nws_contact": "operator@example.com",
+            "meshwx_v4_enabled": "on",
+            "meshwx_v4_channel": "8",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert db.get_setting("meshwx_v4_enabled") is False
 
 
 @pytest.mark.parametrize("path", ["/", "/settings", "/routing"])

@@ -119,6 +119,14 @@
 
       {% set radio='meshcore' %}{% set live_field='meshcore_channel' %}{% set test_field='meshcore_test_channel' %}{% set live_val=mc_channel %}{% set test_val=mc_test %}{% set channels=mc_channels %}{% set connected=mc_connected %}{% set model=mc_model %}{% set error='' %}
       <div style="margin-top:10px;">{% include "_radio_channels.html" %}</div>
+      <div class="row" style="margin-top:14px;">
+        <label class="chk"><input type="checkbox" name="meshwx_v4_enabled" {% if meshwx_v4_enabled %}checked{% endif %}> <b>Structured MeshWX v4 warning cards</b></label>
+        <div>
+          <label>Dedicated data channel index</label>
+          <input type="number" name="meshwx_v4_channel" min="1" max="{{ mc_max_channels - 1 }}" value="{{ meshwx_v4_channel }}">
+        </div>
+      </div>
+      <p class="hint">Optional binary warning feed for compatible MeshWX clients. Use a dedicated non-Public hash channel; normal county text alerts continue unchanged.</p>
     </div>
   </div>
 

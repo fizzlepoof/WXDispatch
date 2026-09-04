@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <b>Status: v2.2.0.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
+  <b>Status: v2.3.0.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
 </p>
 
 ---
@@ -62,6 +62,10 @@ channel. Built after living through Hurricane Helene's comms blackout.
   materially changes and a *cancellation* when it clears. Old state auto-expires.
 - **Fits a LoRa packet.** Alerts are trimmed to ≤195 bytes, e.g.
   `[WX] Tornado Warning: Charleston +2 more until 8:45 PM EDT`.
+- **Optional rich warning cards.** WXDispatch can dual-cast active warnings as
+  COBS-encoded MeshWX v4 `0x20`/`0x21` binary frames on a dedicated non-Public
+  MeshCore hash channel. Compatible clients render structured warning cards while
+  the existing county text channels continue unchanged.
 - **Dry-run by default.** Automated alerts are logged, not transmitted, until you flip it on.
 - **A real dashboard.** Live radio status, recent alerts, 7-day activity, transmit log,
   and a per-radio **Send test** button to key up each radio on the bench.
@@ -202,6 +206,18 @@ that another node received it. For Meshtastic, success means the request was **a
 Meshtastic node** software, likewise without proof of over-air delivery. The transmit log records
 interface outcomes and failures, not RF delivery receipts. Verify tests on a separate receiving
 node before relying on the system.
+
+### Structured MeshWX v4 warnings
+
+Enable **Structured MeshWX v4 warning cards** under Settings → Radios and select a dedicated
+non-Public channel index containing the same hash channel on the sender and receiver, for example
+`#middle-tn-meshwx-v4`. WXDispatch emits the public MeshWX v4 warning-zone (`0x21`) format when an
+NWS forecast-zone UGC is available, or the warning-polygon (`0x20`) format when usable GeoJSON
+geometry is present. County text routes remain the compatibility, update, and cancellation path;
+binary output is an additional initial-warning feed and is disabled by default. It uses MeshCore's
+experimental `0xFFFF` application-data namespace until MeshWX receives a registered data type. The
+encoding is compatible with
+[`digitaino/meshwx`](https://github.com/digitaino/meshwx) and clients that implement its v4 format.
 
 ### IPAWS alerts (FEMA)
 

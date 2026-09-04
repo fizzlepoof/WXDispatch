@@ -1,5 +1,4 @@
 import pytest
-import asyncio
 from meshcore import EventType
 
 from app.db import Database
@@ -12,6 +11,9 @@ class FakeRadio:
 
     async def send_text(self, text, channel):
         self.calls.append((text, channel))
+
+    async def send_binary(self, payload, channel):
+        self.calls.append((payload, channel))
 
 
 async def test_destination_item_sends_only_specific_transport_channel_and_caps_utf8():
@@ -36,11 +38,43 @@ async def test_destination_item_sends_only_specific_transport_channel_and_caps_u
     assert row["destination_id"] == 44
 
 
+async def test_structured_weather_item_sends_binary_only_to_meshcore():
+    db = Database(":memory:")
+    manager = TransmitManager(db)
+    meshcore = manager._transports["meshcore"]
+    meshtastic = manager._transports["meshtastic"]
+    meshcore.enabled = meshtastic.enabled = True
+    meshcore.connected = meshtastic.connected = True
+    meshcore.tx, meshtastic.tx = FakeRadio(), FakeRadio()
+
+    manager.enqueue_meshwx(b"\x04\x21\xff", 7)
+    assert not manager._queue
+    item = manager._queue_low.popleft()
+    ok, error = await manager._transmit_item(item)
+
+    assert ok and not error
+    assert meshcore.tx.calls == [(b"\x04\x21\xff", 7)]
+    assert meshtastic.tx.calls == []
+    assert item.log_tx is False
+
+
 class Commands:
     def __init__(self, result_type=EventType.OK):
         self.result_type = result_type
+        self.raw = []
 
     async def send_chan_msg(self, channel, text):
+        return type("Result", (), {"type": self.result_type, "payload": {}})()
+
+    async def send_device_query(self):
+        return type(
+            "Result",
+            (),
+            {"type": EventType.DEVICE_INFO, "payload": {"max_channels": 8}},
+        )()
+
+    async def send(self, data, expected):
+        self.raw.append((data, expected))
         return type("Result", (), {"type": self.result_type, "payload": {}})()
 
 
@@ -48,6 +82,79 @@ async def test_meshcore_success_means_accepted_by_companion_without_flood_counte
     tx = MeshCoreTransmitter("tcp", host="unused")
     tx._mc = type("Companion", (), {"commands": Commands()})()
     await tx.send_text("weather", 2)
+
+
+async def test_meshcore_binary_channel_send_uses_raw_channel_data_command():
+    commands = Commands()
+    tx = MeshCoreTransmitter("tcp", host="unused")
+    tx._mc = type("Companion", (), {"commands": commands})()
+    await tx.send_binary(b"\x04\x20\xff", 7)
+
+    data, expected = commands.raw[0]
+    assert data == b"\x3e\x07\xff\xff\xff\x04\x20\xff"
+    assert expected == [EventType.OK, EventType.ERROR]
+
+
+async def test_meshcore_binary_channel_send_rejects_oversize_before_companion_call():
+    commands = Commands()
+    tx = MeshCoreTransmitter("tcp", host="unused")
+    tx._mc = type("Companion", (), {"commands": commands})()
+
+    with pytest.raises(TxUnsent, match="163"):
+        await tx.send_binary(b"x" * 164, 7)
+
+    assert commands.raw == []
+
+
+async def test_meshcore_binary_channel_send_rejects_device_out_of_range_channel():
+    commands = Commands()
+    tx = MeshCoreTransmitter("tcp", host="unused")
+    tx._mc = type("Companion", (), {"commands": commands})()
+
+    with pytest.raises(TxUnsent, match="non-Public channel"):
+        await tx.send_binary(b"payload", 8)
+
+    assert commands.raw == []
+
+
+def test_structured_weather_never_displaces_full_high_priority_queue():
+    manager = TransmitManager(Database(":memory:"))
+    for index in range(manager._queue.maxlen):
+        manager.enqueue_destination(str(index), "meshcore", 2, index)
+    first = manager._queue[0].text
+    results = []
+
+    accepted = manager.enqueue_meshwx(
+        b"\x04\x21", 7, on_result=lambda ok, err="": results.append((ok, err))
+    )
+
+    assert accepted
+    assert manager._queue[0].text == first
+    assert len(manager._queue) == manager._queue.maxlen
+    assert len(manager._queue_low) == 1
+    assert results == []
+
+
+def test_structured_weather_can_be_cancelled_by_correlation_key():
+    manager = TransmitManager(Database(":memory:"))
+    results = []
+    key = ("meshwx", "alert-1")
+    manager.enqueue_meshwx(
+        b"\x04\x21", 7, correlation_key=key,
+        on_result=lambda ok, err="": results.append((ok, err)),
+    )
+
+    assert manager.cancel_queued_correlation(key) == 1
+    assert not manager._queue_low
+    assert results == [(False, "superseded")]
+
+
+async def test_meshcore_binary_channel_send_requires_explicit_ok():
+    tx = MeshCoreTransmitter("tcp", host="unused")
+    tx._mc = type("Companion", (), {"commands": Commands(EventType.ERROR)})()
+
+    with pytest.raises(TxUnsent, match="binary channel data"):
+        await tx.send_binary(b"payload", 7)
 
 
 @pytest.mark.parametrize("result_type", [EventType.ERROR, None])
