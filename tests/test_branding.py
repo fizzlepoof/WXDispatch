@@ -48,6 +48,38 @@ def test_web_ui_uses_new_product_name():
     assert not (ROOT / "docs/settings-2.png").exists()
 
 
+def test_web_ui_has_persistent_dark_mode_theme():
+    base = (ROOT / "app/web/templates/base.html").read_text()
+    map_template = (ROOT / "app/web/templates/map.html").read_text()
+
+    assert '<html lang="en" data-theme="light">' in base
+    assert 'id="theme-toggle"' in base
+    assert 'aria-label="Switch to dark theme"' in base
+    assert '<span>Switch to dark</span>' in base
+    assert "dark ? 'Switch to light' : 'Switch to dark'" in base
+    assert 'localStorage.getItem("wxdispatch-theme")' in base
+    assert 'localStorage.setItem("wxdispatch-theme", theme)' in base
+    assert 'matchMedia("(prefers-color-scheme: dark)")' in base
+    assert ':root[data-theme="dark"]' in base
+    assert 'color-scheme:dark' in base
+    assert 'background:var(--field)' in base
+    assert 'background:var(--surface)' in base
+    assert '--button-ink:#0d1220' in base
+    assert 'color:var(--button-ink)' in base
+    assert ':root[data-theme="dark"] .leaflet-control-zoom a' in base
+    assert ':root[data-theme="dark"] .leaflet-popup-content-wrapper' in base
+    assert ':root[data-theme="dark"] .leaflet-container a.leaflet-popup-close-button:hover' in base
+    assert ':root[data-theme="dark"] .leaflet-container a.leaflet-popup-close-button:focus' in base
+    assert "wxdispatch:themechange" in base
+    assert "World_Dark_Gray_Base/MapServer/tile" in map_template
+    assert "World_Dark_Gray_Reference/MapServer/tile" in map_template
+    assert "className:'dark-map-labels'" in map_template
+    assert '.dark-map-labels{filter:brightness(1.45) contrast(1.15);}' in base
+    assert "https://www.esri.com" in map_template
+    assert "basemaps.cartocdn.com" not in map_template
+    assert "window.addEventListener('wxdispatch:themechange'" in map_template
+
+
 def test_release_artifact_uses_new_product_name():
     workflow = (ROOT / ".github/workflows/release.yml").read_text()
     spec = (ROOT / "packaging/meshwx.spec").read_text()
