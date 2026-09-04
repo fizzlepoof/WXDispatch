@@ -208,6 +208,29 @@ def _dash_ctx(request) -> dict:
     zones = [z.strip() for z in (db.get_setting("zones", "") or "").split(",") if z.strip()]
     forecast = [z for z in zones if len(z) > 2 and z[2] == "Z"]
     county = [z for z in zones if len(z) > 2 and z[2] == "C"]
+    active_routes = []
+    active_destination_ids = set()
+    routed_counties = set()
+    for rule in db.list_routes():
+        destinations = [d for d in rule["destinations"] if d["enabled"]]
+        if not rule["enabled"] or not destinations:
+            continue
+        county_names = [c["county_name"] for c in rule["counties"]]
+        routed_counties.update(c["zone_code"] for c in rule["counties"])
+        active_destination_ids.update(int(d["id"]) for d in destinations)
+        events = (["All warnings"] if rule["all_warnings"] else []) + list(rule["events"])
+        active_routes.append({
+            "name": rule["name"],
+            "counties": county_names,
+            "events": events,
+            "destinations": [
+                "%s - %s ch %d" % (
+                    d["name"], "MeshCore" if d["transport"] == "meshcore" else "Meshtastic",
+                    int(d["channel"]),
+                )
+                for d in destinations
+            ],
+        })
     port = tx.port or ""
     device = "Heltec V3" if ("CP210" in port or "Silicon_Labs" in port) else (port.split("/")[-1] if port else "(none)")
     up = poller.status.uptime_seconds
@@ -229,9 +252,7 @@ def _dash_ctx(request) -> dict:
         if 0 <= a < 7:
             buckets[6 - int(a)] += 1
     spark_line, spark_fill = _spark(buckets)
-    include = list(db.get_setting("filter_include_exact", []) or [])
-    if db.get_setting("filter_include_suffix", []):
-        include = ["All Warnings"] + include
+
     recent = [{
         "event": r["event"], "area": r["area"], "disposition": r["disposition"],
         "detail": r["detail"], "text": r["transmitted_text"], "when": fmt_local(r["ts"], tz),
@@ -301,11 +322,15 @@ def _dash_ctx(request) -> dict:
         "connected": tx.connected, "device": device, "tx_error": tx.last_error,
         "channel_index": int(db.get_setting("channel_index", 0)),
         "zone_count": len(zones), "forecast_count": len(forecast), "county_count": len(county),
+        "active_routes": active_routes,
+        "route_count": len(active_routes),
+        "route_counties": len(routed_counties),
+        "route_destinations": len(active_destination_ids),
         "poll_interval": int(db.get_setting("poll_interval", 120)), "queue_depth": tx.queue_depth,
         "last_poll_local": fmt_local(poller.status.last_poll_time, tz) if poller.status.last_poll_time else "-",
         "uptime_str": uptime_str, "sent_7d": sent_7d, "sent_today": sent_today,
         "spark_line": spark_line, "spark_fill": spark_fill,
-        "include": include, "recent": recent, "last_tx": last_tx,
+        "recent": recent, "last_tx": last_tx,
         "transports": tx.status(),
     }
 

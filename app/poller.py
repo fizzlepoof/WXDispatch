@@ -255,6 +255,7 @@ class WxPoller:
         accepted_prior_rows = [row for row in prior_rows
                                if row["disposition"] in ("sent", "update", "cleared", "cancelled")]
         is_referenced_change = alert.message_type in ("Update", "Cancel") or bool(alert.references)
+        has_current_route = bool(route_alert(self._db, alert))
         cancel_queued = getattr(self._tx, "cancel_queued_correlation", None)
         if is_referenced_change:
             if cancel_queued is not None:
@@ -267,7 +268,7 @@ class WxPoller:
             # A prior text acceptance plus a failed structured attempt is retried
             # on ordinary duplicate polls without re-sending the county text.
             self._queue_meshwx_if_needed(alert)
-        if not legacy_decision.transmit and not (
+        if not legacy_decision.transmit and not has_current_route and not (
                 is_referenced_change and (accepted_prior_rows or related_pending)):
             if not self._db.history_exists(alert.nws_id):
                 self._db.add_history(alert.nws_id, alert.event, alert.area_desc,

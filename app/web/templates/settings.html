@@ -7,10 +7,20 @@
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
   <div class="panel">
-    <h3>Coverage area</h3>
-    <p class="hint">Pick your state, then check the counties to monitor. Counties cover
-      <em>every</em> alert type - tornado, severe thunderstorm and flood warnings, plus
-      watches and advisories - so this is all most people need.</p>
+    <h3>Routing rules are authoritative</h3>
+    <p class="hint">County monitoring, event selection, and delivery channels are controlled on the
+      <a href="/routing">Routing</a> page. Enabled routes automatically supply the NWS polling area
+      and local alert map.</p>
+    <a class="btn" href="/routing">Manage routing rules</a>
+  </div>
+
+  <details class="panel adv" style="padding:14px 18px;">
+    <summary>Legacy coverage and global alert filters</summary>
+
+  <div class="panel">
+    <h3>Legacy coverage area</h3>
+    <p class="hint">Optional compatibility settings for older standalone setups. These are not
+      needed when enabled routing rules already contain every county you monitor.</p>
     <label>State</label>
     <select name="state" hx-get="/settings/counties" hx-target="#counties"
             hx-swap="innerHTML" hx-include="this">
@@ -30,7 +40,8 @@
   </div>
 
   <div class="panel">
-    <h3>What to broadcast</h3>
+    <h3>Legacy global alert filter</h3>
+    <p class="hint">Routing-rule event selections take priority for routed destinations.</p>
     <label class="chk" style="margin-bottom:6px;">
       <input type="checkbox" name="all_warnings" {% if all_warnings %}checked{% endif %}>
       <span><b>All Warning products</b> - tornado, severe thunderstorm, flood, winter, wind, heat&hellip; <em>(recommended)</em></span>
@@ -58,6 +69,7 @@
       </div>
     </details>
   </div>
+  </details>
 
   <div class="panel">
     <h3>Radios</h3>

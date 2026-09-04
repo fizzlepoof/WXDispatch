@@ -1,3 +1,19 @@
+<section class="panel" style="padding:0;grid-column:1/-1;">
+  <div class="panel-head"><h3>{{ 'Configured' if dry_run else 'Active' }} routing</h3><a class="see" href="/routing">Manage &rarr;</a></div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));">
+    {% for route in active_routes %}
+    <div class="node">
+      <div class="node-top"><span class="node-name">{{ route.name }}</span><span class="dot ok">Enabled</span></div>
+      <div class="node-meta">{{ route.counties | join(', ') }}</div>
+      <div class="node-meta">{{ route.destinations | join(' · ') }}</div>
+      <div class="node-meta">{{ route.events | join(', ') if route.events else 'No event products selected' }}</div>
+    </div>
+    {% else %}
+    <div class="kv"><span class="k">No active routing rules</span><span class="v"><a class="see" href="/routing">Configure &rarr;</a></span></div>
+    {% endfor %}
+  </div>
+</section>
+
 <section class="panel" style="padding:0;">
   <div class="panel-head"><h3>Recent alerts</h3><a class="see" href="/history">View history &rarr;</a></div>
   {% for a in recent %}
@@ -33,11 +49,5 @@
     <div class="kv"><span class="k">No radios enabled</span><span class="v"><a class="see" href="/settings">Set up &rarr;</a></span></div>
     {% endfor %}
     <div class="kv"><span class="k">Last TX</span><span class="v">{{ last_tx }}</span></div>
-  </section>
-  <section class="panel" style="padding:0;">
-    <div class="panel-head"><h3>Broadcasting</h3><a class="see" href="/settings">Edit &rarr;</a></div>
-    <div class="chips">
-      {% for ev in include %}<span class="chip">{{ ev }}</span>{% endfor %}
-    </div>
   </section>
 </aside>

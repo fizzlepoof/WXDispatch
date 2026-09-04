@@ -284,6 +284,31 @@ async def test_poller_formats_and_sends_robertson_not_first_area(tmp_path):
     assert history[0]["area"] == "Smith; Robertson"
 
 
+async def test_route_event_rules_are_authoritative_over_legacy_global_filter(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    db.set_setting("dry_run", False)
+    destination_id = db.create_destination("Montgomery mesh", "meshcore", 1)
+    rule_id = db.create_route("Montgomery advisories", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+    db.replace_route_events(rule_id, ["Heat Advisory"], all_warnings=False)
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = DestinationTx()
+
+    await WxPoller(db, tx)._process(
+        _alert(
+            areas="Montgomery County", zones=["TNC125"], event="Heat Advisory",
+        ).raw,
+        FilterRules([], [], []),
+        "America/Chicago",
+        0,
+        False,
+    )
+
+    assert len(tx.sent) == 1
+    assert tx.sent[0][1:] == ("meshcore", 1, destination_id)
+    assert db.query_history()[0]["disposition"] == "accepted"
+
+
 async def test_poller_routes_forecast_zone_warning_to_county_destination(tmp_path):
     db = Database(str(tmp_path / "mesh.db"))
     db.set_setting("dry_run", False)
@@ -1010,7 +1035,7 @@ async def test_dry_run_update_preserves_last_accepted_delivery_snapshot(tmp_path
     assert "Robertson County" in tx.sent[1][0]
 
 
-async def test_global_filter_blocks_new_alert_before_routing(tmp_path):
+async def test_route_event_selection_overrides_legacy_global_filter(tmp_path):
     db = Database(str(tmp_path / "mesh.db"))
     destination_id = db.create_destination("Robertson mesh", "meshcore", 2)
     rule_id = db.create_route("Robertson advisories", 10, True)
@@ -1024,8 +1049,9 @@ async def test_global_filter_blocks_new_alert_before_routing(tmp_path):
         FilterRules([], ["Warning"], []), "America/Chicago", 0, False,
     )
 
-    assert tx.sent == []
-    assert db.query_history()[0]["disposition"] == "filtered"
+    assert len(tx.sent) == 1
+    assert tx.sent[0][1:] == ("meshcore", 2, destination_id)
+    assert db.query_history()[0]["disposition"] == "accepted"
 
 
 async def test_included_alert_without_route_is_logged_as_no_route(tmp_path):

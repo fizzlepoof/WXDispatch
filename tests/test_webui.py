@@ -505,6 +505,38 @@ def test_settings_exposes_optional_meshwx_v4_controls(web):
     assert "normal county text alerts continue unchanged" in response.text
 
 
+def test_settings_makes_routing_primary_and_marks_coverage_as_legacy(web):
+    client, _db, _tx = web
+
+    response = client.get("/settings")
+
+    assert response.status_code == 200
+    assert "Routing rules are authoritative" in response.text
+    assert "Legacy coverage and global alert filters" in response.text
+    assert 'href="/routing"' in response.text
+
+
+def test_dashboard_shows_active_route_details_instead_of_legacy_coverage(web):
+    client, db, _tx = web
+    destination_id = db.create_destination("Montgomery mesh", "meshcore", 7, True)
+    rule_id = db.create_route("Montgomery warnings", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+    db.replace_route_events(rule_id, [], all_warnings=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "Configured routing" in response.text
+    assert "Montgomery warnings" in response.text
+    assert "Montgomery County" in response.text
+    assert "Montgomery mesh" in response.text
+    assert "MeshCore ch 7" in response.text
+    assert "1 county" in response.text
+    assert "1 routing rule configured" in response.text
+    assert "Watching 1 zones" not in response.text
+
+
 def test_settings_round_trip_enables_structured_feed_only_off_public(web):
     client, db, _tx = web
     token = csrf(client)

@@ -143,15 +143,16 @@ No Python install required. Windows may warn about an unrecognized app the first
 2. **NOAA → NWS contact**: set this to your email address. The NWS API
    [requires a contact string](https://www.weather.gov/documentation/services-web-api)
    in every request; leaving the default placeholder can get you rate-limited or blocked.
-3. **Coverage**: pick your state, check your counties.
-4. **What to broadcast**: leave *All Warnings* on; add any watches/advisories you want.
-5. **Radios**: enable Meshtastic and/or MeshCore. For each, choose **USB** or **network (IP/TCP)**, click **Connect and load channels**, then pick which channel carries live alerts and which carries test messages.
-6. Save, then open **Routing**. Create and enable at least one destination, then create and
-   enable a county/event rule that uses it. WXDispatch never creates routing rules automatically.
-7. Go to **Troubleshoot → Send test**. A success response means the request was accepted by
+3. **Radios**: enable Meshtastic and/or MeshCore. For each, choose **USB** or **network (IP/TCP)**, click **Connect and load channels**, then pick which channel carries live alerts and which carries test messages.
+4. Save, then open **Routing**. Create and enable at least one destination, then create and
+   enable a county/event rule that uses it. Routing rules are authoritative: their counties
+   automatically drive NWS polling and the local map, and their event selections control each
+   destination. The collapsed legacy coverage/global-filter controls are not needed for routed
+   setups.
+5. Go to **Troubleshoot → Send test**. A success response means the request was accepted by
    Meshtastic node software or accepted by MeshCore companion software; it does **not** prove
    over-air delivery. Confirm reception on a separate listening node.
-8. Only after routing and reception are verified, turn **dry-run off** on the dashboard. WXDispatch
+6. Only after routing and reception are verified, turn **dry-run off** on the dashboard. WXDispatch
    blocks LIVE mode when no enabled rule has an enabled destination.
 
 Upgrading an existing installation uses the same safety rule: **Upgrades intentionally create
