@@ -138,7 +138,7 @@
           <input type="number" name="meshwx_v4_channel" min="1" max="{{ mc_max_channels - 1 }}" value="{{ meshwx_v4_channel }}">
         </div>
       </div>
-      <p class="hint">Optional binary warning feed for compatible MeshWX clients. Use a dedicated non-Public hash channel; normal county text alerts continue unchanged.</p>
+      <p class="hint">Optional binary warning feed only for clients with a MeshWX v4 decoder. openHop Console does not decode this binary feed and shows it as <code>[data 0xFFFF]</code>; leave it disabled for Console-only setups; normal county text alerts continue unchanged on their routed channels. Use a dedicated non-Public hash channel.</p>
     </div>
   </div>
 

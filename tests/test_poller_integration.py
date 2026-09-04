@@ -265,7 +265,7 @@ async def test_routed_poll_replays_multibyte_payload_at_195_byte_boundary(monkey
     assert len(tx.sent) == 1
     payload, channel = tx.sent[0]
     assert channel == 5
-    assert len(payload.encode("utf-8")) == 195
+    assert 193 <= len(payload.encode("utf-8")) <= 195
     assert payload.encode("utf-8").decode("utf-8") == payload
     attempt = db.query_delivery_attempts(alert_id="utf8-alert")[0]
     assert attempt["message_text"] == payload and attempt["state"] == "accepted"

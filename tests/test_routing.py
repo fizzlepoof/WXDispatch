@@ -334,7 +334,7 @@ async def test_poller_routes_forecast_zone_warning_to_county_destination(tmp_pat
 
     assert len(tx.sent) == 1
     text, transport, channel, sent_destination_id = tx.sent[0]
-    assert "Extreme Heat Warning" in text
+    assert text.startswith("⚠️ EXTREME HEAT WARNING: Christian County")
     assert "Christian County" in text
     assert (transport, channel, sent_destination_id) == ("meshcore", 5, destination_id)
     assert db.query_history()[0]["disposition"] == "accepted"
@@ -1366,7 +1366,7 @@ async def test_referenced_update_clears_destination_that_lost_its_county_once(tm
     await poller._process(update.raw, rules, "America/Chicago", 0, False)
 
     assert len(tx.sent) == 2
-    assert "CLEARED: Tornado Warning for Smith County" in tx.sent[1][0]
+    assert tx.sent[1][0] == "⚠️ CLEARED TORNADO WARNING: Smith County"
 
 
 async def test_disabled_prior_destination_receives_no_further_messages(tmp_path):

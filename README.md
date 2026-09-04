@@ -61,11 +61,14 @@ channel. Built after living through Hurricane Helene's comms blackout.
 - **No spam.** Never rebroadcasts the same alert; sends one concise *update* when a warning
   materially changes and a *cancellation* when it clears. Old state auto-expires.
 - **Fits a LoRa packet.** Alerts are trimmed to ≤195 bytes, e.g.
-  `[WX] Tornado Warning: Charleston +2 more until 8:45 PM EDT`.
-- **Optional rich warning cards.** WXDispatch can dual-cast active warnings as
+  `⚠️ TORNADO WARNING: Charleston County +2 counties until 8:45 PM`.
+- **openHop Console alert cards.** Routed alerts remain ordinary `GRP_TXT` messages but use
+  the Console HOWL form `⚠️ SEVERITY: headline`. A sending companion whose name includes
+  `Bot` is rendered as a card while every normal MeshCore client still sees readable text.
+- **Optional MeshWX v4 binary feed.** WXDispatch can also dual-cast active warnings as
   COBS-encoded MeshWX v4 `0x20`/`0x21` binary frames on a dedicated non-Public
-  MeshCore hash channel. Compatible clients render structured warning cards while
-  the existing county text channels continue unchanged.
+  MeshCore hash channel. This is only for clients with a MeshWX v4 decoder; openHop Console
+  otherwise displays it as `[data 0xFFFF]`, so leave it disabled for Console-only setups.
 - **Dry-run by default.** Automated alerts are logged, not transmitted, until you flip it on.
 - **A real dashboard.** Live radio status, recent alerts, 7-day activity, transmit log,
   and a per-radio **Send test** button to key up each radio on the bench.

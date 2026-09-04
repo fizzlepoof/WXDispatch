@@ -1,6 +1,6 @@
-"""Format an alert into a Meshtastic text payload (<= 195 bytes).
+"""Format an alert into a radio text payload (<= 195 bytes).
 
-    "[WX] Tornado Warning for Charleston and surrounding areas until 8:45 PM"
+    "⚠️ TORNADO WARNING: Charleston County until 8:45 PM"
     "[WX] Heat Advisory for Columbia and surrounding areas from 12:00 PM to 8:00 PM"
     "[WX] SPS: Strong thunderstorm (60 mph wind, 0.75in hail) - Columbia until 8:00 PM"
 
@@ -14,12 +14,14 @@ what it's actually for. The payload is byte-capped in UTF-8, area trimmed first.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import MAX_PAYLOAD_BYTES
 
 PREFIX = "[WX] "
+HOWL_ALERT_PREFIX = "⚠️ "
 DEFAULT_HOME_AREA = "Columbia"
 
 
@@ -160,17 +162,28 @@ def build_routed_mesh_text(alert, matched_areas, tz_name: str = "America/New_Yor
                            disposition: str = "sent") -> str:
     """Format only the counties that activated one destination's route."""
     labels = [_county_label(value) for value in matched_areas if value.strip()]
-    event = alert.event
+    raw_event = alert.event.strip()
+    upper_event = " ".join(raw_event.upper().split())
+    howl_safe = (
+        2 <= len(upper_event) <= 64
+        and bool(re.fullmatch(r"[A-Z]+(?: [A-Z]+)*", upper_event))
+    )
+    event = upper_event if howl_safe else "ALERT"
+    headline_event = "" if howl_safe else raw_event
     if disposition == "cancelled":
-        event = "CANCELLED: " + event
+        event = "CANCELLED " + event
     elif disposition == "cleared":
-        event = "CLEARED: " + event
+        event = "CLEARED " + event
     when = "" if disposition in ("cancelled", "cleared") else _format_when(alert.onset, alert.ends, tz_name)
 
     def assemble(area: str) -> str:
-        value = PREFIX + event
+        value = HOWL_ALERT_PREFIX + event + ":"
+        if headline_event:
+            value += " " + headline_event
+            if area:
+                value += " for"
         if area:
-            value += " for " + area
+            value += " " + area
         if when:
             value += " " + when
         return value

@@ -35,6 +35,53 @@ def test_routed_compaction_uses_singular_and_plural_county_grammar():
     assert "+2 counties" in three
 
 
+def test_routed_alert_uses_openhop_howl_weather_card_text():
+    alert = Alert(
+        "id", "Heat Advisory", "", "", "",
+        "2030-07-01T20:00:00-04:00", "Alert",
+        ends="2030-07-01T20:00:00-04:00",
+    )
+
+    msg = build_routed_mesh_text(
+        alert, ["Montgomery"], tz_name="America/New_York",
+    )
+
+    assert msg == "⚠️ HEAT ADVISORY: Montgomery County until 8:00 PM"
+
+
+def test_routed_cancellation_remains_a_howl_weather_card():
+    alert = Alert("id", "Tornado Warning", "", "", "", "", "Cancel")
+
+    msg = build_routed_mesh_text(alert, ["Robertson"], disposition="cancelled")
+
+    assert msg == "⚠️ CANCELLED TORNADO WARNING: Robertson County"
+
+
+def test_routed_event_with_nonletters_uses_howl_safe_alert_severity():
+    alert = Alert("id", "911 Telephone Outage Emergency", "", "", "", "", "Alert")
+
+    msg = build_routed_mesh_text(alert, ["Montgomery"])
+
+    assert msg == "⚠️ ALERT: 911 Telephone Outage Emergency for Montgomery County"
+
+
+def test_routed_long_event_keeps_howl_parser_colon_before_truncation():
+    alert = Alert("id", "A" * 188, "", "", "", "", "Alert")
+
+    msg = build_routed_mesh_text(alert, ["Montgomery"], max_bytes=195)
+
+    assert msg.startswith("⚠️ ALERT:")
+    assert len(msg.encode("utf-8")) <= 195
+
+
+def test_routed_one_letter_event_uses_howl_safe_alert_severity():
+    alert = Alert("id", "A", "", "", "", "", "Alert")
+
+    msg = build_routed_mesh_text(alert, ["Montgomery"])
+
+    assert msg == "⚠️ ALERT: A for Montgomery County"
+
+
 def test_timezone_conversion(feature):
     a = Alert.from_feature(feature("tornado_warning"))
     msg = format_alert(a.event, a.area_desc, a.ends, "America/Chicago", onset_iso=a.onset)

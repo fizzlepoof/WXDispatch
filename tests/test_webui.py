@@ -514,6 +514,7 @@ def test_settings_makes_routing_primary_and_marks_coverage_as_legacy(web):
     assert "Routing rules are authoritative" in response.text
     assert "Legacy coverage and global alert filters" in response.text
     assert 'href="/routing"' in response.text
+    assert "openHop Console does not decode this binary feed" in response.text
 
 
 def test_dashboard_shows_active_route_details_instead_of_legacy_coverage(web):
