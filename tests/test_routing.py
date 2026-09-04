@@ -11,7 +11,7 @@ from app.filters import FilterRules
 from app.poller import WxPoller, _delivery_hash
 
 
-def _alert(areas="Smith; Robertson", zones=None, event="Tornado Warning",
+def _alert(areas="Smith; Robertson", zones=None, same_codes=None, event="Tornado Warning",
            alert_id="alert-1", message_type="Alert", references=None,
            headline="warning"):
     zones = ["TNC147", "TNC159"] if zones is None else zones
@@ -25,7 +25,7 @@ def _alert(areas="Smith; Robertson", zones=None, event="Tornado Warning",
             "references": [{"@id": ref} for ref in (references or [])],
             "effective": "2099-01-01T00:00:00+00:00",
             "expires": "2099-01-01T01:00:00+00:00",
-            "geocode": {"UGC": zones},
+            "geocode": {"UGC": zones, "SAME": same_codes or []},
         },
     })
 
@@ -44,6 +44,106 @@ def test_route_uses_only_configured_county_that_matched(tmp_path):
     assert matches[0].transport == "meshcore"
     assert matches[0].channel == 2
     assert matches[0].matched_areas == ("Robertson",)
+
+
+def test_route_matches_county_when_warning_uses_forecast_zone_ugc(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Christian mesh", "meshcore", 5)
+    rule_id = db.create_route("Christian warnings", 10, True)
+    db.replace_route_counties(rule_id, [("KYC047", "Christian County")])
+    db.replace_route_events(rule_id, [], all_warnings=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+
+    matches = route_alert(
+        db, _alert(
+            areas="Regional heat area",
+            zones=["KYZ017"],
+            same_codes=["021047"],
+            event="Extreme Heat Warning",
+        ),
+    )
+
+    assert len(matches) == 1
+    assert matches[0].destination_id == destination_id
+    assert matches[0].matched_areas == ("Christian County",)
+
+
+def test_forecast_zone_same_codes_require_matching_state_and_county(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    christian_destination = db.create_destination("Christian", "meshcore", 5)
+    wrong_state_destination = db.create_destination("Tennessee 047", "meshcore", 6)
+    christian_rule = db.create_route("Christian warnings", 10, True)
+    wrong_state_rule = db.create_route("Tennessee 047 warnings", 20, True)
+    db.replace_route_counties(christian_rule, [("KYC047", "Christian County")])
+    db.replace_route_counties(wrong_state_rule, [("TNC047", "Fayette County")])
+    for rule_id, destination_id in (
+        (christian_rule, christian_destination),
+        (wrong_state_rule, wrong_state_destination),
+    ):
+        db.replace_route_events(rule_id, [], all_warnings=True)
+        db.replace_route_destinations(rule_id, [destination_id])
+
+    matches = route_alert(
+        db,
+        _alert(
+            areas="Regional heat area",
+            zones=["KYZ017"],
+            same_codes=["021047"],
+            event="Extreme Heat Warning",
+        ),
+    )
+
+    assert [match.destination_id for match in matches] == [christian_destination]
+
+
+def test_forecast_zone_without_same_code_does_not_guess_from_area_name(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Christian", "meshcore", 5)
+    rule_id = db.create_route("Christian warnings", 10, True)
+    db.replace_route_counties(rule_id, [("KYC047", "Christian County")])
+    db.replace_route_events(rule_id, [], all_warnings=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+
+    matches = route_alert(
+        db,
+        _alert(
+            areas="Christian",
+            zones=["KYZ017"],
+            event="Extreme Heat Warning",
+        ),
+    )
+
+    assert matches == []
+
+
+@pytest.mark.parametrize(
+    ("same_code", "should_match"),
+    [
+        ("121047", True),
+        ("21047", False),
+        ("0021047", False),
+        ("02A047", False),
+    ],
+)
+def test_forecast_zone_validates_same_location_format(tmp_path, same_code, should_match):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Christian", "meshcore", 5)
+    rule_id = db.create_route("Christian warnings", 10, True)
+    db.replace_route_counties(rule_id, [("KYC047", "Christian County")])
+    db.replace_route_events(rule_id, [], all_warnings=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+
+    matches = route_alert(
+        db,
+        _alert(
+            areas="Regional heat area",
+            zones=["KYZ017"],
+            same_codes=[same_code],
+            event="Extreme Heat Warning",
+        ),
+    )
+
+    assert bool(matches) is should_match
 
 
 class DestinationTx:
@@ -137,6 +237,73 @@ async def test_poller_formats_and_sends_robertson_not_first_area(tmp_path):
     assert "Smith" not in tx.sent[0][0]
     history = db.query_history()
     assert history[0]["area"] == "Smith; Robertson"
+
+
+async def test_poller_routes_forecast_zone_warning_to_county_destination(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    db.set_setting("dry_run", False)
+    destination_id = db.create_destination("Christian mesh", "meshcore", 5)
+    rule_id = db.create_route("Christian warnings", 10, True)
+    db.replace_route_counties(rule_id, [("KYC047", "Christian County")])
+    db.replace_route_events(rule_id, [], all_warnings=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = DestinationTx()
+
+    await WxPoller(db, tx)._process(
+        _alert(
+            areas="Christian",
+            zones=["KYZ017"],
+            same_codes=["021047"],
+            event="Extreme Heat Warning",
+        ).raw,
+        FilterRules([], ["Warning"], []),
+        "America/Chicago",
+        0,
+        False,
+    )
+
+    assert len(tx.sent) == 1
+    text, transport, channel, sent_destination_id = tx.sent[0]
+    assert "Extreme Heat Warning" in text
+    assert "Christian County" in text
+    assert (transport, channel, sent_destination_id) == ("meshcore", 5, destination_id)
+    assert db.query_history()[0]["disposition"] == "accepted"
+
+
+async def test_existing_no_route_history_is_retried_after_route_fix(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    db.set_setting("dry_run", False)
+    destination_id = db.create_destination("Christian mesh", "meshcore", 5)
+    rule_id = db.create_route("Christian warnings", 10, True)
+    db.replace_route_counties(rule_id, [("KYC047", "Christian County")])
+    db.replace_route_events(rule_id, [], all_warnings=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+    alert = _alert(
+        areas="Christian",
+        zones=["KYZ017"],
+        same_codes=["021047"],
+        event="Extreme Heat Warning",
+    )
+    db.add_history(
+        alert.nws_id,
+        alert.event,
+        alert.area_desc,
+        "no_route",
+        "",
+        "no matching route",
+    )
+    tx = DestinationTx()
+
+    await WxPoller(db, tx)._process(
+        alert.raw,
+        FilterRules([], ["Warning"], []),
+        "America/Chicago",
+        0,
+        False,
+    )
+
+    assert len(tx.sent) == 1
+    assert db.query_history()[0]["disposition"] == "accepted"
 
 
 @pytest.mark.parametrize(
