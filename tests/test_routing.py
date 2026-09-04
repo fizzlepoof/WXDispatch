@@ -3,12 +3,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.db import Database
 from app.config import STATE_EXPIRY_HOURS
-from app.models import Alert
-from app.routing import RoutedDestination, route_alert
+from app.db import Database
 from app.filters import FilterRules
+from app.meshwx_v4 import cobs_decode
+from app.models import Alert
 from app.poller import WxPoller, _delivery_hash
+from app.routing import RoutedDestination, route_alert
 
 
 def _alert(areas="Smith; Robertson", zones=None, same_codes=None, event="Tornado Warning",
@@ -157,6 +158,50 @@ class DestinationTx:
         return True
 
 
+class StructuredTx(DestinationTx):
+    def __init__(self):
+        super().__init__()
+        self.structured = []
+
+    def enqueue_meshwx(self, payload, channel, correlation_key=None, on_result=None):
+        self.structured.append((payload, channel))
+        if on_result:
+            on_result(True)
+        return True
+
+
+class RetryingStructuredTx(DestinationTx):
+    def __init__(self):
+        super().__init__()
+        self.structured = []
+
+    def enqueue_meshwx(self, payload, channel, correlation_key=None, on_result=None):
+        self.structured.append((payload, channel, correlation_key))
+        ok = len(self.structured) > 1
+        if on_result:
+            on_result(ok, "temporary failure" if not ok else "")
+        return ok
+
+
+class DeferredStructuredTx(DestinationTx):
+    def __init__(self):
+        super().__init__()
+        self.pending_structured = {}
+        self.cancelled = []
+
+    def enqueue_meshwx(self, payload, channel, correlation_key=None, on_result=None):
+        self.pending_structured[correlation_key] = on_result
+        return True
+
+    def cancel_queued_correlation(self, correlation_key):
+        callback = self.pending_structured.pop(correlation_key, None)
+        if callback is None:
+            return 0
+        self.cancelled.append(correlation_key)
+        callback(False, "superseded")
+        return 1
+
+
 class DeferredTx:
     def __init__(self):
         self.sent = []
@@ -268,6 +313,208 @@ async def test_poller_routes_forecast_zone_warning_to_county_destination(tmp_pat
     assert "Christian County" in text
     assert (transport, channel, sent_destination_id) == ("meshcore", 5, destination_id)
     assert db.query_history()[0]["disposition"] == "accepted"
+
+
+async def test_poller_adds_one_optional_structured_warning_without_replacing_text(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    db.set_setting("dry_run", False)
+    db.set_setting("meshwx_v4_enabled", True)
+    db.set_setting("meshwx_v4_channel", 7)
+    destination_id = db.create_destination("Christian mesh", "meshcore", 5)
+    rule_id = db.create_route("Christian warnings", 10, True)
+    db.replace_route_counties(rule_id, [("KYC047", "Christian County")])
+    db.replace_route_events(rule_id, [], all_warnings=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = StructuredTx()
+
+    await WxPoller(db, tx)._process(
+        _alert(
+            areas="Christian",
+            zones=["KYZ017"],
+            same_codes=["021047"],
+            event="Extreme Heat Warning",
+        ).raw,
+        FilterRules([], ["Warning"], []),
+        "America/Chicago",
+        0,
+        False,
+    )
+
+    assert len(tx.sent) == 1
+    assert len(tx.structured) == 1
+    payload, channel = tx.structured[0]
+    assert channel == 7
+    assert payload and b"\x00" not in payload
+
+
+async def test_poller_structured_warning_is_disabled_by_default(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    db.set_setting("dry_run", False)
+    destination_id = db.create_destination("Christian mesh", "meshcore", 5)
+    rule_id = db.create_route("Christian warnings", 10, True)
+    db.replace_route_counties(rule_id, [("KYC047", "Christian County")])
+    db.replace_route_events(rule_id, [], all_warnings=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = StructuredTx()
+
+    await WxPoller(db, tx)._process(
+        _alert(zones=["KYZ017"], same_codes=["021047"], event="Extreme Heat Warning").raw,
+        FilterRules([], ["Warning"], []), "America/Chicago", 0, False,
+    )
+
+    assert len(tx.sent) == 1
+    assert tx.structured == []
+
+
+async def test_poller_does_not_send_structured_warning_when_text_fails(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    db.set_setting("dry_run", False)
+    db.set_setting("meshwx_v4_enabled", True)
+    db.set_setting("meshwx_v4_channel", 7)
+    destination_id = db.create_destination("Christian mesh", "meshcore", 5)
+    rule_id = db.create_route("Christian warnings", 10, True)
+    db.replace_route_counties(rule_id, [("KYC047", "Christian County")])
+    db.replace_route_events(rule_id, [], all_warnings=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = StructuredTx()
+    tx.enqueue_destination = lambda text, transport, channel, destination_id, on_result=None: (
+        on_result(False, "failed") if on_result else False
+    )
+
+    await WxPoller(db, tx)._process(
+        _alert(zones=["KYZ017"], same_codes=["021047"], event="Extreme Heat Warning").raw,
+        FilterRules([], ["Warning"], []), "America/Chicago", 0, False,
+    )
+
+    assert tx.structured == []
+
+
+async def test_malformed_structured_geometry_never_suppresses_text(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    db.set_setting("dry_run", False)
+    db.set_setting("meshwx_v4_enabled", True)
+    db.set_setting("meshwx_v4_channel", 7)
+    destination_id = db.create_destination("Robertson mesh", "meshcore", 5)
+    rule_id = db.create_route("Robertson warnings", 10, True)
+    db.replace_route_counties(rule_id, [("TNC147", "Robertson County")])
+    db.replace_route_events(rule_id, [], all_warnings=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = StructuredTx()
+    feature = _alert(zones=["TNC147"], event="Tornado Warning").raw
+    feature["geometry"] = {"type": "Polygon", "coordinates": [[[None]]]}
+
+    await WxPoller(db, tx)._process(
+        feature, FilterRules([], ["Warning"], []), "America/Chicago", 0, False,
+    )
+
+    assert len(tx.sent) == 1
+    assert tx.structured == []
+    assert db.query_history()[0]["disposition"] == "accepted"
+
+
+async def test_poller_updates_remain_text_only(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    db.set_setting("dry_run", False)
+    db.set_setting("meshwx_v4_enabled", True)
+    db.set_setting("meshwx_v4_channel", 7)
+    destination_id = db.create_destination("Christian mesh", "meshcore", 5)
+    rule_id = db.create_route("Christian warnings", 10, True)
+    db.replace_route_counties(rule_id, [("KYC047", "Christian County")])
+    db.replace_route_events(rule_id, [], all_warnings=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = StructuredTx()
+
+    await WxPoller(db, tx)._process(
+        _alert(
+            zones=["KYZ017"], same_codes=["021047"], event="Extreme Heat Warning",
+            alert_id="update-1", message_type="Update", references=["original-1"],
+        ).raw,
+        FilterRules([], ["Warning"], []), "America/Chicago", 0, False,
+    )
+
+    assert len(tx.sent) == 1
+    assert tx.structured == []
+
+
+async def test_failed_structured_warning_retries_without_resending_text(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    db.set_setting("dry_run", False)
+    db.set_setting("meshwx_v4_enabled", True)
+    db.set_setting("meshwx_v4_channel", 7)
+    destination_id = db.create_destination("Christian mesh", "meshcore", 5)
+    rule_id = db.create_route("Christian warnings", 10, True)
+    db.replace_route_counties(rule_id, [("KYC047", "Christian County")])
+    db.replace_route_events(rule_id, [], all_warnings=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = RetryingStructuredTx()
+    poller = WxPoller(db, tx)
+    feature = _alert(
+        zones=["KYZ017"], same_codes=["021047"], event="Extreme Heat Warning",
+    ).raw
+
+    await poller._process(
+        feature, FilterRules([], ["Warning"], []), "America/Chicago", 0, False,
+    )
+    assert len(tx.sent) == 1
+    assert len(tx.structured) == 1
+    assert db.get_meshwx_delivery("alert-1")["state"] == "failed"
+
+    await poller._process(
+        feature, FilterRules([], ["Warning"], []), "America/Chicago", 0, False,
+    )
+    assert len(tx.sent) == 1
+    assert len(tx.structured) == 2
+    assert db.get_meshwx_delivery("alert-1")["state"] == "accepted"
+
+
+async def test_update_cancels_queued_structured_warning(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    db.set_setting("dry_run", False)
+    db.set_setting("meshwx_v4_enabled", True)
+    db.set_setting("meshwx_v4_channel", 7)
+    destination_id = db.create_destination("Christian mesh", "meshcore", 5)
+    rule_id = db.create_route("Christian warnings", 10, True)
+    db.replace_route_counties(rule_id, [("KYC047", "Christian County")])
+    db.replace_route_events(rule_id, [], all_warnings=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = DeferredStructuredTx()
+    poller = WxPoller(db, tx)
+
+    await poller._process(
+        _alert(
+            zones=["KYZ017"], same_codes=["021047"], event="Extreme Heat Warning",
+            alert_id="original-1",
+        ).raw,
+        FilterRules([], ["Warning"], []), "America/Chicago", 0, False,
+    )
+    assert ("meshwx", "original-1") in tx.pending_structured
+
+    await poller._process(
+        _alert(
+            zones=["KYZ017"], same_codes=["021047"], event="Extreme Heat Warning",
+            alert_id="update-1", message_type="Update", references=["original-1"],
+        ).raw,
+        FilterRules([], ["Warning"], []), "America/Chicago", 0, False,
+    )
+
+    assert tx.cancelled == [("meshwx", "original-1")]
+    assert db.get_meshwx_delivery("original-1")["state"] == "superseded"
+
+
+async def test_meshwx_sequence_persists_and_wraps_across_poller_restart(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    db.set_setting("meshwx_v4_enabled", True)
+    db.set_setting("meshwx_v4_channel", 7)
+    db.set_setting("meshwx_v4_sequence", 0xFFFF)
+    tx = StructuredTx()
+    poller = WxPoller(db, tx)
+
+    assert poller._queue_meshwx_if_needed(
+        _alert(zones=["TNZ050"], alert_id="sequence-test")
+    )
+    assert cobs_decode(tx.structured[0][0])[4:6] == b"\xff\xff"
+    assert db.get_setting("meshwx_v4_sequence") == 0
+    assert WxPoller(db, StructuredTx())._meshwx_sequence == 0
 
 
 async def test_existing_no_route_history_is_retried_after_route_fix(tmp_path):

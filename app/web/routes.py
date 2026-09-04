@@ -636,6 +636,9 @@ async def settings_page(request: Request):
         mc_port=s.get("meshcore_port", "") or "",
         mc_host=s.get("meshcore_host", "") or "",
         mc_channel=int(s.get("meshcore_channel", 0) or 0),
+        mc_max_channels=max(2, int(s.get("meshcore_max_channels", 8) or 8)),
+        meshwx_v4_enabled=bool(s.get("meshwx_v4_enabled", False)),
+        meshwx_v4_channel=int(s.get("meshwx_v4_channel", 0) or 0),
         mt_test=int(s.get("meshtastic_test_channel", 1) or 1),
         mc_test=int(s.get("meshcore_test_channel", 1) or 1),
         mt_channels=s.get("meshtastic_channels", []) or [],
@@ -671,6 +674,8 @@ async def save_settings(
     meshcore_port: str = Form(""),
     meshcore_host: str = Form(""),
     meshcore_channel: int = Form(0),
+    meshwx_v4_enabled: str = Form(""),
+    meshwx_v4_channel: int = Form(0),
     meshtastic_test_channel: int = Form(1),
     meshcore_test_channel: int = Form(1),
 ):
@@ -706,6 +711,14 @@ async def save_settings(
     db.set_setting("meshcore_port", meshcore_port.strip())
     db.set_setting("meshcore_host", meshcore_host.strip())
     db.set_setting("meshcore_channel", int(meshcore_channel))
+    meshwx_channel = max(0, min(255, int(meshwx_v4_channel)))
+    try:
+        meshcore_max_channels = int(db.get_setting("meshcore_max_channels", 8) or 8)
+    except (TypeError, ValueError):
+        meshcore_max_channels = 8
+    meshwx_valid = 1 <= meshwx_channel < meshcore_max_channels
+    db.set_setting("meshwx_v4_enabled", bool(meshwx_v4_enabled) and meshwx_valid)
+    db.set_setting("meshwx_v4_channel", meshwx_channel)
     db.set_setting("meshtastic_test_channel", int(meshtastic_test_channel))
     db.set_setting("meshcore_test_channel", int(meshcore_test_channel))
 

@@ -102,6 +102,15 @@ CREATE TABLE IF NOT EXISTS delivery_attempts (
     finalized_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS meshwx_delivery_state (
+    alert_id TEXT PRIMARY KEY,
+    msg_hash TEXT NOT NULL,
+    channel INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('queued','accepted','failed','superseded')),
+    error TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS history (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     ts               TEXT NOT NULL,
@@ -167,6 +176,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_routes_name_unique
 CREATE INDEX IF NOT EXISTS idx_delivery_last ON alert_delivery_state(last_alert_id);
 CREATE INDEX IF NOT EXISTS idx_attempt_alert ON delivery_attempts(alert_id, id);
 CREATE INDEX IF NOT EXISTS idx_attempt_destination ON delivery_attempts(destination_id, id);
+CREATE INDEX IF NOT EXISTS idx_meshwx_updated ON meshwx_delivery_state(updated_at);
 """
 
 
@@ -625,6 +635,57 @@ class Database:
             )
             self._conn.commit()
 
+    def get_meshwx_delivery(self, alert_id: str):
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM meshwx_delivery_state WHERE alert_id = ?", (alert_id,)
+            ).fetchone()
+
+    def set_meshwx_delivery(self, alert_id: str, msg_hash: str, channel: int,
+                            state: str, error: str = "") -> None:
+        if state not in {"queued", "accepted", "failed", "superseded"}:
+            raise ValueError("invalid MeshWX delivery state")
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO meshwx_delivery_state
+                   (alert_id,msg_hash,channel,state,error,updated_at)
+                   VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(alert_id) DO UPDATE SET
+                     msg_hash=excluded.msg_hash, channel=excluded.channel,
+                     state=excluded.state, error=excluded.error,
+                     updated_at=excluded.updated_at""",
+                (alert_id, msg_hash, channel, state, error, _now()),
+            )
+            self._conn.commit()
+
+    def supersede_meshwx_deliveries(self, alert_ids) -> int:
+        ids = [value for value in alert_ids if value]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock:
+            cur = self._conn.execute(
+                f"""UPDATE meshwx_delivery_state
+                    SET state = 'superseded', error = 'superseded', updated_at = ?
+                    WHERE alert_id IN ({placeholders}) AND state != 'superseded'""",
+                [_now(), *ids],
+            )
+            self._conn.commit()
+            return cur.rowcount
+
+    def recover_queued_meshwx_deliveries(self) -> int:
+        """Make interrupted queued sends retryable after process startup."""
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE meshwx_delivery_state
+                   SET state = 'failed', error = 'interrupted before completion',
+                       updated_at = ?
+                   WHERE state = 'queued'""",
+                (_now(),),
+            )
+            self._conn.commit()
+            return cur.rowcount
+
     def create_delivery_attempt(
         self, *, root_alert_id: str, alert_id: str, destination_id: int,
         destination_name: str, transport: str, channel: int,
@@ -807,6 +868,9 @@ class Database:
         with self._lock:
             cur = self._conn.execute(
                 "DELETE FROM history WHERE ts < ?", (cutoff,)
+            )
+            self._conn.execute(
+                "DELETE FROM meshwx_delivery_state WHERE updated_at < ?", (cutoff,)
             )
             self._conn.commit()
             return cur.rowcount

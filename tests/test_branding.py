@@ -14,15 +14,15 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_product_identity_is_wxdispatch_2():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
 
-    assert __version__ == "2.2.0"
+    assert __version__ == "2.3.0"
     assert project["project"]["name"] == "wxdispatch"
-    assert project["project"]["version"] == "2.2.0"
+    assert project["project"]["version"] == "2.3.0"
     assert project["project"]["urls"]["Repository"] == \
         "https://github.com/fizzlepoof/WXDispatch"
     assert GITHUB_REPO == "fizzlepoof/WXDispatch"
     app = create_app()
     assert app.title == "WXDispatch"
-    assert app.version == "2.2.0"
+    assert app.version == "2.3.0"
 
 
 def test_python_package_includes_web_templates():

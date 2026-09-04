@@ -83,6 +83,8 @@ DEFAULT_SETTINGS: dict = {
     "meshcore_channel": 0,
     "meshcore_repeat": 2,
     "meshcore_test_channel": 1,
+    "meshwx_v4_enabled": False,
+    "meshwx_v4_channel": 0,
     "dry_run": True,
     "test_channel": 1,   # tests + manual sends use this channel (keep off the live alert channel 0)
     "display_timezone": "",   # blank = use this computer's local time zone

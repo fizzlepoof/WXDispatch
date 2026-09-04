@@ -1,6 +1,6 @@
 [project]
 name = "wxdispatch"
-version = "2.2.0"
+version = "2.3.0"
 description = "Route county-aware NWS and IPAWS alerts over Meshtastic and MeshCore radios"
 readme = "README.md"
 requires-python = ">=3.11"

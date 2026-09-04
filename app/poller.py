@@ -14,10 +14,11 @@ import logging
 from dataclasses import replace
 from datetime import datetime, timezone
 
-from .config import POLL_INTERVAL_MIN, POLL_HARD_TIMEOUT
+from .config import POLL_HARD_TIMEOUT, POLL_INTERVAL_MIN
 from .dedupe import decide
 from .filters import FilterRules
-from .formatter import build_mesh_text, build_routed_mesh_text
+from .formatter import build_routed_mesh_text
+from .meshwx_v4 import encode_alert
 from .models import Alert
 from .nws import NWSClient, NWSError
 from .routing import RoutedDestination, route_alert
@@ -68,6 +69,14 @@ class WxPoller:
         self._stopped = False
         self._pending_deliveries: dict[tuple[str, str, int, str, int], dict] = {}
         self._conditional_chains: set[tuple[str, int]] = set()
+        saved_sequence = self._db.get_setting("meshwx_v4_sequence", None)
+        try:
+            self._meshwx_sequence = int(saved_sequence) & 0xFFFF
+        except (TypeError, ValueError):
+            self._meshwx_sequence = int(datetime.now(timezone.utc).timestamp()) & 0xFFFF
+        recover_meshwx = getattr(self._db, "recover_queued_meshwx_deliveries", None)
+        if recover_meshwx is not None:
+            recover_meshwx()
 
     # ---- lifecycle ------------------------------------------------------
     def start(self) -> None:
@@ -87,6 +96,72 @@ class WxPoller:
     def poke(self) -> None:
         """Wake the loop early (e.g. after a settings change)."""
         self._wake.set()
+
+    def _meshwx_channel(self) -> int | None:
+        if not bool(self._db.get_setting("meshwx_v4_enabled", False)):
+            return None
+        try:
+            channel = int(self._db.get_setting("meshwx_v4_channel", 0) or 0)
+            max_channels = int(self._db.get_setting("meshcore_max_channels", 8) or 8)
+        except (TypeError, ValueError):
+            return None
+        return channel if 1 <= channel < max_channels else None
+
+    def _preview_meshwx(self, alert: Alert) -> tuple[bytes | None, int | None]:
+        channel = self._meshwx_channel()
+        if channel is None or alert.message_type in ("Update", "Cancel") or alert.references:
+            return None, channel
+        return encode_alert(alert, sequence=self._meshwx_sequence), channel
+
+    def _queue_meshwx_if_needed(self, alert: Alert) -> bool:
+        payload, channel = self._preview_meshwx(alert)
+        if payload is None or channel is None:
+            return False
+        get_delivery = getattr(self._db, "get_meshwx_delivery", None)
+        set_delivery = getattr(self._db, "set_meshwx_delivery", None)
+        if get_delivery is None or set_delivery is None:
+            return False
+        msg_hash = alert.content_hash()
+        prior = get_delivery(alert.nws_id)
+        if (prior is not None and prior["msg_hash"] == msg_hash
+                and int(prior["channel"]) == channel
+                and prior["state"] in ("queued", "accepted", "superseded")):
+            return False
+        enqueue = getattr(self._tx, "enqueue_meshwx", None)
+        if enqueue is None:
+            return False
+        sequence = self._meshwx_sequence
+        payload = encode_alert(alert, sequence=sequence)
+        if payload is None:
+            return False
+        self._meshwx_sequence = (sequence + 1) & 0xFFFF
+        self._db.set_setting("meshwx_v4_sequence", self._meshwx_sequence)
+        correlation_key = ("meshwx", alert.nws_id)
+        set_delivery(alert.nws_id, msg_hash, channel, "queued")
+
+        def _on_result(ok, err=""):
+            current = get_delivery(alert.nws_id)
+            if current is not None and current["state"] == "superseded":
+                return
+            state = "accepted" if ok else "failed"
+            set_delivery(alert.nws_id, msg_hash, channel, state, err or "")
+            if ok:
+                self._db.add_event(
+                    "INFO", "MeshWX v4 warning accepted on MeshCore ch %d" % channel,
+                )
+            else:
+                self._db.add_error(
+                    "meshwx_v4", err or "structured warning was not accepted"
+                )
+
+        try:
+            return bool(enqueue(
+                payload, channel, correlation_key=correlation_key, on_result=_on_result,
+            ))
+        except Exception as exc:
+            set_delivery(alert.nws_id, msg_hash, channel, "failed", str(exc))
+            self._db.add_error("meshwx_v4", str(exc))
+            return False
 
     # ---- loop -----------------------------------------------------------
     async def _run(self) -> None:
@@ -180,6 +255,18 @@ class WxPoller:
         accepted_prior_rows = [row for row in prior_rows
                                if row["disposition"] in ("sent", "update", "cleared", "cancelled")]
         is_referenced_change = alert.message_type in ("Update", "Cancel") or bool(alert.references)
+        cancel_queued = getattr(self._tx, "cancel_queued_correlation", None)
+        if is_referenced_change:
+            if cancel_queued is not None:
+                for related_id in related_ids:
+                    cancel_queued(("meshwx", related_id))
+            supersede_meshwx = getattr(self._db, "supersede_meshwx_deliveries", None)
+            if supersede_meshwx is not None:
+                supersede_meshwx(related_ids)
+        elif accepted_prior_rows:
+            # A prior text acceptance plus a failed structured attempt is retried
+            # on ordinary duplicate polls without re-sending the county text.
+            self._queue_meshwx_if_needed(alert)
         if not legacy_decision.transmit and not (
                 is_referenced_change and (accepted_prior_rows or related_pending)):
             if not self._db.history_exists(alert.nws_id):
@@ -187,7 +274,6 @@ class WxPoller:
                                      legacy_decision.disposition, "", legacy_decision.detail)
             return
         if is_referenced_change:
-            cancel_queued = getattr(self._tx, "cancel_queued_correlation", None)
             if cancel_queued is not None:
                 for chain_key in {pending["chain_key"] for pending in related_pending}:
                     cancel_queued(chain_key)
@@ -220,9 +306,15 @@ class WxPoller:
             routed.append((destination, root_id, disposition, text))
 
         if dry_run:
+            structured_payload, structured_channel = self._preview_meshwx(alert)
             for destination, _root_id, _disposition, text in routed:
                 self._db.add_event("INFO", "[DRY-RUN] would send via %s ch %d: %s" %
                                    (destination.transport, destination.channel, text))
+            if structured_payload is not None:
+                self._db.add_event(
+                    "INFO", "[DRY-RUN] would send MeshWX v4 warning on MeshCore ch %d"
+                    % structured_channel,
+                )
             if not self._db.history_exists(alert.nws_id):
                 self._db.add_history(
                     alert.nws_id, alert.event, alert.area_desc, "dry_run", routed[0][3],
@@ -283,6 +375,7 @@ class WxPoller:
                         self._db.finalize_delivery_attempt(attempt, "accepted")
                         self._record_delivery(a, dest, root, disp)
                         outcomes["accepted"] += 1
+                        self._queue_meshwx_if_needed(a)
                     else:
                         attempt_state = ("superseded" if err == "superseded" else
                                          "skipped" if err == "predecessor was not accepted" else
@@ -327,6 +420,7 @@ class WxPoller:
                 _on_result(False, str(exc))
             self._db.add_event("INFO", "queued %s via %s ch %d: %s" %
                                (disposition, destination.transport, destination.channel, text))
+
 
     @staticmethod
     def _snapshot_destination(row, matched_areas=None) -> RoutedDestination:
