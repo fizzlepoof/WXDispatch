@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -367,6 +368,98 @@ def test_routing_page_has_load_all_channels_control(web, monkeypatch):
     assert "Load all channels" in enabled.text
     assert "requires administrator authentication" in enabled.text
     assert '<button class="secondary" disabled>Load all channels</button>' in disabled.text
+
+
+def test_local_alert_map_page_uses_pinned_leaflet_and_safe_dom_rendering(web):
+    client, _db, _tx = web
+
+    response = client.get("/map")
+
+    assert response.status_code == 200
+    assert 'href="/map"' in response.text
+    assert 'id="alert-map"' in response.text
+    assert "unpkg.com/leaflet@1.9.4/dist/leaflet.css" in response.text
+    assert "sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" in response.text
+    assert "unpkg.com/leaflet@1.9.4/dist/leaflet.js" in response.text
+    assert "sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" in response.text
+    assert "/api/map-data" in response.text
+    assert "data.county_count" in response.text
+    assert "data.zone_errors" in response.text
+    assert "data.alert_errors" in response.text
+    assert "data.stale" in response.text
+    assert "if(loading)return" in response.text
+    assert ".textContent" in response.text
+    assert ".innerHTML" not in response.text
+    assert "© OpenStreetMap contributors" in response.text
+    assert "https://www.openstreetmap.org/copyright" in response.text
+
+
+def test_local_alert_map_data_uses_county_scoped_alerts_and_configured_route_counties(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    client, db, _tx = web
+    rule_id = db.create_route("local map", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+    geometry = {
+        "type": "Polygon",
+        "coordinates": [[
+            [-87.0, 36.5], [-86.5, 36.5], [-86.5, 36.0], [-87.0, 36.5],
+        ]],
+    }
+
+    class FakeZoneCache:
+        async def get_many(self, counties, contact):
+            assert counties == [{"code": "TNC125", "name": "Montgomery County"}]
+            return [{
+                "type": "Feature",
+                "geometry": geometry,
+                "properties": {"code": "TNC125", "name": "Montgomery County"},
+            }], []
+
+    safe_alert = {
+        "id": "local-alert",
+        "event": "Tornado Warning",
+        "headline": "Local warning",
+        "area": "Montgomery",
+        "severity": "Extreme",
+        "urgency": "Immediate",
+        "certainty": "Observed",
+        "onset": "2099-01-01T00:00:00+00:00",
+        "ends": "",
+        "expires": "2099-01-01T01:00:00+00:00",
+        "local_zones": ["TNC125"],
+        "local_counties": ["Montgomery County"],
+        "geometry": None,
+    }
+
+    class FakeAlertCache:
+        async def get_many(self, counties, contact):
+            assert counties == [{"code": "TNC125", "name": "Montgomery County"}]
+            return [safe_alert], [], False, "2099-01-01T00:00:00+00:00"
+
+    monkeypatch.setattr(routes_mod, "_ALERT_MAP_CACHE", FakeZoneCache())
+    monkeypatch.setattr(routes_mod, "_COUNTY_ALERT_CACHE", FakeAlertCache())
+
+    response = client.get("/api/map-data")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    payload = response.json()
+    assert payload["counties"] == [{
+        "type": "Feature",
+        "geometry": geometry,
+        "properties": {"code": "TNC125", "name": "Montgomery County"},
+    }]
+    assert len(payload["alerts"]) == 1
+    assert payload["alerts"][0]["id"] == "local-alert"
+    assert payload["alerts"][0]["local_counties"] == ["Montgomery County"]
+    assert "description" not in payload["alerts"][0]
+    assert payload["last_poll_success"] == "2099-01-01T00:00:00+00:00"
+    assert payload["poll_result"] == "ok: 1 active local alert(s)"
+    assert payload["stale"] is False
+    assert payload["zone_errors"] == []
+    assert payload["alert_errors"] == []
+    assert payload["error"] == ""
 
 
 def test_dashboard_broadcast_counts_include_routed_accepted_and_partial_outcomes(web):

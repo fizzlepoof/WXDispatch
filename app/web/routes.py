@@ -1,6 +1,7 @@
 """Web UI routes (server-rendered templates + htmx partials)."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import os
@@ -13,12 +14,13 @@ from typing import Any, cast
 import datetime
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.templating import Jinja2Templates
 import httpx
 
 from .. import __version__
+from ..alert_map import CountyAlertCache, ZoneGeometryCache, configured_counties
 from ..config import (MAX_PAYLOAD_BYTES, POLL_INTERVAL_MIN, IPAWS_EVENT_TYPES,
                       GITHUB_LATEST_RELEASE_API, GITHUB_RELEASES_URL)
 from ..serial_discovery import list_all_ports
@@ -35,6 +37,8 @@ def _template_dir() -> Path:
 _CSRF_COOKIE = "mesh_wx_csrf"
 _CSRF_SECRET = secrets.token_bytes(32)
 _CHANNEL_ADMIN_AUTH = HTTPBasic(auto_error=False)
+_ALERT_MAP_CACHE = ZoneGeometryCache()
+_COUNTY_ALERT_CACHE = CountyAlertCache()
 
 
 def _new_csrf_token() -> str:
@@ -319,6 +323,55 @@ async def healthz(request: Request):
 @router.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     return render(request, "dashboard.html", **_dash_ctx(request))
+
+
+@router.get("/map", response_class=HTMLResponse)
+async def local_alert_map(request: Request):
+    return render(request, "map.html")
+
+
+@router.get("/api/map-data", response_class=JSONResponse)
+async def local_alert_map_data(request: Request):
+    db = _db(request)
+    configured = configured_counties(db)
+    contact = str(db.get_setting("nws_contact", "") or "")
+    boundary_result, alert_result = await asyncio.gather(
+        _ALERT_MAP_CACHE.get_many(configured, contact),
+        _COUNTY_ALERT_CACHE.get_many(configured, contact),
+    )
+    county_features, zone_errors = boundary_result
+    fetched_names = {
+        feature["properties"]["code"]: feature["properties"]["name"]
+        for feature in county_features
+    }
+    alert_counties = [
+        {"code": county["code"], "name": fetched_names.get(county["code"], county["name"])}
+        for county in configured
+    ]
+    alerts, alert_errors, stale, last_success = alert_result
+    alert_names = {county["code"]: county["name"] for county in alert_counties}
+    for alert in alerts:
+        alert["local_counties"] = [
+            alert_names.get(code, code) for code in alert["local_zones"]
+        ]
+    if not configured:
+        error = "No local counties are configured."
+    elif alert_errors and not last_success:
+        error = "Current NWS alert data is unavailable for the configured counties."
+    else:
+        error = ""
+    result = ("partial" if alert_errors else "ok") + f": {len(alerts)} active local alert(s)"
+    return JSONResponse({
+        "counties": county_features,
+        "county_count": len(configured),
+        "alerts": alerts,
+        "last_poll_success": last_success,
+        "poll_result": result,
+        "stale": stale,
+        "zone_errors": zone_errors,
+        "alert_errors": alert_errors,
+        "error": error,
+    }, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/partials/status", response_class=HTMLResponse)

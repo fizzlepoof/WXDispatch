@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %} &middot; Local Alert Map{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<style>
+  #alert-map{height:min(62vh,680px);min-height:420px;border-radius:14px;border:1px solid var(--line);z-index:1;}
+  .map-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(280px,1fr);gap:18px;}
+  .alert-list{display:flex;flex-direction:column;gap:10px;max-height:min(62vh,680px);overflow:auto;}
+  .alert-card{background:var(--inset);border:1px solid var(--line);border-left:5px solid var(--accent);border-radius:10px;padding:12px;}
+  .alert-card h4{margin:0 0 5px}.alert-card p{margin:3px 0}.map-key{display:flex;gap:12px;flex-wrap:wrap;margin-top:10px;}
+  .map-key span{display:inline-flex;align-items:center;gap:5px}.map-swatch{width:12px;height:12px;border-radius:3px;display:inline-block;}
+  @media(max-width:980px){.map-layout{grid-template-columns:1fr}.alert-list{max-height:none}#alert-map{height:55vh;}}
+</style>
+{% endblock %}
+{% block content %}
+<div class="topbar"><div><h2 class="pt">Local Alert Map</h2><p class="sub">Current NWS alerts for counties configured in Settings or Routing.</p></div></div>
+<div class="panel">
+  <div id="map-status" class="hint" role="status">Loading county boundaries and current alerts…</div>
+  <div class="map-layout">
+    <div>
+      <div id="alert-map" aria-label="Map of configured counties and current NWS alerts"></div>
+      <div class="map-key" aria-label="Alert severity key">
+        <span><i class="map-swatch" style="background:#991b1b"></i>Extreme</span>
+        <span><i class="map-swatch" style="background:#dc2626"></i>Severe</span>
+        <span><i class="map-swatch" style="background:#f59e0b"></i>Moderate</span>
+        <span><i class="map-swatch" style="background:#3b82f6"></i>Minor / unknown</span>
+      </div>
+    </div>
+    <div id="current-alerts" class="alert-list" aria-live="polite"></div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script>
+(function(){
+  'use strict';
+  var map=L.map('alert-map').setView([39,-98],4);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+    maxZoom:19,attribution:'<a href="https://www.openstreetmap.org/copyright">© OpenStreetMap contributors</a>'
+  }).addTo(map);
+  var layers=L.layerGroup().addTo(map);
+  var fitted=false;
+  var loading=false;
+  var colors={Extreme:'#991b1b',Severe:'#dc2626',Moderate:'#f59e0b',Minor:'#3b82f6',Unknown:'#3b82f6'};
+  var ranks={Extreme:4,Severe:3,Moderate:2,Minor:1,Unknown:0};
+
+  function el(tag,text,className){
+    var item=document.createElement(tag);
+    if(text!==undefined)item.textContent=String(text);
+    if(className)item.className=className;
+    return item;
+  }
+  function bestAlert(items){
+    return items.reduce(function(best,item){
+      return !best||(ranks[item.severity]||0)>(ranks[best.severity]||0)?item:best;
+    },null);
+  }
+  function popupFor(name,items){
+    var box=el('div');box.appendChild(el('strong',name));
+    if(!items.length){box.appendChild(el('div','No current alerts'));return box;}
+    items.forEach(function(item){box.appendChild(el('div',item.event||'NWS alert'));});
+    return box;
+  }
+  function renderList(data){
+    var list=document.getElementById('current-alerts');list.replaceChildren();
+    list.appendChild(el('h3','Current local alerts'));
+    if(data.error)list.appendChild(el('p',data.error,'hint'));
+    if(data.stale)list.appendChild(el('p','NWS data is stale; displayed alerts may not reflect current conditions.','health-banner warn'));
+    if(data.zone_errors.length)list.appendChild(el('p','Some county boundaries could not load ('+data.zone_errors.length+').','hint'));
+    if(data.alert_errors.length)list.appendChild(el('p','Current alert checks failed for '+data.alert_errors.length+' configured '+(data.alert_errors.length===1?'county':'counties')+'.','health-banner warn'));
+    if(!data.county_count){list.appendChild(el('p','No county coverage is configured. Add counties in Settings or Routing.','hint'));return;}
+    if(!data.alerts.length){list.appendChild(el('p','No active NWS alerts for the configured counties.','hint'));return;}
+    data.alerts.forEach(function(item){
+      var card=el('article',undefined,'alert-card');
+      card.style.borderLeftColor=colors[item.severity]||colors.Unknown;
+      card.appendChild(el('h4',item.event||'NWS alert'));
+      card.appendChild(el('p',item.local_counties.join(', ')));
+      if(item.headline)card.appendChild(el('p',item.headline,'hint'));
+      var end=item.ends||item.expires;
+      if(end)card.appendChild(el('p','Until '+new Date(end).toLocaleString(),'hint'));
+      list.appendChild(card);
+    });
+  }
+  function render(data){
+    layers.clearLayers();
+    var byZone={};
+    data.alerts.forEach(function(alert){
+      alert.local_zones.forEach(function(code){(byZone[code]||(byZone[code]=[])).push(alert);});
+      if(alert.geometry){
+        var color=colors[alert.severity]||colors.Unknown;
+        L.geoJSON({type:'Feature',properties:{},geometry:alert.geometry},{style:{color:color,weight:3,dashArray:'6 4',fillOpacity:.12}}).addTo(layers);
+      }
+    });
+    var countyLayer=L.geoJSON({type:'FeatureCollection',features:data.counties},{
+      style:function(feature){
+        var items=byZone[feature.properties.code]||[], best=bestAlert(items);
+        var color=best?(colors[best.severity]||colors.Unknown):'#64748b';
+        return {color:color,weight:2,fillColor:color,fillOpacity:best ? .32 : .06};
+      },
+      onEachFeature:function(feature,layer){
+        var items=byZone[feature.properties.code]||[];
+        layer.bindPopup(popupFor(feature.properties.name,items));
+      }
+    }).addTo(layers);
+    if(!fitted&&countyLayer.getLayers().length){map.fitBounds(countyLayer.getBounds(),{padding:[18,18]});fitted=true;}
+    renderList(data);
+    var status=document.getElementById('map-status');
+    var when=data.last_poll_success?new Date(data.last_poll_success).toLocaleString():'not yet';
+    status.textContent=(data.stale?'STALE · ':'')+'Last successful county alert update: '+when+' · '+data.alerts.length+' active local alert'+(data.alerts.length===1?'':'s');
+  }
+  function load(){
+    if(loading)return;
+    loading=true;
+    fetch('/api/map-data',{credentials:'same-origin'}).then(function(response){
+      if(!response.ok)throw new Error('Map data request failed');return response.json();
+    }).then(render).catch(function(){
+      document.getElementById('map-status').textContent='Could not load local alert map data. Retrying automatically.';
+    }).finally(function(){loading=false;});
+  }
+  load();window.setInterval(load,60000);
+})();
+</script>
+{% endblock %}

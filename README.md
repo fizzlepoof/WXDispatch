@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <b>Status: v2.1.0.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
+  <b>Status: v2.2.0.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
 </p>
 
 ---
@@ -65,6 +65,8 @@ channel. Built after living through Hurricane Helene's comms blackout.
 - **Dry-run by default.** Automated alerts are logged, not transmitted, until you flip it on.
 - **A real dashboard.** Live radio status, recent alerts, 7-day activity, transmit log,
   and a per-radio **Send test** button to key up each radio on the bench.
+- **Local alert map.** Shows every configured county and its current county-scoped NWS
+  alerts, including multi-county events, partial lookup failures, and stale-data warnings.
 
 ## Install
 
