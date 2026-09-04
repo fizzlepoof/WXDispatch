@@ -494,7 +494,14 @@ async def resend_log(request: Request, entry_id: int):
     db, tx = _db(request), _tx(request)
     row = db.get_transmit_log(entry_id)
     if row is not None and row["transport"]:
-        await tx.resend(row["transport"], row["text"] or "", int(row["channel"]))
+        followup = row["followup_text"] or ""
+        resend_pair = getattr(tx, "resend_with_followup", None)
+        if followup and resend_pair is not None:
+            await resend_pair(
+                row["transport"], row["text"] or "", followup, int(row["channel"])
+            )
+        else:
+            await tx.resend(row["transport"], row["text"] or "", int(row["channel"]))
     return render(request, "_transmit_rows.html", rows=db.query_transmit_log())
 
 
@@ -1172,6 +1179,7 @@ async def edit_routing_rule(request: Request, rule_id: int):
         request, "routing_rule_edit.html", rule=rule,
         destinations=db.list_destinations(), event_groups=_EVENT_GROUPS,
         selected_events=set(rule["events"]),
+        selected_detail_events=set(rule["detail_events"]),
         selected_destinations={destination["id"] for destination in rule["destinations"]},
     )
 
@@ -1199,13 +1207,17 @@ async def create_routing_rule(request: Request):
     events = list(dict.fromkeys(str(value) for value in form.getlist("events")))
     if any(event not in allowed_events for event in events):
         return _channel_form_error(request, "One or more selected event types is invalid.")
+    detail_events = list(dict.fromkeys(
+        str(value) for value in form.getlist("detail_events") if str(value) in events
+    ))
     all_warnings = bool(form.get("all_warnings"))
+    all_warnings_details = bool(form.get("all_warnings_details"))
     if not all_warnings and not events:
         return _channel_form_error(request, "Select all warnings or at least one event type.")
     try:
         db.create_routing_rule(
             name, priority, bool(form.get("enabled")), all_warnings,
-            counties, events, destination_ids,
+            counties, events, destination_ids, detail_events, all_warnings_details,
         )
     except sqlite3.IntegrityError as exc:
         if "routing_rules.name" in str(exc) or "idx_routes_name_unique" in str(exc):
@@ -1241,13 +1253,17 @@ async def update_routing_rule(request: Request, rule_id: int):
     events = list(dict.fromkeys(str(value) for value in form.getlist("events")))
     if any(event not in allowed_events for event in events):
         return _channel_form_error(request, "One or more selected event types is invalid.")
+    detail_events = list(dict.fromkeys(
+        str(value) for value in form.getlist("detail_events") if str(value) in events
+    ))
     all_warnings = bool(form.get("all_warnings"))
+    all_warnings_details = bool(form.get("all_warnings_details"))
     if not all_warnings and not events:
         return _channel_form_error(request, "Select all warnings or at least one event type.")
     try:
         updated = db.update_routing_rule(
             rule_id, name, priority, bool(form.get("enabled")), all_warnings,
-            counties, events, destination_ids,
+            counties, events, destination_ids, detail_events, all_warnings_details,
         )
     except sqlite3.IntegrityError as exc:
         if "routing_rules.name" in str(exc) or "idx_routes_name_unique" in str(exc):

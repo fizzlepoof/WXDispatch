@@ -23,6 +23,7 @@ class DummyTx:
     def __init__(self):
         self.channel_calls = []
         self.transports = []
+        self.resend_calls = []
 
     async def send_manual(self, text):
         return True
@@ -31,6 +32,14 @@ class DummyTx:
         return True
 
     async def send_to(self, name, text):
+        return True, ""
+
+    async def resend(self, name, text, channel):
+        self.resend_calls.append((name, text, "", channel))
+        return True, ""
+
+    async def resend_with_followup(self, name, text, followup_text, channel):
+        self.resend_calls.append((name, text, followup_text, channel))
         return True, ""
 
     async def reconfigure(self):
@@ -141,6 +150,26 @@ def test_state_changes_require_matching_csrf_token(web):
     assert accepted.status_code == 200
     assert "accepted by configured radio interfaces" in accepted.text
     assert "over-air delivery is not confirmed" in accepted.text
+
+
+def test_transmit_log_resend_replays_card_and_its_detail(web):
+    client, db, tx = web
+    db.add_transmit_log(
+        1, 20, True, "⚠️ HEAT ADVISORY: Montgomery County", transport="meshcore",
+        destination_id=1, followup_text="DETAIL: Heat index near 105.",
+    )
+    entry_id = db.query_transmit_log()[0]["id"]
+    token = csrf(client)
+
+    response = client.post(
+        f"/transmit-log/resend/{entry_id}", data={"csrf_token": token}
+    )
+
+    assert response.status_code == 200
+    assert tx.resend_calls == [(
+        "meshcore", "⚠️ HEAT ADVISORY: Montgomery County",
+        "DETAIL: Heat index near 105.", 1,
+    )]
 
 
 @pytest.mark.parametrize("action", ["create", "update", "toggle", "delete"])
@@ -1219,7 +1248,9 @@ def test_rule_edit_form_is_prefilled_with_all_associations(web):
         rule_id,
         [("TNC147", "Robertson County"), ("TNC159", "Smith County")],
     )
-    db.replace_route_events(rule_id, ["Tornado Warning"])
+    db.replace_route_events(
+        rule_id, ["Tornado Warning"], detail_events=["Tornado Warning"]
+    )
     db.replace_route_destinations(rule_id, [selected_destination])
 
     response = client.get(f"/routing/rules/{rule_id}/edit")
@@ -1232,6 +1263,8 @@ def test_rule_edit_form_is_prefilled_with_all_associations(web):
     assert f'name="destination_ids" value="{selected_destination}" checked' in response.text
     assert f'name="destination_ids" value="{other_destination}" checked' not in response.text
     assert 'name="events" value="Tornado Warning" checked' in response.text
+    assert 'name="detail_events" value="Tornado Warning" checked' in response.text
+    assert 'name="detail_events" value="Heat Advisory" checked' in response.text
     assert 'name="all_warnings"' in response.text
     assert 'name="all_warnings" type="checkbox" checked' not in response.text
     assert 'name="enabled" type="checkbox" checked' not in response.text
@@ -1256,7 +1289,9 @@ def test_rule_update_changes_every_field_and_deduplicates_associations(web):
             "priority": "7",
             "enabled": "on",
             "all_warnings": "on",
+            "all_warnings_details": "on",
             "events": ["Heat Advisory", "Heat Advisory"],
+            "detail_events": ["Heat Advisory", "Heat Advisory"],
             "counties": (
                 "TNC159 | Smith County\nTNC021 | Cheatham County\n"
                 "TNC159 | Smith County"
@@ -1278,10 +1313,44 @@ def test_rule_update_changes_every_field_and_deduplicates_associations(web):
         ("TNC021", "Cheatham County"), ("TNC159", "Smith County"),
     ]
     assert rule["events"] == ["Heat Advisory"]
+    assert rule["detail_events"] == ["Heat Advisory"]
+    assert rule["all_warnings_details"] is True
     assert [destination["id"] for destination in rule["destinations"]] == [
         first_destination, second_destination,
     ]
     assert not db._conn.in_transaction
+
+
+def test_new_route_event_detail_checkboxes_default_enabled(web):
+    client, db, _tx = web
+    destination_id = db.create_destination("Montgomery", "meshcore", 1)
+
+    page = client.get("/routing")
+
+    assert page.status_code == 200
+    assert 'name="detail_events" value="Heat Advisory" checked' in page.text
+    assert 'type="checkbox" name="all_warnings_details" checked' in page.text
+
+    token = client.cookies.get("mesh_wx_csrf")
+    response = client.post(
+        "/routing/rules",
+        data={
+            "csrf_token": token,
+            "name": "Mixed details",
+            "priority": "10",
+            "enabled": "on",
+            "events": ["Heat Advisory", "Dense Fog Advisory"],
+            "detail_events": ["Heat Advisory"],
+            "counties": "TNC125 | Montgomery County",
+            "destination_ids": str(destination_id),
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    route = db.list_routes()[0]
+    assert route["events"] == ["Dense Fog Advisory", "Heat Advisory"]
+    assert route["detail_events"] == ["Heat Advisory"]
 
 
 def test_rule_toggle_is_exposed_and_flips_only_enabled_state(web):

@@ -38,6 +38,55 @@ async def test_destination_item_sends_only_specific_transport_channel_and_caps_u
     assert row["destination_id"] == 44
 
 
+async def test_alert_card_log_keeps_its_detail_for_manual_pair_resend():
+    db = Database(":memory:")
+    manager = TransmitManager(db)
+    meshcore = manager._transports["meshcore"]
+    meshcore.enabled = meshcore.connected = True
+    meshcore.tx = FakeRadio()
+
+    manager.enqueue_destination_card(
+        "alert card", "meshcore", 7, 44, ("root", 44),
+        followup_text="DETAIL: protective information",
+    )
+    item = manager._queue.popleft()
+    ok, error = await manager._transmit_item(item)
+
+    assert ok and not error
+    row = db.query_transmit_log()[0]
+    assert row["text"] == "alert card"
+    assert row["followup_text"] == "DETAIL: protective information"
+
+
+async def test_manual_pair_resend_is_paced_and_stops_if_card_fails(monkeypatch):
+    db = Database(":memory:")
+    manager = TransmitManager(db)
+    calls = []
+
+    async def resend(name, text, channel):
+        calls.append((name, text, channel))
+        return (text != "failed card"), ("radio unavailable" if text == "failed card" else "")
+
+    async def sleep(seconds):
+        calls.append(("sleep", seconds))
+
+    monkeypatch.setattr(manager, "resend", resend)
+    monkeypatch.setattr("app.transmit.asyncio.sleep", sleep)
+
+    assert await manager.resend_with_followup(
+        "meshcore", "alert card", "DETAIL: information", 7
+    ) == (True, "")
+    assert calls[0] == ("meshcore", "alert card", 7)
+    assert calls[1][0] == "sleep"
+    assert calls[2] == ("meshcore", "DETAIL: information", 7)
+
+    calls.clear()
+    assert await manager.resend_with_followup(
+        "meshcore", "failed card", "DETAIL: information", 7
+    ) == (False, "radio unavailable")
+    assert calls == [("meshcore", "failed card", 7)]
+
+
 async def test_structured_weather_item_sends_binary_only_to_meshcore():
     db = Database(":memory:")
     manager = TransmitManager(db)
@@ -133,6 +182,23 @@ def test_structured_weather_never_displaces_full_high_priority_queue():
     assert len(manager._queue) == manager._queue.maxlen
     assert len(manager._queue_low) == 1
     assert results == []
+
+
+def test_detail_queue_never_displaces_or_delays_queued_alert_cards():
+    manager = TransmitManager(Database(":memory:"))
+    limit = manager._queue_detail.maxlen
+    assert limit is not None
+    for index in range(limit):
+        manager.enqueue_destination_detail(
+            f"DETAIL: {index}", "meshcore", 2, index, ("detail", index)
+        )
+
+    manager.enqueue_destination_card(
+        "urgent alert", "meshcore", 2, 999, ("card", 999)
+    )
+
+    assert manager._queue[0].text == "urgent alert"
+    assert len(manager._queue_detail) == manager._queue_detail.maxlen
 
 
 def test_structured_weather_can_be_cancelled_by_correlation_key():
@@ -234,3 +300,35 @@ async def test_conditional_successor_is_skipped_after_predecessor_failure(monkey
 
     assert attempted == ["original"]
     assert results[1] == ("cancel", False, "predecessor was not accepted")
+
+
+async def test_card_enqueue_preserves_conditional_predecessor_requirement(monkeypatch):
+    manager = TransmitManager(Database(":memory:"))
+    attempted = []
+    results = []
+
+    async def transmit(item):
+        attempted.append(item.text)
+        return False, "radio unavailable"
+
+    async def no_delay(_seconds):
+        return None
+
+    monkeypatch.setattr(manager, "_transmit_item", transmit)
+    monkeypatch.setattr("app.transmit.asyncio.sleep", no_delay)
+    key = ("root", 7)
+    manager.enqueue_destination_card(
+        "original", "meshcore", 2, 7, key,
+        on_result=lambda ok, err="": results.append(("original", ok, err)),
+    )
+    manager.enqueue_destination_card(
+        "cancel", "meshcore", 2, 7, key, require_prior_success=True,
+        on_result=lambda ok, err="": (
+            results.append(("cancel", ok, err)), setattr(manager, "_stopped", True)
+        ),
+    )
+
+    await manager._worker()
+
+    assert attempted == ["original"]
+    assert results[-1] == ("cancel", False, "predecessor was not accepted")

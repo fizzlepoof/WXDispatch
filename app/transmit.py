@@ -499,6 +499,7 @@ class QueueItem:
     destination_id: int | None = None
     correlation_key: object = None
     require_prior_success: bool = False
+    followup_text: str = ""
 
 
 def _build_transports(db) -> dict:
@@ -542,6 +543,7 @@ class TransmitManager:
         self._db = db
         self._transports = _build_transports(db)
         self._queue: deque[QueueItem] = deque(maxlen=QUEUE_MAX)        # high: weather/live
+        self._queue_detail: deque[QueueItem] = deque(maxlen=QUEUE_MAX) # medium: alert details
         self._queue_low: deque[QueueItem] = deque(maxlen=QUEUE_MAX)    # low: IPAWS/test
         self._queue_event = asyncio.Event()
         self._lock = asyncio.Lock()
@@ -595,7 +597,7 @@ class TransmitManager:
 
     @property
     def queue_depth(self) -> int:
-        return len(self._queue)
+        return len(self._queue) + len(self._queue_detail) + len(self._queue_low)
 
     @property
     def last_error(self) -> str:
@@ -885,10 +887,39 @@ class TransmitManager:
             require_prior_success=require_prior_success,
         )
 
+    def enqueue_destination_card(self, text: str, transport: str, channel: int,
+                                 destination_id: int, correlation_key,
+                                 followup_text: str = "",
+                                 require_prior_success: bool = False,
+                                 on_result=None) -> bool:
+        if transport not in self._transports:
+            if on_result:
+                self._safe_result(on_result, False, "unknown transport")
+            return False
+        return self._enqueue(
+            self._queue, text, on_test=False, log_tx=True, on_result=on_result,
+            transport=transport, channel=channel, destination_id=destination_id,
+            correlation_key=correlation_key, followup_text=followup_text,
+            require_prior_success=require_prior_success,
+        )
+
+    def enqueue_destination_detail(self, text: str, transport: str, channel: int,
+                                   destination_id: int, correlation_key,
+                                   on_result=None) -> bool:
+        if transport not in self._transports:
+            if on_result:
+                self._safe_result(on_result, False, "unknown transport")
+            return False
+        return self._enqueue(
+            self._queue_detail, text, on_test=False, log_tx=True, on_result=on_result,
+            transport=transport, channel=channel, destination_id=destination_id,
+            correlation_key=correlation_key,
+        )
+
     def cancel_queued_correlation(self, correlation_key) -> int:
         """Remove unsent items in a delivery chain; an in-flight item is untouched."""
         removed = []
-        for lane in (self._queue, self._queue_low):
+        for lane in (self._queue, self._queue_detail, self._queue_low):
             kept = [item for item in lane if item.correlation_key != correlation_key]
             removed.extend(item for item in lane if item.correlation_key == correlation_key)
             lane.clear()
@@ -907,7 +938,7 @@ class TransmitManager:
 
     def _enqueue(self, lane, text, on_test, log_tx, on_result, transport=None,
                  channel=None, destination_id=None, correlation_key=None,
-                 require_prior_success=False) -> bool:
+                 require_prior_success=False, followup_text="") -> bool:
         dropped = len(lane) == lane.maxlen
         if dropped:
             # The item we are about to drop never gets a send: report it failed so
@@ -919,7 +950,8 @@ class TransmitManager:
                               on_result=on_result, transport=transport, channel=channel,
                               destination_id=destination_id,
                               correlation_key=correlation_key,
-                              require_prior_success=require_prior_success))
+                              require_prior_success=require_prior_success,
+                              followup_text=followup_text))
         self._queue_event.set()
         if dropped:
             logger.warning("transmit queue full; dropped oldest")
@@ -1170,6 +1202,15 @@ class TransmitManager:
                     logger.info("resent via %s on ch %d", t.name, channel)
             return ok, ("" if ok else err)
 
+    async def resend_with_followup(self, name: str, text: str, followup_text: str,
+                                   channel: int) -> tuple[bool, str]:
+        ok, err = await self.resend(name, text, channel)
+        if not ok or not followup_text:
+            return ok, err
+        await asyncio.sleep(BURST_GAP_SECONDS)
+        detail_ok, detail_err = await self.resend(name, followup_text, channel)
+        return detail_ok, detail_err
+
     async def _transmit_item(self, item: QueueItem) -> tuple[bool, str]:
         """Send one queued item on the right channel (live vs test), confirmed per
         radio. Weather items also write the transmit_log; IPAWS items do not."""
@@ -1190,7 +1231,8 @@ class TransmitManager:
                 if item.log_tx:
                     self._db.add_transmit_log(ch, blen, ok, item.text, False,
                                               error=("" if ok else err), transport=t.name,
-                                              destination_id=item.destination_id)
+                                              destination_id=item.destination_id,
+                                              followup_text=item.followup_text)
                 any_ok = any_ok or ok
                 if not ok:
                     last = err
@@ -1199,7 +1241,7 @@ class TransmitManager:
     async def _worker(self) -> None:
         first = True
         while not self._stopped:
-            if not self._queue and not self._queue_low:
+            if not self._queue and not self._queue_detail and not self._queue_low:
                 self._queue_event.clear()
                 try:
                     await self._queue_event.wait()
@@ -1212,9 +1254,11 @@ class TransmitManager:
                     await asyncio.sleep(BURST_GAP_SECONDS)   # pace EVERY send, both lanes
                 except asyncio.CancelledError:
                     return
-            # Weather (high) always drains before IPAWS (low), so a real warning
-            # never waits behind a backlog of secondary alerts.
-            item = self._queue.popleft() if self._queue else self._queue_low.popleft()
+            # Alert cards always drain before details, and details before the low
+            # IPAWS/MeshWX lane. A follow-up can never delay or evict a warning.
+            item = (self._queue.popleft() if self._queue else
+                    self._queue_detail.popleft() if self._queue_detail else
+                    self._queue_low.popleft())
             if (item.require_prior_success and
                     self._chain_results.get(item.correlation_key) is not True):
                 if item.on_result is not None:

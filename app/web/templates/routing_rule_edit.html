@@ -13,9 +13,11 @@
   <textarea name="counties" rows="4" required>{% for county in rule.counties %}{{ county.zone_code }} | {{ county.county_name }}{% if not loop.last %}
 {% endif %}{% endfor %}</textarea>
   <label class="chk"><input name="all_warnings" type="checkbox"{% if rule.all_warnings %} checked{% endif %}> Match all warning products</label>
+  <label class="chk detail-toggle"><input name="all_warnings_details" type="checkbox"{% if rule.all_warnings_details %} checked{% endif %}> Send details for all warning products</label>
+  <p class="hint">Details send as one paced <code>DETAIL:</code> follow-up only when the NWS alert contains useful hazard facts or protective instructions.</p>
   {% for group, events in event_groups.items() %}
   <div class="grp-title">{{ group }}</div>
-  <div class="checkgrid">{% for event in events %}<label class="chk"><input type="checkbox" name="events" value="{{ event }}"{% if event in selected_events %} checked{% endif %}> {{ event }}</label>{% endfor %}</div>
+  <div class="checkgrid">{% for event in events %}<div class="event-option"><label class="chk"><input type="checkbox" name="events" value="{{ event }}"{% if event in selected_events %} checked{% endif %}> {{ event }}</label><label class="chk detail-toggle"><input type="checkbox" name="detail_events" value="{{ event }}"{% if event not in selected_events or event in selected_detail_events %} checked{% endif %}> Send details</label></div>{% endfor %}</div>
   {% endfor %}
   <span class="fld-lbl">Destinations</span>
   <div class="checkgrid">{% for destination in destinations %}<label class="chk"><input type="checkbox" name="destination_ids" value="{{ destination.id }}"{% if destination.id in selected_destinations %} checked{% endif %}> {{ destination.name }} ({{ destination.transport }} ch {{ destination.channel }})</label>{% else %}<span class="hint">Create a destination first.</span>{% endfor %}</div>

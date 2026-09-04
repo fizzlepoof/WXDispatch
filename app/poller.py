@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 from .config import POLL_HARD_TIMEOUT, POLL_INTERVAL_MIN
 from .dedupe import decide
+from .detail_formatter import build_alert_detail
 from .filters import FilterRules
 from .formatter import build_routed_mesh_text
 from .meshwx_v4 import encode_alert
@@ -41,6 +42,21 @@ def _delivery_hash(alert: Alert, matched_areas) -> str:
         ),
     }, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def _detail_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _detail_is_current(alert: Alert) -> bool:
+    value = alert.ends or alert.expires
+    if not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+        return parsed.tzinfo is not None and parsed > datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        return False
 
 
 class PollerStatus:
@@ -77,6 +93,9 @@ class WxPoller:
         recover_meshwx = getattr(self._db, "recover_queued_meshwx_deliveries", None)
         if recover_meshwx is not None:
             recover_meshwx()
+        recover_details = getattr(self._db, "recover_queued_detail_deliveries", None)
+        if recover_details is not None:
+            recover_details()
 
     # ---- lifecycle ------------------------------------------------------
     def start(self) -> None:
@@ -162,6 +181,92 @@ class WxPoller:
             set_delivery(alert.nws_id, msg_hash, channel, "failed", str(exc))
             self._db.add_error("meshwx_v4", str(exc))
             return False
+
+    def _queue_detail_if_needed(self, alert: Alert, destination: RoutedDestination,
+                                root_id: str, disposition: str) -> bool:
+        if (disposition not in ("sent", "update") or not destination.details_enabled
+                or not _detail_is_current(alert)):
+            return False
+        text = build_alert_detail(alert)
+        if not text:
+            return False
+        msg_hash = _detail_hash(text)
+        prior = self._db.get_delivery_state(root_id, destination.destination_id)
+        if prior is None:
+            return False
+        if (prior["detail_hash"] == msg_hash and
+                (prior["detail_state"] == "accepted" or
+                 (prior["detail_state"] == "queued" and
+                  prior["detail_alert_id"] == alert.nws_id))):
+            return False
+        if not self._db.queue_detail_delivery(
+            root_id, destination.destination_id, alert.nws_id, text, msg_hash
+        ):
+            return False
+
+        def _on_result(ok, err="", root=root_id,
+                       destination_id=destination.destination_id,
+                       expected_alert_id=alert.nws_id,
+                       expected_hash=msg_hash):
+            try:
+                state = "accepted" if ok else (
+                    "superseded" if err == "superseded" else "failed"
+                )
+                self._db.finalize_detail_delivery(
+                    root, destination_id, expected_alert_id, expected_hash,
+                    state, err or ""
+                )
+                if not ok and err != "superseded":
+                    self._db.add_error(
+                        "broadcast_detail", err or "detail message was not accepted"
+                    )
+            finally:
+                self._discard_chain_result(("detail", root, destination_id))
+
+        correlation_key = ("detail", root_id, destination.destination_id)
+        try:
+            detail_enqueue = getattr(self._tx, "enqueue_destination_detail", None)
+            if detail_enqueue is not None:
+                return bool(detail_enqueue(
+                    text, destination.transport, destination.channel,
+                    destination.destination_id, correlation_key,
+                    on_result=_on_result,
+                ))
+            chain_enqueue = getattr(self._tx, "enqueue_destination_chain", None)
+            if chain_enqueue is not None:
+                return bool(chain_enqueue(
+                    text, destination.transport, destination.channel,
+                    destination.destination_id, correlation_key,
+                    on_result=_on_result,
+                ))
+            return bool(self._tx.enqueue_destination(
+                text, destination.transport, destination.channel,
+                destination.destination_id, on_result=_on_result,
+            ))
+        except Exception as exc:
+            _on_result(False, str(exc))
+            return False
+
+    def _retry_detail_if_needed(self, alert: Alert, prior_rows) -> bool:
+        if alert.message_type == "Cancel":
+            return False
+        prior_by_destination = {
+            int(row["destination_id"]): row for row in prior_rows
+            if row["disposition"] in ("sent", "update")
+        }
+        queued = False
+        for destination in route_alert(self._db, alert):
+            prior = prior_by_destination.get(destination.destination_id)
+            if prior is None:
+                continue
+            snapshot = self._snapshot_destination(
+                prior, destination.matched_areas, destination.details_enabled
+            )
+            queued = self._queue_detail_if_needed(
+                alert, snapshot, str(prior["root_alert_id"]),
+                str(prior["disposition"]),
+            ) or queued
+        return queued
 
     # ---- loop -----------------------------------------------------------
     async def _run(self) -> None:
@@ -261,6 +366,14 @@ class WxPoller:
             if cancel_queued is not None:
                 for related_id in related_ids:
                     cancel_queued(("meshwx", related_id))
+            for row in prior_rows:
+                if (row["detail_state"] == "queued" and
+                        row["detail_alert_id"] != alert.nws_id):
+                    root_id = str(row["root_alert_id"])
+                    destination_id = int(row["destination_id"])
+                    if cancel_queued is not None:
+                        cancel_queued(("detail", root_id, destination_id))
+                    self._db.supersede_queued_detail(root_id, destination_id)
             supersede_meshwx = getattr(self._db, "supersede_meshwx_deliveries", None)
             if supersede_meshwx is not None:
                 supersede_meshwx(related_ids)
@@ -292,6 +405,7 @@ class WxPoller:
         targets = [target for target in targets
                    if self._pending_key(alert, target[0]) not in self._pending_deliveries]
         if not targets:
+            self._retry_detail_if_needed(alert, prior_rows)
             if not self._db.history_exists(alert.nws_id):
                 disposition = "no_route" if legacy_decision.transmit else legacy_decision.disposition
                 detail = "no matching route" if legacy_decision.transmit else legacy_decision.detail
@@ -376,6 +490,7 @@ class WxPoller:
                         self._db.finalize_delivery_attempt(attempt, "accepted")
                         self._record_delivery(a, dest, root, disp)
                         outcomes["accepted"] += 1
+                        self._queue_detail_if_needed(a, dest, root, disp)
                         self._queue_meshwx_if_needed(a)
                     else:
                         attempt_state = ("superseded" if err == "superseded" else
@@ -405,8 +520,23 @@ class WxPoller:
                         self._db.update_history(a.nws_id, final, detail=detail)
 
             try:
+                followup_text = (
+                    build_alert_detail(alert)
+                    if (destination.details_enabled and disposition in ("sent", "update")
+                        and _detail_is_current(alert))
+                    else ""
+                )
+                card_enqueue = getattr(self._tx, "enqueue_destination_card", None)
                 chain_enqueue = getattr(self._tx, "enqueue_destination_chain", None)
-                if chain_enqueue is not None:
+                if card_enqueue is not None:
+                    card_enqueue(
+                        text, destination.transport, destination.channel,
+                        destination.destination_id, chain_key,
+                        followup_text=followup_text,
+                        require_prior_success=require_prior,
+                        on_result=_on_result,
+                    )
+                elif chain_enqueue is not None:
                     chain_enqueue(
                         text, destination.transport, destination.channel,
                         destination.destination_id, chain_key,
@@ -424,12 +554,13 @@ class WxPoller:
 
 
     @staticmethod
-    def _snapshot_destination(row, matched_areas=None) -> RoutedDestination:
+    def _snapshot_destination(row, matched_areas=None,
+                              details_enabled: bool = False) -> RoutedDestination:
         areas = (tuple(matched_areas) if matched_areas is not None else
                  tuple(json.loads(row["matched_areas"] or "[]")))
         return RoutedDestination(
             int(row["destination_id"]), str(row["transport"]), str(row["transport"]),
-            int(row["channel"]), areas,
+            int(row["channel"]), areas, details_enabled,
         )
 
     @staticmethod
@@ -494,7 +625,7 @@ class WxPoller:
                     old = pending["destination"]
                     destination = RoutedDestination(
                         old.destination_id, old.name, old.transport, old.channel,
-                        destination.matched_areas,
+                        destination.matched_areas, destination.details_enabled,
                     )
                 out.append((destination, pending["root_id"] if pending else default_root,
                             disposition))
@@ -502,7 +633,9 @@ class WxPoller:
 
             # A prior recipient keeps its endpoint snapshot even if the reusable
             # destination is edited while this alert chain is active.
-            snapshot = self._snapshot_destination(prior, destination.matched_areas)
+            snapshot = self._snapshot_destination(
+                prior, destination.matched_areas, destination.details_enabled
+            )
             material_hash = _delivery_hash(alert, snapshot.matched_areas)
             if (prior["disposition"] in ("sent", "update") and
                     prior["msg_hash"] == material_hash):

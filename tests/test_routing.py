@@ -14,7 +14,7 @@ from app.routing import RoutedDestination, route_alert
 
 def _alert(areas="Smith; Robertson", zones=None, same_codes=None, event="Tornado Warning",
            alert_id="alert-1", message_type="Alert", references=None,
-           headline="warning"):
+           headline="warning", description="", instruction=None, parameters=None):
     zones = ["TNC147", "TNC159"] if zones is None else zones
     return Alert.from_feature({
         "id": alert_id,
@@ -22,6 +22,9 @@ def _alert(areas="Smith; Robertson", zones=None, same_codes=None, event="Tornado
             "event": event,
             "headline": headline,
             "areaDesc": areas,
+            "description": description,
+            "instruction": instruction,
+            "parameters": parameters or {},
             "messageType": message_type,
             "references": [{"@id": ref} for ref in (references or [])],
             "effective": "2099-01-01T00:00:00+00:00",
@@ -45,6 +48,78 @@ def test_route_uses_only_configured_county_that_matched(tmp_path):
     assert matches[0].transport == "meshcore"
     assert matches[0].channel == 2
     assert matches[0].matched_areas == ("Robertson",)
+
+
+def test_route_exposes_per_event_detail_toggle(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Robertson mesh", "meshcore", 2)
+    rule_id = db.create_route("Robertson alerts", 10, True)
+    db.replace_route_counties(rule_id, [("TNC147", "Robertson")])
+    db.replace_route_events(
+        rule_id,
+        ["Tornado Warning", "Heat Advisory"],
+        detail_events=["Heat Advisory"],
+    )
+    db.replace_route_destinations(rule_id, [destination_id])
+
+    tornado = route_alert(db, _alert(event="Tornado Warning"))
+    heat = route_alert(db, _alert(event="Heat Advisory"))
+
+    assert tornado[0].details_enabled is False
+    assert heat[0].details_enabled is True
+    assert db.get_route(rule_id)["detail_events"] == ["Heat Advisory"]
+
+
+def test_all_warning_detail_toggle_and_overlapping_rule_use_or_semantics(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Robertson mesh", "meshcore", 2)
+    broad = db.create_route("All warnings without details", 10, True)
+    enabled = db.create_route("Tornado details", 20, True)
+    for rule_id in (broad, enabled):
+        db.replace_route_counties(rule_id, [("TNC147", "Robertson")])
+        db.replace_route_destinations(rule_id, [destination_id])
+    db.replace_route_events(
+        broad, [], all_warnings=True, all_warnings_details=False
+    )
+    db.replace_route_events(
+        enabled, ["Tornado Warning"], detail_events=["Tornado Warning"]
+    )
+
+    match = route_alert(db, _alert())[0]
+
+    assert match.details_enabled is True
+    db.replace_route_events(enabled, ["Tornado Warning"], detail_events=[])
+    assert route_alert(db, _alert())[0].details_enabled is False
+
+
+def test_existing_route_events_migrate_with_details_enabled(tmp_path):
+    path = tmp_path / "legacy-route.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE routing_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            priority INTEGER NOT NULL DEFAULT 100,
+            all_warnings INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE route_events (
+            rule_id INTEGER NOT NULL,
+            event TEXT NOT NULL,
+            PRIMARY KEY(rule_id, event)
+        );
+        INSERT INTO routing_rules(id,name,enabled,priority,all_warnings)
+            VALUES(1,'Legacy',1,10,1);
+        INSERT INTO route_events(rule_id,event) VALUES(1,'Heat Advisory');
+    """)
+    conn.close()
+
+    db = Database(str(path))
+
+    route = db.get_route(1)
+    assert route["detail_events"] == ["Heat Advisory"]
+    assert route["all_warnings_details"] is True
 
 
 def test_route_matches_county_when_warning_uses_forecast_zone_ugc(tmp_path):
@@ -307,6 +382,159 @@ async def test_route_event_rules_are_authoritative_over_legacy_global_filter(tmp
     assert len(tx.sent) == 1
     assert tx.sent[0][1:] == ("meshcore", 1, destination_id)
     assert db.query_history()[0]["disposition"] == "accepted"
+
+
+async def test_poller_sends_detail_only_after_card_is_accepted(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Montgomery mesh", "meshcore", 1)
+    rule_id = db.create_route("Montgomery heat", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+    db.replace_route_events(rule_id, ["Heat Advisory"], detail_events=["Heat Advisory"])
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = DestinationTx()
+    feature = _alert(
+        areas="Montgomery County", zones=["TNC125"], event="Heat Advisory",
+        description="* WHAT...Heat index values around 105.",
+        instruction="Drink plenty of fluids and stay in an air-conditioned room.",
+    ).raw
+
+    await WxPoller(db, tx)._process(
+        feature, FilterRules([], [], []), "America/Chicago", 0, False,
+    )
+
+    assert len(tx.sent) == 2
+    assert tx.sent[0][0].startswith("⚠️ HEAT ADVISORY:")
+    assert tx.sent[1][0].startswith("DETAIL: Heat index values around 105.")
+    state = db.get_delivery_state("alert-1", destination_id)
+    assert state["detail_state"] == "accepted"
+    assert state["detail_text"] == tx.sent[1][0]
+
+
+async def test_poller_does_not_send_detail_when_card_fails(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Montgomery mesh", "meshcore", 1)
+    rule_id = db.create_route("Montgomery heat", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+    db.replace_route_events(rule_id, ["Heat Advisory"], detail_events=["Heat Advisory"])
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = DestinationTx()
+
+    def fail(text, transport, channel, sent_destination_id, on_result=None):
+        tx.sent.append((text, transport, channel, sent_destination_id))
+        if on_result:
+            on_result(False, "radio unavailable")
+        return False
+
+    tx.enqueue_destination = fail
+    feature = _alert(
+        areas="Montgomery County", zones=["TNC125"], event="Heat Advisory",
+        description="* WHAT...Heat index values around 105.",
+    ).raw
+
+    await WxPoller(db, tx)._process(
+        feature, FilterRules([], [], []), "America/Chicago", 0, False,
+    )
+
+    assert len(tx.sent) == 1
+    assert tx.sent[0][0].startswith("⚠️ HEAT ADVISORY:")
+
+
+async def test_poller_skips_disabled_detail(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Montgomery mesh", "meshcore", 1)
+    rule_id = db.create_route("Montgomery alerts", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+    db.replace_route_events(rule_id, ["Heat Advisory"], detail_events=[])
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = DestinationTx()
+
+    await WxPoller(db, tx)._process(
+        _alert(
+            areas="Montgomery County", zones=["TNC125"], event="Heat Advisory",
+            description="* WHAT...Heat index values around 105.",
+        ).raw,
+        FilterRules([], [], []), "America/Chicago", 0, False,
+    )
+
+    assert len(tx.sent) == 1
+
+
+async def test_poller_does_not_send_detail_for_expired_alert(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Montgomery mesh", "meshcore", 1)
+    rule_id = db.create_route("Montgomery heat", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+    db.replace_route_events(rule_id, ["Heat Advisory"], detail_events=["Heat Advisory"])
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = DestinationTx()
+    feature = _alert(
+        areas="Montgomery County", zones=["TNC125"], event="Heat Advisory",
+        description="* WHAT...Heat index values around 105.",
+    ).raw
+    feature["properties"]["expires"] = "2000-01-01T00:00:00+00:00"
+    feature["properties"]["ends"] = "2000-01-01T00:00:00+00:00"
+
+    await WxPoller(db, tx)._process(
+        feature, FilterRules([], [], []), "America/Chicago", 0, False,
+    )
+
+    assert len(tx.sent) == 1
+    assert tx.sent[0][0].startswith("⚠️ HEAT ADVISORY:")
+
+
+async def test_poller_resends_only_materially_changed_detail(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Montgomery mesh", "meshcore", 1)
+    rule_id = db.create_route("Montgomery heat", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+    db.replace_route_events(rule_id, ["Heat Advisory"], detail_events=["Heat Advisory"])
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = DestinationTx()
+    poller = WxPoller(db, tx)
+    first = _alert(
+        areas="Montgomery County", zones=["TNC125"], event="Heat Advisory",
+        description="* WHAT...Heat index values around 105.",
+    ).raw
+
+    await poller._process(first, FilterRules([], [], []), "America/Chicago", 0, False)
+    await poller._process(first, FilterRules([], [], []), "America/Chicago", 0, False)
+    changed = _alert(
+        areas="Montgomery County", zones=["TNC125"], event="Heat Advisory",
+        description="* WHAT...Heat index values around 108.",
+    ).raw
+    await poller._process(changed, FilterRules([], [], []), "America/Chicago", 0, False)
+
+    assert len(tx.sent) == 3
+    assert tx.sent[0][0].startswith("⚠️ HEAT ADVISORY:")
+    assert tx.sent[1][0] == "DETAIL: Heat index values around 105."
+    assert tx.sent[2][0] == "DETAIL: Heat index values around 108."
+
+
+async def test_changed_detail_uses_card_destination_snapshot(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Montgomery mesh", "meshcore", 1)
+    rule_id = db.create_route("Montgomery heat", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+    db.replace_route_events(rule_id, ["Heat Advisory"], detail_events=["Heat Advisory"])
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = DestinationTx()
+    poller = WxPoller(db, tx)
+    first = _alert(
+        areas="Montgomery County", zones=["TNC125"], event="Heat Advisory",
+        description="* WHAT...Heat index values around 105.",
+    ).raw
+    await poller._process(first, FilterRules([], [], []), "America/Chicago", 0, False)
+    db.update_destination(destination_id, "Moved", "meshcore", 3, True)
+    changed = _alert(
+        areas="Montgomery County", zones=["TNC125"], event="Heat Advisory",
+        description="* WHAT...Heat index values around 108.",
+    ).raw
+
+    await poller._process(changed, FilterRules([], [], []), "America/Chicago", 0, False)
+
+    assert tx.sent[-1] == (
+        "DETAIL: Heat index values around 108.", "meshcore", 1, destination_id,
+    )
 
 
 async def test_poller_routes_forecast_zone_warning_to_county_destination(tmp_path):
@@ -726,6 +954,205 @@ async def test_queued_original_is_removed_when_cancel_arrives(tmp_path):
     assert tx.queued == []
     assert tx.attempted == []
     assert db.get_delivery_state("alert-1", destination_id) is None
+
+
+async def test_cancel_removes_queued_detail_and_sends_no_new_detail(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Robertson", "meshcore", 2)
+    rule_id = db.create_route("Robertson", 10, True)
+    db.replace_route_counties(rule_id, [("TNC147", "Robertson")])
+    db.replace_route_events(rule_id, [], all_warnings=True, all_warnings_details=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = ChainTx()
+    poller = WxPoller(db, tx)
+    rules = FilterRules([], ["Warning"], [])
+    original = _alert(
+        areas="Robertson", zones=["TNC147"],
+        description="HAZARD...60 mph wind gusts.",
+    )
+
+    await poller._process(original.raw, rules, "America/Chicago", 0, False)
+    tx.run_next(True)
+    assert len(tx.queued) == 1
+    assert tx.queued[0]["text"].startswith("DETAIL:")
+
+    cancel = _alert(
+        areas="", zones=[], alert_id="alert-2", message_type="Cancel",
+        references=["alert-1"],
+    )
+    await poller._process(cancel.raw, rules, "America/Chicago", 0, False)
+
+    assert len(tx.queued) == 1
+    assert "CANCELLED" in tx.queued[0]["text"]
+    state = db.get_delivery_state("alert-1", destination_id)
+    assert state["detail_state"] == "superseded"
+
+
+async def test_interrupted_queued_detail_is_retryable_after_restart(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Robertson", "meshcore", 2)
+    rule_id = db.create_route("Robertson", 10, True)
+    db.replace_route_counties(rule_id, [("TNC147", "Robertson")])
+    db.replace_route_events(rule_id, [], all_warnings=True, all_warnings_details=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = ChainTx()
+    feature = _alert(
+        areas="Robertson", zones=["TNC147"],
+        description="HAZARD...60 mph wind gusts.",
+    ).raw
+    poller = WxPoller(db, tx)
+
+    await poller._process(feature, FilterRules([], ["Warning"], []),
+                          "America/Chicago", 0, False)
+    tx.run_next(True)
+    assert db.get_delivery_state("alert-1", destination_id)["detail_state"] == "queued"
+
+    retry_tx = DestinationTx()
+    restarted = WxPoller(db, retry_tx)
+    await restarted._process(feature, FilterRules([], ["Warning"], []),
+                             "America/Chicago", 0, False)
+
+    assert [item[0] for item in retry_tx.sent] == ["DETAIL: 60 mph wind gusts."]
+    assert db.get_delivery_state("alert-1", destination_id)["detail_state"] == "accepted"
+
+
+async def test_duplicate_referenced_update_keeps_its_queued_detail(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Robertson", "meshcore", 2)
+    rule_id = db.create_route("Robertson", 10, True)
+    db.replace_route_counties(rule_id, [("TNC147", "Robertson")])
+    db.replace_route_events(rule_id, [], all_warnings=True, all_warnings_details=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = ChainTx()
+    poller = WxPoller(db, tx)
+    rules = FilterRules([], ["Warning"], [])
+    original = _alert(
+        areas="Robertson", zones=["TNC147"],
+        description="HAZARD...60 mph wind gusts.",
+    )
+    await poller._process(original.raw, rules, "America/Chicago", 0, False)
+    tx.run_next(True)
+    tx.run_next(True)
+    update = _alert(
+        areas="Robertson", zones=["TNC147"], alert_id="alert-2",
+        message_type="Update", references=["alert-1"], headline="updated",
+        description="HAZARD...70 mph wind gusts.",
+    )
+    await poller._process(update.raw, rules, "America/Chicago", 0, False)
+    tx.run_next(True)
+    assert tx.queued[0]["text"] == "DETAIL: 70 mph wind gusts."
+
+    await poller._process(update.raw, rules, "America/Chicago", 0, False)
+
+    assert len(tx.queued) == 1
+    assert tx.queued[0]["text"] == "DETAIL: 70 mph wind gusts."
+    state = db.get_delivery_state("alert-1", destination_id)
+    assert state["detail_state"] == "queued"
+    assert state["detail_alert_id"] == "alert-2"
+
+
+async def test_failed_referenced_update_detail_retries_without_card(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Robertson", "meshcore", 2)
+    rule_id = db.create_route("Robertson", 10, True)
+    db.replace_route_counties(rule_id, [("TNC147", "Robertson")])
+    db.replace_route_events(rule_id, [], all_warnings=True, all_warnings_details=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = ChainTx()
+    poller = WxPoller(db, tx)
+    rules = FilterRules([], ["Warning"], [])
+    original = _alert(
+        areas="Robertson", zones=["TNC147"],
+        description="HAZARD...60 mph wind gusts.",
+    )
+    await poller._process(original.raw, rules, "America/Chicago", 0, False)
+    tx.run_next(True)
+    tx.run_next(True)
+    update = _alert(
+        areas="Robertson", zones=["TNC147"], alert_id="alert-2",
+        message_type="Update", references=["alert-1"], headline="updated",
+        description="HAZARD...70 mph wind gusts.",
+    )
+    await poller._process(update.raw, rules, "America/Chicago", 0, False)
+    tx.run_next(True)
+    tx.run_next(False)
+
+    await poller._process(update.raw, rules, "America/Chicago", 0, False)
+
+    assert len(tx.queued) == 1
+    assert tx.queued[0]["text"] == "DETAIL: 70 mph wind gusts."
+
+
+async def test_superseded_same_hash_callback_cannot_finalize_new_detail(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Robertson", "meshcore", 2)
+    rule_id = db.create_route("Robertson", 10, True)
+    db.replace_route_counties(rule_id, [("TNC147", "Robertson")])
+    db.replace_route_events(rule_id, [], all_warnings=True, all_warnings_details=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = ChainTx()
+    poller = WxPoller(db, tx)
+    rules = FilterRules([], ["Warning"], [])
+    original = _alert(
+        areas="Robertson", zones=["TNC147"],
+        description="HAZARD...60 mph wind gusts.",
+    )
+    await poller._process(original.raw, rules, "America/Chicago", 0, False)
+    tx.run_next(True)
+    tx.begin_next()
+    update = _alert(
+        areas="Robertson", zones=["TNC147"], alert_id="alert-2",
+        message_type="Update", references=["alert-1"], headline="updated",
+        description="HAZARD...60 mph wind gusts.",
+    )
+
+    await poller._process(update.raw, rules, "America/Chicago", 0, False)
+    tx.finish(True)
+    assert db.get_delivery_state("alert-1", destination_id)["detail_state"] == "superseded"
+    tx.run_next(True)
+
+    state = db.get_delivery_state("alert-1", destination_id)
+    assert state["detail_alert_id"] == "alert-2"
+    assert state["detail_state"] == "queued"
+    assert tx.queued[0]["text"] == "DETAIL: 60 mph wind gusts."
+
+
+async def test_cancel_can_reference_a_detail_only_update(tmp_path):
+    db = Database(str(tmp_path / "mesh.db"))
+    destination_id = db.create_destination("Robertson", "meshcore", 2)
+    rule_id = db.create_route("Robertson", 10, True)
+    db.replace_route_counties(rule_id, [("TNC147", "Robertson")])
+    db.replace_route_events(rule_id, [], all_warnings=True, all_warnings_details=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+    tx = DestinationTx()
+    poller = WxPoller(db, tx)
+    rules = FilterRules([], ["Warning"], [])
+    original = _alert(
+        areas="Robertson", zones=["TNC147"],
+        description="HAZARD...60 mph wind gusts.",
+    )
+    update_two = _alert(
+        areas="Robertson", zones=["TNC147"], alert_id="alert-2",
+        message_type="Update", references=["alert-1"], headline="updated",
+        description="HAZARD...70 mph wind gusts.",
+    )
+    update_three = _alert(
+        areas="Robertson", zones=["TNC147"], alert_id="alert-3",
+        message_type="Update", references=["alert-1"], headline="updated",
+        description="HAZARD...80 mph wind gusts.",
+    )
+
+    for item in (original, update_two, update_three):
+        await poller._process(item.raw, rules, "America/Chicago", 0, False)
+    assert tx.sent[-1][0] == "DETAIL: 80 mph wind gusts."
+    cancel = _alert(
+        areas="", zones=[], alert_id="alert-4", message_type="Cancel",
+        references=["alert-3"], headline="cancelled",
+    )
+
+    await poller._process(cancel.raw, rules, "America/Chicago", 0, False)
+
+    assert tx.sent[-1][0].startswith("⚠️ CANCELLED TORNADO WARNING:")
 
 
 async def test_queued_original_is_superseded_by_latest_update(tmp_path):

@@ -27,6 +27,7 @@ class RoutedDestination:
     transport: str
     channel: int
     matched_areas: tuple[str, ...]
+    details_enabled: bool = True
 
 
 def _county_same_key(zone_code: str) -> str:
@@ -55,8 +56,11 @@ def route_alert(db, alert) -> list[RoutedDestination]:
     for row in db.routing_rows():
         if not row["rule_enabled"] or not row["destination_enabled"]:
             continue
-        event_ok = bool(row["all_warnings"] and alert.event.casefold().endswith("warning"))
-        event_ok = event_ok or row["event"] == alert.event
+        warning_match = bool(
+            row["all_warnings"] and alert.event.casefold().endswith("warning")
+        )
+        exact_match = row["event"] == alert.event
+        event_ok = warning_match or exact_match
         if not event_ok:
             continue
         zone_code = row["zone_code"].upper()
@@ -70,9 +74,15 @@ def route_alert(db, alert) -> list[RoutedDestination]:
             "destination_id": int(row["destination_id"]),
             "name": row["destination_name"], "transport": row["transport"],
             "channel": int(row["channel"]), "areas": [],
+            "details_enabled": False,
         })
+        entry["details_enabled"] = bool(
+            entry["details_enabled"]
+            or (warning_match and row["all_warnings_details"])
+            or (exact_match and row["detail_enabled"])
+        )
         if row["county_name"] not in entry["areas"]:
             entry["areas"].append(row["county_name"])
     return [RoutedDestination(v["destination_id"], v["name"], v["transport"],
-                              v["channel"], tuple(v["areas"]))
+                              v["channel"], tuple(v["areas"]), v["details_enabled"])
             for v in matches.values()]

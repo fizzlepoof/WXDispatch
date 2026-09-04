@@ -10,7 +10,7 @@
       {% if tp %}
       <button class="secondary" style="padding:4px 12px;font-size:12.5px;"
               hx-post="/transmit-log/resend/{{ r['id'] }}" hx-target="#tx-rows" hx-swap="innerHTML"
-              hx-confirm="Submit this message to {{ 'Meshtastic' if tp == 'meshtastic' else ('the MeshCore companion' if tp == 'meshcore' else 'this radio interface') }} now? Interface acceptance does not confirm over-air delivery.">Resend</button>
+              hx-confirm="Submit this message{% if r['followup_text'] %} and its paced DETAIL follow-up{% endif %} to {{ 'Meshtastic' if tp == 'meshtastic' else ('the MeshCore companion' if tp == 'meshcore' else 'this radio interface') }} now? Interface acceptance does not confirm over-air delivery.">Resend</button>
       {% endif %}
     </span>
   </div>

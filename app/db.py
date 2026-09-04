@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS routing_rules (
     name TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
     priority INTEGER NOT NULL DEFAULT 100,
-    all_warnings INTEGER NOT NULL DEFAULT 0
+    all_warnings INTEGER NOT NULL DEFAULT 0,
+    all_warnings_details INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS route_counties (
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS route_counties (
 CREATE TABLE IF NOT EXISTS route_events (
     rule_id INTEGER NOT NULL REFERENCES routing_rules(id) ON DELETE CASCADE,
     event TEXT NOT NULL,
+    detail_enabled INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY(rule_id, event)
 );
 
@@ -78,6 +80,11 @@ CREATE TABLE IF NOT EXISTS alert_delivery_state (
     matched_areas TEXT NOT NULL DEFAULT '[]',
     event TEXT, headline TEXT, expires TEXT, msg_hash TEXT,
     disposition TEXT, sent_ts TEXT, updated_at TEXT NOT NULL,
+    detail_text TEXT NOT NULL DEFAULT '',
+    detail_alert_id TEXT NOT NULL DEFAULT '',
+    detail_hash TEXT NOT NULL DEFAULT '',
+    detail_state TEXT NOT NULL DEFAULT '',
+    detail_error TEXT NOT NULL DEFAULT '',
     UNIQUE(root_alert_id, destination_id)
 );
 
@@ -132,7 +139,8 @@ CREATE TABLE IF NOT EXISTS transmit_log (
     text       TEXT,
     error      TEXT,
     transport  TEXT,
-    destination_id INTEGER
+    destination_id INTEGER,
+    followup_text TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS errors (
@@ -220,6 +228,55 @@ class Database:
                 self._conn.execute("ALTER TABLE transmit_log ADD COLUMN transport TEXT")
             if "destination_id" not in columns:
                 self._conn.execute("ALTER TABLE transmit_log ADD COLUMN destination_id INTEGER")
+            if "followup_text" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE transmit_log ADD COLUMN followup_text TEXT NOT NULL DEFAULT ''"
+                )
+            route_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(route_events)")
+            }
+            if "detail_enabled" not in route_columns:
+                self._conn.execute(
+                    "ALTER TABLE route_events ADD COLUMN detail_enabled INTEGER NOT NULL DEFAULT 1"
+                )
+            rule_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(routing_rules)")
+            }
+            if "all_warnings_details" not in rule_columns:
+                self._conn.execute(
+                    "ALTER TABLE routing_rules ADD COLUMN all_warnings_details "
+                    "INTEGER NOT NULL DEFAULT 1"
+                )
+            delivery_columns = {
+                row[1] for row in self._conn.execute(
+                    "PRAGMA table_info(alert_delivery_state)"
+                )
+            }
+            delivery_migrations = {
+                "detail_text": (
+                    "ALTER TABLE alert_delivery_state ADD COLUMN "
+                    "detail_text TEXT NOT NULL DEFAULT ''"
+                ),
+                "detail_alert_id": (
+                    "ALTER TABLE alert_delivery_state ADD COLUMN "
+                    "detail_alert_id TEXT NOT NULL DEFAULT ''"
+                ),
+                "detail_hash": (
+                    "ALTER TABLE alert_delivery_state ADD COLUMN "
+                    "detail_hash TEXT NOT NULL DEFAULT ''"
+                ),
+                "detail_state": (
+                    "ALTER TABLE alert_delivery_state ADD COLUMN "
+                    "detail_state TEXT NOT NULL DEFAULT ''"
+                ),
+                "detail_error": (
+                    "ALTER TABLE alert_delivery_state ADD COLUMN "
+                    "detail_error TEXT NOT NULL DEFAULT ''"
+                ),
+            }
+            for name, statement in delivery_migrations.items():
+                if name not in delivery_columns:
+                    self._conn.execute(statement)
             self._conn.commit()
 
     def _seed_settings(self) -> None:
@@ -368,19 +425,23 @@ class Database:
     def create_routing_rule(
         self, name: str, priority: int, enabled: bool, all_warnings: bool,
         counties: list[tuple[str, str]], events: list[str],
-        destination_ids: list[int],
+        destination_ids: list[int], detail_events: Optional[list[str]] = None,
+        all_warnings_details: bool = True,
     ) -> int:
         """Create a complete manual rule atomically."""
         unique_counties = list(dict.fromkeys(counties))
         unique_events = list(dict.fromkeys(events))
+        detail_set = set(unique_events if detail_events is None else detail_events)
         unique_destinations = list(dict.fromkeys(destination_ids))
         with self._lock:
             try:
                 self._conn.execute("BEGIN")
                 cur = self._conn.execute(
-                    """INSERT INTO routing_rules(name, enabled, priority, all_warnings)
-                       VALUES (?, ?, ?, ?)""",
-                    (name, int(enabled), priority, int(all_warnings)),
+                    """INSERT INTO routing_rules
+                       (name, enabled, priority, all_warnings, all_warnings_details)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (name, int(enabled), priority, int(all_warnings),
+                     int(all_warnings_details)),
                 )
                 lastrowid = cur.lastrowid
                 assert lastrowid is not None
@@ -390,8 +451,8 @@ class Database:
                     [(rule_id, code, county_name) for code, county_name in unique_counties],
                 )
                 self._conn.executemany(
-                    "INSERT INTO route_events(rule_id, event) VALUES (?, ?)",
-                    [(rule_id, event) for event in unique_events],
+                    "INSERT INTO route_events(rule_id, event, detail_enabled) VALUES (?, ?, ?)",
+                    [(rule_id, event, int(event in detail_set)) for event in unique_events],
                 )
                 self._conn.executemany(
                     "INSERT INTO route_destinations(rule_id, destination_id) VALUES (?, ?)",
@@ -406,19 +467,22 @@ class Database:
     def update_routing_rule(
         self, rule_id: int, name: str, priority: int, enabled: bool,
         all_warnings: bool, counties: list[tuple[str, str]], events: list[str],
-        destination_ids: list[int],
+        destination_ids: list[int], detail_events: Optional[list[str]] = None,
+        all_warnings_details: bool = True,
     ) -> bool:
         """Replace a manual rule and all associations atomically."""
         unique_counties = list(dict.fromkeys(counties))
         unique_events = list(dict.fromkeys(events))
+        detail_set = set(unique_events if detail_events is None else detail_events)
         unique_destinations = list(dict.fromkeys(destination_ids))
         with self._lock:
             try:
                 self._conn.execute("BEGIN")
                 cur = self._conn.execute(
                     """UPDATE routing_rules SET name = ?, priority = ?, enabled = ?,
-                       all_warnings = ? WHERE id = ?""",
-                    (name, priority, int(enabled), int(all_warnings), rule_id),
+                       all_warnings = ?, all_warnings_details = ? WHERE id = ?""",
+                    (name, priority, int(enabled), int(all_warnings),
+                     int(all_warnings_details), rule_id),
                 )
                 if cur.rowcount != 1:
                     self._conn.rollback()
@@ -431,8 +495,8 @@ class Database:
                     [(rule_id, code, county_name) for code, county_name in unique_counties],
                 )
                 self._conn.executemany(
-                    "INSERT INTO route_events(rule_id, event) VALUES (?, ?)",
-                    [(rule_id, event) for event in unique_events],
+                    "INSERT INTO route_events(rule_id, event, detail_enabled) VALUES (?, ?, ?)",
+                    [(rule_id, event, int(event in detail_set)) for event in unique_events],
                 )
                 self._conn.executemany(
                     "INSERT INTO route_destinations(rule_id, destination_id) VALUES (?, ?)",
@@ -510,16 +574,20 @@ class Database:
             self._conn.commit()
 
     def replace_route_events(self, rule_id: int, events: list[str],
-                             all_warnings: bool = False) -> None:
+                             all_warnings: bool = False,
+                             detail_events: Optional[list[str]] = None,
+                             all_warnings_details: bool = True) -> None:
+        detail_set = set(events if detail_events is None else detail_events)
         with self._lock:
             self._conn.execute("DELETE FROM route_events WHERE rule_id = ?", (rule_id,))
             self._conn.executemany(
-                "INSERT INTO route_events(rule_id, event) VALUES (?, ?)",
-                [(rule_id, event) for event in events],
+                "INSERT INTO route_events(rule_id, event, detail_enabled) VALUES (?, ?, ?)",
+                [(rule_id, event, int(event in detail_set)) for event in events],
             )
             self._conn.execute(
-                "UPDATE routing_rules SET all_warnings = ? WHERE id = ?",
-                (int(all_warnings), rule_id),
+                """UPDATE routing_rules
+                   SET all_warnings = ?, all_warnings_details = ? WHERE id = ?""",
+                (int(all_warnings), int(all_warnings_details), rule_id),
             )
             self._conn.commit()
 
@@ -553,12 +621,17 @@ class Database:
         rule = dict(row)
         rule["enabled"] = bool(rule["enabled"])
         rule["all_warnings"] = bool(rule["all_warnings"])
+        rule["all_warnings_details"] = bool(rule["all_warnings_details"])
         rule["counties"] = [dict(value) for value in self._conn.execute(
             "SELECT zone_code, county_name FROM route_counties "
             "WHERE rule_id = ? ORDER BY zone_code", (rule_id,),
         ).fetchall()]
         rule["events"] = [value["event"] for value in self._conn.execute(
             "SELECT event FROM route_events WHERE rule_id = ? ORDER BY event", (rule_id,),
+        ).fetchall()]
+        rule["detail_events"] = [value["event"] for value in self._conn.execute(
+            "SELECT event FROM route_events WHERE rule_id = ? AND detail_enabled = 1 "
+            "ORDER BY event", (rule_id,),
         ).fetchall()]
         rule["destinations"] = [dict(value) for value in self._conn.execute(
             """SELECT d.* FROM route_destinations rd
@@ -571,8 +644,9 @@ class Database:
         with self._lock:
             return self._conn.execute(
                 """SELECT r.id rule_id, r.name rule_name, r.enabled rule_enabled,
-                          r.priority, r.all_warnings, c.zone_code, c.county_name,
-                          e.event, d.id destination_id, d.name destination_name,
+                          r.priority, r.all_warnings, r.all_warnings_details,
+                          c.zone_code, c.county_name, e.event, e.detail_enabled,
+                          d.id destination_id, d.name destination_name,
                           d.transport, d.channel, d.enabled destination_enabled
                    FROM routing_rules r
                    JOIN route_counties c ON c.rule_id = r.id
@@ -602,7 +676,9 @@ class Database:
         with self._lock:
             return self._conn.execute(
                 f"SELECT * FROM alert_delivery_state WHERE last_alert_id IN ({placeholders}) "
-                f"OR root_alert_id IN ({placeholders}) ORDER BY chain_id", ids + ids,
+                f"OR root_alert_id IN ({placeholders}) "
+                f"OR detail_alert_id IN ({placeholders}) ORDER BY chain_id",
+                ids + ids + ids,
             ).fetchall()
 
     def get_delivery_state(self, root_alert_id: str, destination_id: int):
@@ -634,6 +710,62 @@ class Database:
                  disposition, now, now),
             )
             self._conn.commit()
+
+    def queue_detail_delivery(self, root_alert_id: str, destination_id: int,
+                              alert_id: str, text: str, msg_hash: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE alert_delivery_state
+                   SET detail_alert_id = ?, detail_text = ?, detail_hash = ?,
+                       detail_state = 'queued', detail_error = '', updated_at = ?
+                   WHERE root_alert_id = ? AND destination_id = ?""",
+                (alert_id, text, msg_hash, _now(), root_alert_id, destination_id),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def finalize_detail_delivery(self, root_alert_id: str, destination_id: int,
+                                 alert_id: str, msg_hash: str, state: str,
+                                 error: str = "") -> bool:
+        if state not in {"accepted", "failed", "superseded"}:
+            raise ValueError("invalid detail delivery state")
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE alert_delivery_state
+                   SET detail_state = ?, detail_error = ?, updated_at = ?
+                   WHERE root_alert_id = ? AND destination_id = ?
+                     AND detail_alert_id = ? AND detail_hash = ?
+                     AND detail_state = 'queued'""",
+                (state, error, _now(), root_alert_id, destination_id,
+                 alert_id, msg_hash),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def supersede_queued_detail(self, root_alert_id: str, destination_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE alert_delivery_state
+                   SET detail_state = 'superseded', detail_error = 'superseded',
+                       updated_at = ?
+                   WHERE root_alert_id = ? AND destination_id = ?
+                     AND detail_state = 'queued'""",
+                (_now(), root_alert_id, destination_id),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def recover_queued_detail_deliveries(self) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE alert_delivery_state
+                   SET detail_state = 'failed',
+                       detail_error = 'interrupted before completion', updated_at = ?
+                   WHERE detail_state = 'queued'""",
+                (_now(),),
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     def get_meshwx_delivery(self, alert_id: str):
         with self._lock:
@@ -911,13 +1043,18 @@ class Database:
         error: str = "",
         transport: str = "meshtastic",
         destination_id: Optional[int] = None,
+        followup_text: str = "",
     ) -> None:
-        cols = ("ts, channel, byte_count, success, manual, text, error, transport, destination_id")
         vals = (_now(), channel, byte_count, int(success), int(manual), text, error,
-                transport, destination_id)
+                transport, destination_id, followup_text)
         with self._lock:
             self._conn.execute(
-                "INSERT INTO transmit_log(%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)" % cols, vals)
+                """INSERT INTO transmit_log
+                   (ts,channel,byte_count,success,manual,text,error,transport,
+                    destination_id,followup_text)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                vals,
+            )
             self._conn.commit()
 
     def query_transmit_log(self, limit: int = 200) -> list[sqlite3.Row]:

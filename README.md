@@ -65,6 +65,11 @@ channel. Built after living through Hurricane Helene's comms blackout.
 - **openHop Console alert cards.** Routed alerts remain ordinary `GRP_TXT` messages but use
   the Console HOWL form `⚠️ SEVERITY: headline`. A sending companion whose name includes
   `Bot` is rendered as a card while every normal MeshCore client still sees readable text.
+- **Optional alert details.** Each event in a routing rule can send one paced `DETAIL:`
+  follow-up containing concise NWS-authored hazard facts and, when available, protective
+  instructions. Details go only after the alert card is accepted, retry independently, and
+  resend only when their meaningful content changes. If an alert contains nothing useful,
+  WXDispatch stays silent.
 - **Optional MeshWX v4 binary feed.** WXDispatch can also dual-cast active warnings as
   COBS-encoded MeshWX v4 `0x20`/`0x21` binary frames on a dedicated non-Public
   MeshCore hash channel. This is only for clients with a MeshWX v4 decoder; openHop Console
@@ -150,8 +155,9 @@ No Python install required. Windows may warn about an unrecognized app the first
 4. Save, then open **Routing**. Create and enable at least one destination, then create and
    enable a county/event rule that uses it. Routing rules are authoritative: their counties
    automatically drive NWS polling and the local map, and their event selections control each
-   destination. The collapsed legacy coverage/global-filter controls are not needed for routed
-   setups.
+   destination. Each selected event also has a **Send details** checkbox, enabled by default;
+   uncheck it when that event should remain a one-message alert. The collapsed legacy
+   coverage/global-filter controls are not needed for routed setups.
 5. Go to **Troubleshoot → Send test**. A success response means the request was accepted by
    Meshtastic node software or accepted by MeshCore companion software; it does **not** prove
    over-air delivery. Confirm reception on a separate listening node.
