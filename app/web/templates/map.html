@@ -38,9 +38,30 @@
 (function(){
   'use strict';
   var map=L.map('alert-map').setView([39,-98],4);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
-    maxZoom:19,attribution:'<a href="https://www.openstreetmap.org/copyright">© OpenStreetMap contributors</a>'
-  }).addTo(map);
+  var osmAttribution='<a href="https://www.openstreetmap.org/copyright">© OpenStreetMap contributors</a>';
+  var esriAttribution='<a href="https://www.esri.com">Tiles © Esri</a> · Esri, HERE, Garmin, '+osmAttribution+', GIS user community';
+  var tileLayers={
+    light:L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+      maxZoom:19,attribution:osmAttribution
+    }),
+    dark:L.layerGroup([
+      L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',{
+        maxZoom:16,attribution:esriAttribution
+      }),
+      L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',{
+        maxZoom:16,className:'dark-map-labels'
+      })
+    ])
+  };
+  var baseLayer;
+  function setBaseLayer(theme){
+    if(baseLayer)map.removeLayer(baseLayer);
+    baseLayer=tileLayers[theme==='dark'?'dark':'light'].addTo(map);
+  }
+  setBaseLayer(document.documentElement.dataset.theme);
+  window.addEventListener('wxdispatch:themechange',function(event){
+    setBaseLayer(event.detail.theme);
+  });
   var layers=L.layerGroup().addTo(map);
   var fitted=false;
   var loading=false;
