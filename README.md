@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <b>Status: v2.3.0.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
+  <b>Status: v2.4.0.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
 </p>
 
 ---
