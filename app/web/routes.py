@@ -20,7 +20,7 @@ from fastapi.templating import Jinja2Templates
 import httpx
 
 from .. import __version__
-from ..alert_map import CountyAlertCache, ZoneGeometryCache, configured_counties
+from ..alert_map import AreaAlertCache, RegionalZoneGeometryCache, configured_counties
 from ..config import (MAX_PAYLOAD_BYTES, POLL_INTERVAL_MIN, IPAWS_EVENT_TYPES,
                       GITHUB_LATEST_RELEASE_API, GITHUB_RELEASES_URL)
 from ..serial_discovery import list_all_ports
@@ -37,8 +37,8 @@ def _template_dir() -> Path:
 _CSRF_COOKIE = "mesh_wx_csrf"
 _CSRF_SECRET = secrets.token_bytes(32)
 _CHANNEL_ADMIN_AUTH = HTTPBasic(auto_error=False)
-_ALERT_MAP_CACHE = ZoneGeometryCache()
-_COUNTY_ALERT_CACHE = CountyAlertCache()
+_ALERT_MAP_CACHE = RegionalZoneGeometryCache()
+_AREA_ALERT_CACHE = AreaAlertCache()
 
 
 def _new_csrf_token() -> str:
@@ -381,11 +381,35 @@ async def local_alert_map_data(request: Request):
     db = _db(request)
     configured = configured_counties(db)
     contact = str(db.get_setting("nws_contact", "") or "")
-    boundary_result, alert_result = await asyncio.gather(
-        _ALERT_MAP_CACHE.get_many(configured, contact),
-        _COUNTY_ALERT_CACHE.get_many(configured, contact),
+    alerts, alert_errors, stale, last_success = await _AREA_ALERT_CACHE.get_many(
+        configured, contact,
     )
-    county_features, zone_errors = boundary_result
+    map_zones = {
+        county["code"]: {
+            "code": county["code"], "name": county["name"], "watched": True,
+        }
+        for county in configured
+    }
+    for alert in alerts:
+        affected_zones = alert.get("affected_zones", alert.get("local_zones", []))
+        if not isinstance(affected_zones, list):
+            continue
+        for raw_code in affected_zones:
+            code = str(raw_code or "").strip().upper()
+            if re.fullmatch(r"[A-Z]{2}[CZ]\d{3}", code) and code not in map_zones:
+                map_zones[code] = {"code": code, "name": code, "watched": False}
+    county_features, zone_errors, regional_scope_codes = await _ALERT_MAP_CACHE.get_many(
+        list(map_zones.values()), contact,
+    )
+    regional_scope = set(regional_scope_codes)
+
+    def in_regional_scope(alert: dict) -> bool:
+        if alert.get("watched"):
+            return True
+        affected = alert.get("affected_zones", alert.get("local_zones", []))
+        return isinstance(affected, list) and not regional_scope.isdisjoint(affected)
+
+    alerts = [alert for alert in alerts if in_regional_scope(alert)]
     fetched_names = {
         feature["properties"]["code"]: feature["properties"]["name"]
         for feature in county_features
@@ -394,12 +418,14 @@ async def local_alert_map_data(request: Request):
         {"code": county["code"], "name": fetched_names.get(county["code"], county["name"])}
         for county in configured
     ]
-    alerts, alert_errors, stale, last_success = alert_result
     alert_names = {county["code"]: county["name"] for county in alert_counties}
     for alert in alerts:
         alert["local_counties"] = [
             alert_names.get(code, code) for code in alert["local_zones"]
         ]
+        alert["watched"] = bool(alert.get("watched", alert["local_zones"]))
+    watched_alert_count = sum(1 for alert in alerts if alert["watched"])
+    scope_areas = list(dict.fromkeys(county["code"][:2] for county in configured))
     if not configured:
         error = "No local counties are configured."
     elif alert_errors and not last_success:
@@ -411,6 +437,9 @@ async def local_alert_map_data(request: Request):
         "counties": county_features,
         "county_count": len(configured),
         "alerts": alerts,
+        "watched_alert_count": watched_alert_count,
+        "regional_alert_count": len(alerts) - watched_alert_count,
+        "scope_areas": scope_areas,
         "last_poll_success": last_success,
         "poll_result": result,
         "stale": stale,

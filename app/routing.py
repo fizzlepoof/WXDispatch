@@ -30,7 +30,7 @@ class RoutedDestination:
     details_enabled: bool = True
 
 
-def _county_same_key(zone_code: str) -> str:
+def county_same_key(zone_code: str) -> str:
     """Convert a county UGC (KYC047) to SAME's state/county portion (21047)."""
     code = zone_code.strip().upper()
     state_fips = _STATE_FIPS.get(code[:2], "")
@@ -65,7 +65,7 @@ def route_alert(db, alert) -> list[RoutedDestination]:
             continue
         zone_code = row["zone_code"].upper()
         county_ok = ((zone_code in affected_codes or
-                      _county_same_key(zone_code) in same_locations) if has_ugc
+                      county_same_key(zone_code) in same_locations) if has_ugc
                      else row["county_name"].strip().casefold() in affected_names)
         if not county_ok:
             continue

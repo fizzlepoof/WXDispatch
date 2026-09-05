@@ -77,8 +77,10 @@ channel. Built after living through Hurricane Helene's comms blackout.
 - **Dry-run by default.** Automated alerts are logged, not transmitted, until you flip it on.
 - **A real dashboard.** Live radio status, recent alerts, 7-day activity, transmit log,
   and a per-radio **Send test** button to key up each radio on the bench.
-- **Local alert map.** Shows every configured county and its current county-scoped NWS
-  alerts, including multi-county events, partial lookup failures, and stale-data warnings.
+- **Local alert map.** Shows active alerts in the same-state portion of the NWS forecast-office
+  coverage area serving your configured counties. Watched counties and their alerts are emphasized
+  above lighter regional context, while partial lookup failures and stale-data warnings remain
+  visible. Map-only regional awareness does not change alert routing or radio transmission.
 
 ## Install
 

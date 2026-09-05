@@ -439,6 +439,17 @@ def test_local_alert_map_page_uses_pinned_leaflet_and_safe_dom_rendering(web):
     assert "data.zone_errors" in response.text
     assert "data.alert_errors" in response.text
     assert "data.stale" in response.text
+    assert "Current regional alerts" in response.text
+    assert "Watched county" in response.text
+    assert "Regional" in response.text
+    assert "alert.watched" in response.text
+    assert "alert.affected_zones" in response.text
+    assert "new Set" in response.text
+    assert "feature.properties.watched" in response.text
+    assert "item.watched" in response.text
+    assert ".alert-card.watched{background:" in response.text
+    assert "var outline=watched?'#7c3aed':fill;" in response.text
+    assert "L.featureGroup()" in response.text
     assert "if(loading)return" in response.text
     assert ".textContent" in response.text
     assert ".innerHTML" not in response.text
@@ -461,12 +472,14 @@ def test_local_alert_map_data_uses_county_scoped_alerts_and_configured_route_cou
 
     class FakeZoneCache:
         async def get_many(self, counties, contact):
-            assert counties == [{"code": "TNC125", "name": "Montgomery County"}]
+            assert counties == [{
+                "code": "TNC125", "name": "Montgomery County", "watched": True,
+            }]
             return [{
                 "type": "Feature",
                 "geometry": geometry,
                 "properties": {"code": "TNC125", "name": "Montgomery County"},
-            }], []
+            }], [], ["TNC125"]
 
     safe_alert = {
         "id": "local-alert",
@@ -490,7 +503,7 @@ def test_local_alert_map_data_uses_county_scoped_alerts_and_configured_route_cou
             return [safe_alert], [], False, "2099-01-01T00:00:00+00:00"
 
     monkeypatch.setattr(routes_mod, "_ALERT_MAP_CACHE", FakeZoneCache())
-    monkeypatch.setattr(routes_mod, "_COUNTY_ALERT_CACHE", FakeAlertCache())
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", FakeAlertCache())
 
     response = client.get("/api/map-data")
 
@@ -512,6 +525,67 @@ def test_local_alert_map_data_uses_county_scoped_alerts_and_configured_route_cou
     assert payload["zone_errors"] == []
     assert payload["alert_errors"] == []
     assert payload["error"] == ""
+
+
+def test_local_alert_map_data_includes_regional_alerts_and_watched_priority(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    client, db, _tx = web
+    rule_id = db.create_route("regional map", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+
+    class FakeZoneCache:
+        async def get_many(self, counties, contact):
+            assert counties == [
+                {"code": "TNC125", "name": "Montgomery County", "watched": True},
+                {"code": "TNC037", "name": "TNC037", "watched": False},
+                {"code": "TNZ001", "name": "TNZ001", "watched": False},
+            ]
+            return [], [], ["TNC125", "TNC037"]
+
+    class FakeAreaCache:
+        async def get_many(self, counties, contact):
+            assert counties == [{"code": "TNC125", "name": "Montgomery County"}]
+            return [
+                {
+                    "id": "watched", "event": "Tornado Warning", "headline": "Local",
+                    "area": "Montgomery County", "severity": "Extreme",
+                    "urgency": "Immediate", "certainty": "Observed", "onset": "",
+                    "ends": "", "expires": "", "local_zones": ["TNC125"],
+                    "local_counties": ["Montgomery County"], "geometry": None,
+                    "watched": True,
+                    "affected_zones": ["TNC125"],
+                },
+                {
+                    "id": "regional", "event": "Flood Warning", "headline": "Nearby",
+                    "area": "Davidson County", "severity": "Severe", "urgency": "Expected",
+                    "certainty": "Likely", "onset": "", "ends": "", "expires": "",
+                    "local_zones": [], "local_counties": [], "geometry": None,
+                    "watched": False,
+                    "affected_zones": ["TNC037"],
+                },
+                {
+                    "id": "outside", "event": "Wind Advisory", "headline": "Distant",
+                    "area": "West Tennessee", "severity": "Moderate", "urgency": "Expected",
+                    "certainty": "Likely", "onset": "", "ends": "", "expires": "",
+                    "local_zones": [], "local_counties": [], "geometry": None,
+                    "watched": False, "affected_zones": ["TNZ001"],
+                },
+            ], [], False, "2099-01-01T00:00:00+00:00"
+
+    monkeypatch.setattr(routes_mod, "_ALERT_MAP_CACHE", FakeZoneCache())
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", FakeAreaCache())
+    history_before = db.query_history()
+
+    response = client.get("/api/map-data")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [alert["id"] for alert in payload["alerts"]] == ["watched", "regional"]
+    assert payload["watched_alert_count"] == 1
+    assert payload["regional_alert_count"] == 1
+    assert payload["scope_areas"] == ["TN"]
+    assert db.query_history() == history_before
 
 
 def test_dashboard_broadcast_counts_include_routed_accepted_and_partial_outcomes(web):
