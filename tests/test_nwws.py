@@ -136,6 +136,41 @@ def test_official_product_header_may_follow_sequence_line() -> None:
     assert parsed.raw_text.startswith("111\nWFUS54 KOHX 050100\nTOROHX")
 
 
+@pytest.mark.parametrize("bbb", ["COR", "AMD", "RRA", "RRX", "CCA", "AAX"])
+def test_accepts_valid_optional_wmo_bbb_indicator(bbb: str) -> None:
+    parsed = parse_nwws_stanza(
+        OFFICIAL_STANZA.replace(b"WFUS54 KOHX 050100", f"WFUS54 KOHX 050100 {bbb}".encode())
+    )
+
+    assert isinstance(parsed, NWWSProduct)
+
+
+@pytest.mark.parametrize("bbb", ["XYZ", "RR", "RRZ", "cor", "COR EXTRA"])
+def test_rejects_invalid_wmo_bbb_indicator(bbb: str) -> None:
+    stanza = OFFICIAL_STANZA.replace(
+        b"WFUS54 KOHX 050100", f"WFUS54 KOHX 050100 {bbb}".encode()
+    )
+
+    with pytest.raises(NWWSParseError, match="invalid product headers"):
+        parse_nwws_stanza(stanza)
+
+
+def test_wmo_bbb_does_not_bypass_core_attribute_validation() -> None:
+    stanza = OFFICIAL_STANZA.replace(
+        b"WFUS54 KOHX 050100", b"WFUS54 KOHX 050100 COR"
+    ).replace(b"cccc='KOHX'", b"cccc='KOUN'")
+
+    with pytest.raises(NWWSParseError, match="product header mismatch"):
+        parse_nwws_stanza(stanza)
+
+
+def test_wmo_header_timestamp_must_match_stanza_issue_timestamp() -> None:
+    stanza = OFFICIAL_STANZA.replace(b"WFUS54 KOHX 050100", b"WFUS54 KOHX 050101")
+
+    with pytest.raises(NWWSParseError, match="product header timestamp mismatch"):
+        parse_nwws_stanza(stanza)
+
+
 @pytest.mark.parametrize(
     "header, error",
     [
@@ -188,6 +223,44 @@ def test_sequence_tracker_resets_on_process_restart_and_suppresses_replay() -> N
     assert tracker.seen_count <= 3
 
 
+def test_sequence_tracker_permanently_rejects_delayed_retired_process() -> None:
+    tracker = SequenceTracker(max_seen=3)
+
+    tracker.observe("old.90")
+    tracker.observe("new.2")
+    delayed = tracker.observe("old.91")
+    current = tracker.observe("new.3")
+
+    assert delayed.accepted is False
+    assert delayed.replay is True
+    assert delayed.process_changed is False
+    assert current.accepted is True
+    assert current.process_changed is False
+    assert current.gap is None
+
+
+def test_sequence_tracker_alternation_cannot_erase_retired_process_state() -> None:
+    tracker = SequenceTracker(max_seen=3, max_retired=3)
+
+    tracker.observe("first.1")
+    tracker.observe("second.1")
+    assert tracker.observe("first.2").accepted is False
+    tracker.observe("third.1")
+    assert tracker.observe("second.2").accepted is False
+    assert tracker.observe("first.3").accepted is False
+    assert tracker.observe("third.2").accepted is True
+    assert tracker.retired_count == 2
+
+
+def test_sequence_tracker_retired_process_memory_is_bounded() -> None:
+    tracker = SequenceTracker(max_seen=2, max_retired=2)
+
+    for index in range(5):
+        assert tracker.observe(f"worker{index}.1").accepted is True
+
+    assert tracker.retired_count == 2
+
+
 def test_sequence_tracker_accepts_product_objects() -> None:
     product = parse_nwws_stanza(OFFICIAL_STANZA)
     assert isinstance(product, NWWSProduct)
@@ -215,6 +288,17 @@ def test_ugc_parser_keeps_only_valid_county_and_zone_codes() -> None:
     text = "TNC000-001-TNP003-ABC123-TNZ999-051900-"
 
     assert parse_ugc(text) == ("TNC001", "TNZ999")
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "AMZ", "ANZ", "GMZ", "LCZ", "LEZ", "LHZ", "LMZ",
+        "LOZ", "LSZ", "PHZ", "PKZ", "PMZ", "PZZ", "SLZ",
+    ],
+)
+def test_ugc_parser_accepts_nws_marine_and_pseudo_state_prefixes(prefix: str) -> None:
+    assert parse_ugc(f"{prefix}001-051900-") == (f"{prefix}001",)
 
 
 @pytest.mark.parametrize("expiration", ["000000", "320000", "012400", "010060", "999999"])
@@ -261,6 +345,32 @@ def test_maps_common_events_with_safe_unknown_fallback(code: str, expected: str)
 def test_unknown_or_malformed_products_have_no_vtec() -> None:
     assert parse_vtec("ordinary text /not-vtec/") is None
     assert parse_product_metadata("ordinary text").event == ""
+
+
+def test_multiple_actionable_operational_segments_fail_closed() -> None:
+    product = parse_nwws_stanza(
+        OFFICIAL_STANZA.replace(b".NEW.", b".CAN.").replace(
+            b"Tornado Warning text.",
+            b"Tornado Warning cancellation.\n$$\n"
+            b"TNZ005-051930-\n"
+            b"/O.CON.KOHX.SV.W.0043.260905T0100Z-260905T0230Z/\n"
+            b"Severe Thunderstorm Warning continuation.",
+        )
+    )
+    assert isinstance(product, NWWSProduct)
+
+    with pytest.raises(NWWSParseError, match="multiple actionable operational segments"):
+        parse_product_metadata(product.raw_text)
+    assert project_to_feature(product) is None
+
+
+def test_single_actionable_segment_with_product_terminator_still_projects() -> None:
+    product = parse_nwws_stanza(
+        OFFICIAL_STANZA.replace(b"Tornado Warning text.", b"Tornado Warning text.\n$$\nNNNN")
+    )
+    assert isinstance(product, NWWSProduct)
+
+    assert project_to_feature(product) is not None
 
 
 def test_product_text_helpers_reject_unencodable_unicode() -> None:
@@ -321,6 +431,62 @@ def test_vtec_identity_is_stable_across_nwws_process_sequences() -> None:
     assert replayed_feature is not None
     assert first_feature["id"] == expected
     assert replayed_feature["id"] == expected
+
+
+def test_vtec_identity_uses_start_then_end_year_when_available() -> None:
+    product = parse_nwws_stanza(
+        OFFICIAL_STANZA.replace(
+            b"260905T0100Z-260905T0200Z", b"000000T0000Z-251231T2359Z"
+        )
+    )
+    assert isinstance(product, NWWSProduct)
+
+    feature = project_to_feature(product)
+
+    assert feature is not None
+    assert feature["id"] == "urn:nws:vtec:2025:KOHX:TO:W:0042"
+
+
+@pytest.mark.parametrize("action", ["CON", "CAN", "EXP", "EXT"])
+def test_early_january_zero_time_followup_keeps_previous_year_identity(action: str) -> None:
+    initial = parse_nwws_stanza(
+        OFFICIAL_STANZA.replace(b"2026-09-05T01:00:00Z", b"2025-12-31T23:55:00Z")
+        .replace(b"WFUS54 KOHX 050100", b"WFUS54 KOHX 312355")
+        .replace(b"260905T0100Z-260905T0200Z", b"251231T2355Z-260101T0200Z")
+    )
+    followup = parse_nwws_stanza(
+        OFFICIAL_STANZA.replace(b"2026-09-05T01:00:00Z", b"2026-01-01T00:05:00Z")
+        .replace(b"WFUS54 KOHX 050100", b"WFUS54 KOHX 010005")
+        .replace(b".NEW.", f".{action}.".encode())
+        .replace(b"260905T0100Z-260905T0200Z", b"000000T0000Z-000000T0000Z")
+    )
+    assert isinstance(initial, NWWSProduct)
+    assert isinstance(followup, NWWSProduct)
+
+    initial_feature = project_to_feature(initial)
+    followup_feature = project_to_feature(followup)
+
+    assert initial_feature is not None
+    assert followup_feature is not None
+    assert initial_feature["id"] == "urn:nws:vtec:2025:KOHX:TO:W:0042"
+    assert followup_feature["id"] == initial_feature["id"]
+    assert followup_feature["properties"]["expires"] == "2026-01-01T00:05:00Z"
+
+
+@pytest.mark.parametrize("action", ["CON", "CAN", "EXP", "EXT"])
+def test_zero_time_followup_uses_current_year_after_january_grace_window(action: str) -> None:
+    product = parse_nwws_stanza(
+        OFFICIAL_STANZA.replace(b"2026-09-05T01:00:00Z", b"2026-01-08T00:05:00Z")
+        .replace(b"WFUS54 KOHX 050100", b"WFUS54 KOHX 080005")
+        .replace(b".NEW.", f".{action}.".encode())
+        .replace(b"260905T0100Z-260905T0200Z", b"000000T0000Z-000000T0000Z")
+    )
+    assert isinstance(product, NWWSProduct)
+
+    feature = project_to_feature(product)
+
+    assert feature is not None
+    assert feature["id"] == "urn:nws:vtec:2026:KOHX:TO:W:0042"
 
 
 @pytest.mark.parametrize(

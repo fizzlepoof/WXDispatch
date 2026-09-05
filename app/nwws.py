@@ -18,12 +18,15 @@ _SAFE_OFFICE = re.compile(r"[A-Z]{4}")
 _SAFE_WMO = re.compile(r"[A-Z]{4}[0-9]{2}")
 _SAFE_AWIPS = re.compile(r"[A-Z0-9]{3,9}")
 _SAFE_PROCESS = re.compile(r"[A-Za-z0-9_-]{1,64}")
-_WMO_HEADER = re.compile(r"([A-Z]{4}[0-9]{2})[ \t]+([A-Z]{4})[ \t]+([0-9]{6})")
+_WMO_HEADER = re.compile(
+    r"([A-Z]{4}[0-9]{2})[ \t]+([A-Z]{4})[ \t]+([0-9]{6})"
+    r"(?:[ \t]+(?:COR|AMD|(?:AA|CC|RR)[A-X]))?"
+)
 _SEQUENCE_HEADER = re.compile(r"[0-9]{3}")
 _VALID_UGC_AREAS = frozenset(
-    "AL AK AS AZ AR CA CO CT DE DC FL GA GU HI ID IL IN IA KS KY LA ME MD MA MI "
-    "MN MS MO MT NE NV NH NJ NM NY NC ND MP OH OK OR PA PR RI SC SD TN TX UT VT "
-    "VA VI WA WV WI WY".split()
+    "AL AK AM AN AS AZ AR CA CO CT DE DC FL GA GM GU HI ID IL IN IA KS KY LA LC LE "
+    "LH LM LO LS ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND MP OH OK OR PA PK "
+    "PM PH PR PZ RI SC SD SL TN TX UT VT VA VI WA WV WI WY".split()
 )
 
 
@@ -70,18 +73,27 @@ class SequenceDecision:
 class SequenceTracker:
     """Track a bounded window of stream IDs for one NWWS process."""
 
-    def __init__(self, max_seen: int = 256):
+    def __init__(self, max_seen: int = 256, max_retired: int = 64):
         if not 1 <= max_seen <= 4096:
             raise ValueError("max_seen must be between 1 and 4096")
+        if not 1 <= max_retired <= 4096:
+            raise ValueError("max_retired must be between 1 and 4096")
         self._max_seen = max_seen
+        self._max_retired = max_retired
         self._process_id: str | None = None
         self._last_sequence: int | None = None
         self._seen_order: deque[str] = deque()
         self._seen: set[str] = set()
+        self._retired_order: deque[str] = deque()
+        self._retired: set[str] = set()
 
     @property
     def seen_count(self) -> int:
         return len(self._seen)
+
+    @property
+    def retired_count(self) -> int:
+        return len(self._retired)
 
     def observe(self, item: NWWSProduct | str) -> SequenceDecision:
         stream_id = item.stream_id if isinstance(item, NWWSProduct) else item
@@ -100,8 +112,16 @@ class SequenceTracker:
         if sequence > 2_147_483_647:
             raise ValueError("invalid stream id")
 
+        if process_id in self._retired:
+            return SequenceDecision(stream_id=stream_id, accepted=False, replay=True)
+
         changed = self._process_id is not None and process_id != self._process_id
         if process_id != self._process_id:
+            if self._process_id is not None:
+                self._retired.add(self._process_id)
+                self._retired_order.append(self._process_id)
+                while len(self._retired_order) > self._max_retired:
+                    self._retired.discard(self._retired_order.popleft())
             self._process_id = process_id
             self._last_sequence = None
             self._seen_order.clear()
@@ -340,6 +360,17 @@ def parse_vtec(text: str) -> VTEC | None:
 
 def parse_product_metadata(text: str) -> ProductMetadata:
     text = _bounded_product_text(text)
+    actionable_segments = 0
+    for segment in re.split(r"(?m)^[ \t]*\$\$[ \t]*$", text):
+        segment_vtec = parse_vtec(segment)
+        if (
+            segment_vtec is not None
+            and segment_vtec.action in _ACTION_MESSAGE_TYPES
+            and parse_ugc(segment)
+        ):
+            actionable_segments += 1
+            if actionable_segments > 1:
+                raise NWWSParseError("multiple actionable operational segments")
     vtec = parse_vtec(text)
     event = friendly_event_name(vtec.phenomena, vtec.significance) if vtec else ""
     return ProductMetadata(ugc=parse_ugc(text), vtec=vtec, event=event)
@@ -394,6 +425,8 @@ _ACTION_MESSAGE_TYPES = {
     "EXA": "Update",
     "EXB": "Update",
 }
+_ZERO_TIME_FOLLOWUP_ACTIONS = frozenset({"CON", "CAN", "EXP", "EXT"})
+_PREVIOUS_YEAR_GRACE_DAYS = 7
 
 
 def _iso_z(value: datetime) -> str | None:
@@ -401,6 +434,22 @@ def _iso_z(value: datetime) -> str | None:
     if offset is None or offset.total_seconds() != 0:
         return None
     return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _vtec_event_year(vtec: VTEC, issue: datetime) -> int:
+    """Resolve the yearly ETN namespace using deterministic VTEC evidence."""
+    if vtec.start is not None:
+        return vtec.start.year
+    if vtec.end is not None:
+        return vtec.end.year
+    if (
+        vtec.action in _ZERO_TIME_FOLLOWUP_ACTIONS
+        and issue.month == 1
+        and issue.day <= _PREVIOUS_YEAR_GRACE_DAYS
+        and issue.year > 1
+    ):
+        return issue.year - 1
+    return issue.year
 
 
 def project_to_feature(product: NWWSProduct) -> dict | None:
@@ -447,16 +496,20 @@ def project_to_feature(product: NWWSProduct) -> dict | None:
     except (NWWSParseError, TypeError, ValueError):
         return None
     vtec = metadata.vtec
-    if vtec is None or not metadata.event or not metadata.ugc or vtec.end is None:
+    if vtec is None or not metadata.event or not metadata.ugc:
         return None
     message_type = _ACTION_MESSAGE_TYPES.get(vtec.action)
-    expires = _iso_z(vtec.end)
+    if message_type is None:
+        return None
+    expires = _iso_z(vtec.end) if vtec.end is not None else issued
     onset = _iso_z(vtec.start) if vtec.start is not None else issued
     if issued is None or expires is None or onset is None:
         return None
+    if vtec.end is None and vtec.action not in _ZERO_TIME_FOLLOWUP_ACTIONS:
+        return None
 
     stream_id = product.stream_id
-    event_year = vtec.start.year if vtec.start is not None else product.issue_time.year
+    event_year = _vtec_event_year(vtec, product.issue_time)
     try:
         correlation_key = vtec_correlation_key(vtec, event_year)
         canonical_vtec = _canonical_vtec(vtec)
@@ -465,7 +518,7 @@ def project_to_feature(product: NWWSProduct) -> dict | None:
     event = metadata.event[:80]
     area_desc = "; ".join(metadata.ugc)[:2048]
     headline = f"{event} issued by NWS {product.issuing_office}"[:160]
-    if message_type is None or not area_desc:
+    if not area_desc:
         return None
     return {
         "id": correlation_key,
@@ -497,7 +550,7 @@ def project_to_feature(product: NWWSProduct) -> dict | None:
                 "VTECSignificance": [vtec.significance],
                 "VTECEventTrackingNumber": [f"{vtec.etn:04d}"],
                 "VTECStartTime": [_iso_z(vtec.start) if vtec.start is not None else ""],
-                "VTECEndTime": [expires],
+                "VTECEndTime": [_iso_z(vtec.end) if vtec.end is not None else ""],
             },
         },
     }
@@ -554,7 +607,7 @@ def _utc_datetime(value: str) -> datetime:
 
 
 def _validate_product_headers(
-    text: str, *, ttaaii: str, cccc: str, awipsid: str
+    text: str, *, ttaaii: str, cccc: str, awipsid: str, issue: datetime
 ) -> None:
     """Validate the authoritative WMO and AWIPS lines at the product start."""
     lines = text.splitlines()
@@ -577,6 +630,8 @@ def _validate_product_headers(
         raise NWWSParseError("invalid product headers")
     if (product_ttaaii, product_cccc, product_awips) != (ttaaii, cccc, awipsid):
         raise NWWSParseError("product header mismatch")
+    if ddhhmm != issue.strftime("%d%H%M"):
+        raise NWWSParseError("product header timestamp mismatch")
 
 
 def parse_nwws_stanza(stanza: bytes | str) -> NWWSProduct | NWWSHistory:
@@ -637,7 +692,9 @@ def parse_nwws_stanza(stanza: bytes | str) -> NWWSProduct | NWWSHistory:
     if not raw_text:
         raise NWWSParseError("empty product text")
     raw_text = _bounded_product_text(raw_text)
-    _validate_product_headers(raw_text, ttaaii=wmo_id, cccc=office, awipsid=awips_id)
+    _validate_product_headers(
+        raw_text, ttaaii=wmo_id, cccc=office, awipsid=awips_id, issue=issue
+    )
 
     return NWWSProduct(
         issuing_office=office,
