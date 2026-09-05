@@ -9,8 +9,11 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from types import MappingProxyType
 from typing import Final
+
+from app.noaa_same_counties import SAME_COUNTY_FIPS
 
 
 _HEADER_PATTERN = (
@@ -91,7 +94,70 @@ SAME_EVENT_NAMES: Final = MappingProxyType(
         "WSW": "Winter Storm Warning",
     }
 )
+
+
+class SameEventClassification(str, Enum):
+    """Closed routing classification for a SAME event code."""
+
+    EMERGENCY = "emergency"
+    ALERT = "alert"
+    ADVISORY = "advisory"
+    STATEMENT = "statement"
+    TEST = "test"
+    ADMINISTRATIVE = "administrative"
+    TERMINATION = "termination"
+    UNKNOWN = "unknown"
+
+
+class SameLocationScope(str, Enum):
+    """Geographic scope represented by one raw PSSCCC location code."""
+
+    NATIONAL = "national"
+    STATE = "state"
+    COUNTY = "county"
+    INVALID = "invalid"
+
+
+_EMERGENCY_EVENT_CODES = frozenset(
+    {
+        "AVW", "BHW", "BLU", "BOE", "BZW", "CAE", "CDW", "CEM", "CFW",
+        "CHW", "DSW", "DWW", "EAN", "EQW", "EVI", "EWW", "FCW", "FFW",
+        "FLW", "FRW", "FSW", "HMW", "HUW", "HWW", "IBW", "IFW", "LAE",
+        "LEW", "LSW", "NUW", "RHW", "SMW", "SPW", "SQW", "SSW", "SVR",
+        "TOE", "TOR", "TRW", "TSW", "VOW", "WFW", "WSW",
+    }
+)
+_ALERT_EVENT_CODES = frozenset(
+    {
+        "AVA", "CFA", "FFA", "FLA", "HUA", "HWA",
+        "SSA", "SVA", "TOA", "TRA", "TSA", "WSA",
+    }
+)
+_ADVISORY_EVENT_CODES = frozenset({"SPS"})
+_STATEMENT_EVENT_CODES = frozenset({"FFS", "FLS", "HLS", "SVS"})
 _TEST_EVENT_CODES = frozenset({"DMO", "NPT", "RMT", "RWT"})
+_ADMINISTRATIVE_EVENT_CODES = frozenset({"ADR"})
+_TERMINATION_EVENT_CODES = frozenset({"EAT"})
+
+
+def _classify_event(code: str) -> SameEventClassification:
+    if code in _EMERGENCY_EVENT_CODES:
+        return SameEventClassification.EMERGENCY
+    if code in _ALERT_EVENT_CODES:
+        return SameEventClassification.ALERT
+    if code in _ADVISORY_EVENT_CODES:
+        return SameEventClassification.ADVISORY
+    if code in _STATEMENT_EVENT_CODES:
+        return SameEventClassification.STATEMENT
+    if code in _TEST_EVENT_CODES:
+        return SameEventClassification.TEST
+    if code in _ADMINISTRATIVE_EVENT_CODES:
+        return SameEventClassification.ADMINISTRATIVE
+    if code in _TERMINATION_EVENT_CODES:
+        return SameEventClassification.TERMINATION
+    return SameEventClassification.UNKNOWN
+
+
 SAME_STATE_FIPS_TO_POSTAL: Final = MappingProxyType(
     {
         "01": "AL", "02": "AK", "04": "AZ", "05": "AR", "06": "CA",
@@ -163,6 +229,53 @@ class SameEndMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class SameLocation:
+    """A parsed SAME PSSCCC location with fail-closed county validation."""
+
+    raw_code: str
+    partition: int
+    state_fips: str
+    county_fips: str
+    scope: SameLocationScope
+    state_postal: str | None
+    county_ugc: str | None
+
+
+def _parse_location(raw_code: str) -> SameLocation:
+    partition = int(raw_code[0])
+    state_fips = raw_code[1:3]
+    county_fips = raw_code[3:]
+    state_postal = SAME_STATE_FIPS_TO_POSTAL.get(state_fips)
+    scope = SameLocationScope.INVALID
+    county_ugc = None
+
+    if raw_code == "000000":
+        scope = SameLocationScope.NATIONAL
+        state_postal = None
+    elif partition == 0 and county_fips == "000" and state_postal is not None:
+        scope = SameLocationScope.STATE
+    elif (
+        county_fips != "000"
+        and state_postal is not None
+        and county_fips in SAME_COUNTY_FIPS.get(state_fips, ())
+    ):
+        scope = SameLocationScope.COUNTY
+        county_ugc = f"{state_postal}C{county_fips}"
+    else:
+        state_postal = None
+
+    return SameLocation(
+        raw_code=raw_code,
+        partition=partition,
+        state_fips=state_fips,
+        county_fips=county_fips,
+        scope=scope,
+        state_postal=state_postal,
+        county_ugc=county_ugc,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class SameObservation:
     """An immutable, validated SAME start-header observation."""
 
@@ -171,13 +284,20 @@ class SameObservation:
     event_code: str
     event_name: str
     locations: tuple[str, ...]
+    location_details: tuple[SameLocation, ...]
+    location_scopes: tuple[SameLocationScope, ...]
+    is_national: bool
+    state_postals: tuple[str, ...]
     county_ugcs: tuple[str, ...]
+    invalid_locations: tuple[str, ...]
     purge_duration: timedelta
     issued_at: datetime
     expires_at: datetime
     sender: str
+    event_classification: SameEventClassification
     is_test: bool
     is_emergency: bool
+    route_eligible: bool
 
 
 class SameRepeatConfirmer:
@@ -236,7 +356,8 @@ class SameRepeatConfirmer:
             accepted_at is not None
             and 0 <= current - accepted_at < self.duplicate_suppression
         ):
-            self._reset_candidate()
+            if self._candidate_header == result.raw_header:
+                self._reset_candidate()
             return None
         if accepted_at is not None:
             del self._recent[result.raw_header]
@@ -287,13 +408,32 @@ def parse_same(
     duration = _parse_duration(duration_code)
     issued_code = match.group("issued")
     issued = _resolve_issued_at(issued_code, now)
+    location_details = tuple(_parse_location(location) for location in locations)
+    location_scopes = tuple(location.scope for location in location_details)
+    state_postals = tuple(
+        location.state_postal
+        for location in location_details
+        if location.scope is SameLocationScope.STATE and location.state_postal is not None
+    )
     county_ugcs = tuple(
-        f"{SAME_STATE_FIPS_TO_POSTAL[location[1:3]]}C{location[3:]}"
-        for location in locations
-        if location[1:3] in SAME_STATE_FIPS_TO_POSTAL
+        location.county_ugc
+        for location in location_details
+        if location.scope is SameLocationScope.COUNTY and location.county_ugc is not None
+    )
+    invalid_locations = tuple(
+        location.raw_code
+        for location in location_details
+        if location.scope is SameLocationScope.INVALID
     )
     event_code = match.group("event")
-    is_test = event_code in _TEST_EVENT_CODES
+    event_classification = _classify_event(event_code)
+    is_emergency = event_classification in {
+        SameEventClassification.EMERGENCY,
+        SameEventClassification.ALERT,
+    }
+    route_eligible = is_emergency and any(
+        scope is not SameLocationScope.INVALID for scope in location_scopes
+    )
     return SameObservation(
         raw_header=match.group("header"),
         originator=match.group("originator"),
@@ -302,11 +442,18 @@ def parse_same(
             event_code, f"Unknown SAME event {event_code}"
         ),
         locations=locations,
+        location_details=location_details,
+        location_scopes=location_scopes,
+        is_national=SameLocationScope.NATIONAL in location_scopes,
+        state_postals=state_postals,
         county_ugcs=county_ugcs,
+        invalid_locations=invalid_locations,
         purge_duration=duration,
         issued_at=issued,
         expires_at=issued + duration,
         sender=match.group("sender"),
-        is_test=is_test,
-        is_emergency=not is_test,
+        event_classification=event_classification,
+        is_test=event_classification is SameEventClassification.TEST,
+        is_emergency=is_emergency,
+        route_eligible=route_eligible,
     )

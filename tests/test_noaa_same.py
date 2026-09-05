@@ -6,8 +6,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.noaa_same import (
+    SAME_COUNTY_FIPS,
+    SAME_EVENT_NAMES,
     SAME_STATE_FIPS_TO_POSTAL,
+    SameEventClassification,
     SameEndMessage,
+    SameLocationScope,
     SameObservation,
     SameRepeatConfirmer,
     parse_same,
@@ -50,6 +54,61 @@ def test_parses_multiple_locations_and_routes_only_known_fips() -> None:
     assert result.county_ugcs == ("TNC125", "ALC001")
 
 
+def test_models_national_location_without_fabricating_a_county() -> None:
+    result = parse_same(
+        "ZCZC-PEP-EAN-000000+0030-2491830-PEP00000-",
+        now=datetime(2026, 9, 6, 18, 31, tzinfo=UTC),
+    )
+
+    assert result.locations == ("000000",)
+    assert result.location_scopes == (SameLocationScope.NATIONAL,)
+    assert result.location_details[0].raw_code == "000000"
+    assert result.location_details[0].scope is SameLocationScope.NATIONAL
+    assert result.is_national is True
+    assert result.state_postals == ()
+    assert result.county_ugcs == ()
+    assert result.invalid_locations == ()
+
+
+def test_models_statewide_location_without_fabricating_a_county() -> None:
+    result = parse_same(
+        "ZCZC-WXR-TOR-047000+0030-2491830-KOHX/NWS-",
+        now=datetime(2026, 9, 6, 18, 31, tzinfo=UTC),
+    )
+
+    assert result.location_scopes == (SameLocationScope.STATE,)
+    assert result.location_details[0].state_fips == "47"
+    assert result.location_details[0].state_postal == "TN"
+    assert result.state_postals == ("TN",)
+    assert result.county_ugcs == ()
+    assert result.invalid_locations == ()
+
+
+def test_invalid_county_is_preserved_but_not_made_route_eligible() -> None:
+    result = parse_same(
+        "ZCZC-WXR-TOR-047999-147000-099999+0030-2491830-KOHX/NWS-",
+        now=datetime(2026, 9, 6, 18, 31, tzinfo=UTC),
+    )
+
+    assert result.locations == ("047999", "147000", "099999")
+    assert result.location_scopes == (
+        SameLocationScope.INVALID,
+        SameLocationScope.INVALID,
+        SameLocationScope.INVALID,
+    )
+    assert result.county_ugcs == ()
+    assert result.state_postals == ()
+    assert result.invalid_locations == ("047999", "147000", "099999")
+    assert result.route_eligible is False
+
+
+def test_county_validation_data_covers_all_tennessee_counties_and_is_immutable() -> None:
+    assert len(SAME_COUNTY_FIPS["47"]) == 95
+    assert {"001", "125", "189"} <= SAME_COUNTY_FIPS["47"]
+    with pytest.raises(TypeError):
+        SAME_COUNTY_FIPS["47"] = frozenset()  # type: ignore[index]
+
+
 def test_state_fips_map_is_complete_and_read_only() -> None:
     assert len(SAME_STATE_FIPS_TO_POSTAL) == 57
     assert SAME_STATE_FIPS_TO_POSTAL["11"] == "DC"
@@ -58,6 +117,8 @@ def test_state_fips_map_is_complete_and_read_only() -> None:
     assert SAME_STATE_FIPS_TO_POSTAL["72"] == "PR"
     assert SAME_STATE_FIPS_TO_POSTAL["74"] == "UM"
     assert SAME_STATE_FIPS_TO_POSTAL["78"] == "VI"
+    with pytest.raises(TypeError):
+        SAME_STATE_FIPS_TO_POSTAL["47"] = "XX"  # type: ignore[index]
 
 
 def test_accepts_a_bounded_decoder_prefix_and_line_whitespace() -> None:
@@ -114,6 +175,25 @@ def test_rejects_invalid_purge_durations(duration: str) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("duration", "expected"),
+    [
+        ("0015", timedelta(minutes=15)),
+        ("0045", timedelta(minutes=45)),
+        ("0100", timedelta(hours=1)),
+        ("0530", timedelta(hours=5, minutes=30)),
+        ("0600", timedelta(hours=6)),
+    ],
+)
+def test_accepts_purge_duration_boundaries(duration: str, expected: timedelta) -> None:
+    result = parse_same(
+        f"ZCZC-WXR-TOR-047125+{duration}-2491830-KOHX/NWS-",
+        now=datetime(2026, 9, 6, 18, 31, tzinfo=UTC),
+    )
+
+    assert result.purge_duration == expected
+
+
 @pytest.mark.parametrize("issued", ["0001830", "3671830", "2492430", "2491860"])
 def test_rejects_invalid_julian_dates_and_clock_times(issued: str) -> None:
     with pytest.raises(ValueError):
@@ -160,6 +240,33 @@ def test_rejects_implausibly_old_future_or_nonleap_headers(issued: str) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("issued", "now"),
+    [
+        ("2481830", datetime(2026, 9, 6, 18, 30, tzinfo=UTC)),
+        ("2491845", datetime(2026, 9, 6, 18, 30, tzinfo=UTC)),
+    ],
+)
+def test_accepts_header_age_and_future_skew_boundaries(
+    issued: str, now: datetime
+) -> None:
+    result = parse_same(
+        f"ZCZC-WXR-TOR-047125+0030-{issued}-KOHX/NWS-",
+        now=now,
+    )
+
+    assert isinstance(result, SameObservation)
+
+
+@pytest.mark.parametrize("issued", ["2481829", "2491846"])
+def test_rejects_just_outside_header_time_boundaries(issued: str) -> None:
+    with pytest.raises(ValueError, match="implausible"):
+        parse_same(
+            f"ZCZC-WXR-TOR-047125+0030-{issued}-KOHX/NWS-",
+            now=datetime(2026, 9, 6, 18, 30, tzinfo=UTC),
+        )
+
+
 def test_requires_an_aware_now() -> None:
     with pytest.raises(ValueError, match="aware"):
         parse_same(
@@ -199,6 +306,64 @@ def test_preserves_unknown_valid_event_code() -> None:
 
     assert result.event_code == "XYZ"
     assert result.event_name == "Unknown SAME event XYZ"
+    assert result.event_classification is SameEventClassification.UNKNOWN
+    assert result.is_emergency is False
+    assert result.route_eligible is False
+
+
+@pytest.mark.parametrize(
+    ("code", "classification"),
+    [
+        ("ADR", SameEventClassification.ADMINISTRATIVE),
+        ("EAT", SameEventClassification.TERMINATION),
+        ("FFS", SameEventClassification.STATEMENT),
+        ("FLS", SameEventClassification.STATEMENT),
+        ("HLS", SameEventClassification.STATEMENT),
+        ("SPS", SameEventClassification.ADVISORY),
+        ("SVS", SameEventClassification.STATEMENT),
+        ("RWT", SameEventClassification.TEST),
+        ("123", SameEventClassification.UNKNOWN),
+        ("A1B", SameEventClassification.UNKNOWN),
+    ],
+)
+def test_non_emergency_events_fail_closed(
+    code: str, classification: SameEventClassification
+) -> None:
+    result = parse_same(
+        f"ZCZC-WXR-{code}-047125+0030-2491830-KOHX/NWS-",
+        now=datetime(2026, 9, 6, 18, 31, tzinfo=UTC),
+    )
+
+    assert result.event_classification is classification
+    assert result.is_emergency is False
+    assert result.route_eligible is False
+
+
+@pytest.mark.parametrize(
+    ("code", "classification"),
+    [
+        ("TOR", SameEventClassification.EMERGENCY),
+        ("SVR", SameEventClassification.EMERGENCY),
+        ("TOA", SameEventClassification.ALERT),
+        ("FFA", SameEventClassification.ALERT),
+    ],
+)
+def test_only_vetted_hazard_events_are_route_eligible(
+    code: str, classification: SameEventClassification
+) -> None:
+    result = parse_same(
+        f"ZCZC-WXR-{code}-047125+0030-2491830-KOHX/NWS-",
+        now=datetime(2026, 9, 6, 18, 31, tzinfo=UTC),
+    )
+
+    assert result.event_classification is classification
+    assert result.is_emergency is True
+    assert result.route_eligible is True
+
+
+def test_event_name_mapping_is_immutable() -> None:
+    with pytest.raises(TypeError):
+        SAME_EVENT_NAMES["XYZ"] = "Injected event"  # type: ignore[index]
 
 
 def test_required_weekly_test_flags_test_not_emergency() -> None:
@@ -276,6 +441,41 @@ def test_accepted_duplicates_are_suppressed_then_require_reconfirmation() -> Non
     assert confirmer.process(observation, monotonic_now=3.0) is None
     assert confirmer.process(observation, monotonic_now=12.0) is None
     assert confirmer.process(observation, monotonic_now=13.0) == observation
+
+
+def test_duplicate_suppression_expires_at_exact_boundary() -> None:
+    confirmer = SameRepeatConfirmer(
+        confirmation_window=5.0, duplicate_suppression=10.0
+    )
+    observation = _observation()
+
+    assert confirmer.process(observation, monotonic_now=0.0) is None
+    assert confirmer.process(observation, monotonic_now=1.0) == observation
+    assert confirmer.process(observation, monotonic_now=10.999) is None
+    assert confirmer.process(observation, monotonic_now=11.0) is None
+    assert confirmer.process(observation, monotonic_now=12.0) == observation
+
+
+def test_repeat_confirmation_accepts_exact_window_boundary() -> None:
+    confirmer = SameRepeatConfirmer(confirmation_window=5.0)
+    observation = _observation()
+
+    assert confirmer.process(observation, monotonic_now=10.0) is None
+    assert confirmer.process(observation, monotonic_now=15.0) == observation
+
+
+def test_suppressed_duplicate_does_not_clear_a_different_pending_header() -> None:
+    confirmer = SameRepeatConfirmer(
+        confirmation_window=5.0, duplicate_suppression=10.0
+    )
+    stale = _observation("TOR")
+    pending = _observation("SVR")
+
+    assert confirmer.process(stale, monotonic_now=0.0) is None
+    assert confirmer.process(stale, monotonic_now=1.0) == stale
+    assert confirmer.process(pending, monotonic_now=2.0) is None
+    assert confirmer.process(stale, monotonic_now=3.0) is None
+    assert confirmer.process(pending, monotonic_now=4.0) == pending
 
 
 def test_end_of_message_resets_pending_confirmation() -> None:
