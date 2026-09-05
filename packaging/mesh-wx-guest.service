@@ -1,5 +1,5 @@
 [Unit]
-Description=WXDispatch password-protected guest alert map
+Description=WXDispatch password-protected guest view
 After=network-online.target mesh-wx.service
 Wants=network-online.target
 Requires=mesh-wx.service
@@ -10,6 +10,7 @@ User=__USER__
 Group=__GROUP__
 WorkingDirectory=__DIR__
 Environment=MESH_WX_GUEST_PASSWORD_FILE=/etc/mesh-wx/guest-password
+Environment=MESH_WX_GUEST_DB=__DIR__/data/mesh-wx.db
 ExecStart=__DIR__/.venv/bin/python -m app.guest
 Restart=on-failure
 RestartSec=5

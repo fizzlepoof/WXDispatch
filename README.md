@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <b>Status: v2.4.2.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
+  <b>Status: v2.4.3.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
 </p>
 
 ---
@@ -277,12 +277,16 @@ derive the same key. **Load all channels** reads every device-reported slot, inc
 in one operation. That inventory requires administrator authentication because it reveals all exact
 hash-channel names; channel keys are never returned or displayed.
 
-### Password-protected guest map
+### Password-protected guest view
 
-The optional **WXDispatch guest view** is a separate read-only process with only three routes:
-the regional alert map at `/`, its map-data endpoint, and `/healthz`. It contains no dashboard,
-history, routing, settings, transmission, troubleshooting, write, OpenAPI, or documentation routes.
-Run it with `mesh-wx-guest.service`; the backend authenticates HTTP Basic username `guest`.
+The optional **WXDispatch guest view** is a separate read-only process with exactly six routes:
+the guest dashboard at `/`, regional alert map at `/map`, NOAA history at `/history`, IPAWS history
+at `/ipaws`, the fixed map-data endpoint, and `/healthz`. The dashboard and history pages are
+presentation-only: history is queried through a bounded SQLite `mode=ro` connection, internal
+identifiers, sender addresses, and stored error details are omitted, and no guest request can alter
+routing, delivery state, alert history, or radio state. It contains no transmit log, routing, settings,
+manual transmission, troubleshooting, write, OpenAPI, or documentation routes. Run it with
+`mesh-wx-guest.service`; the backend authenticates HTTP Basic username `guest`.
 
 For public access, put the guest process behind HTTPS and use **Pangolin header authentication**
 in extended compatibility mode. Pangolin challenges for HTTP Basic username `guest` and passes the

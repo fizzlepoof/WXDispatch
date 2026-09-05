@@ -1,0 +1,10 @@
+{% extends "guest_base.html" %}
+{% block head %}<style>.record{padding:16px 0;border-top:1px solid var(--line)}.record:first-of-type{border-top:0}.record-head{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}.record-title{font-weight:800;font-size:1.05rem}.record-meta,.record-detail{color:var(--muted);font-size:.88rem}.record-text{margin-top:9px;padding:10px 12px;background:var(--inset);border-radius:9px;white-space:pre-wrap}.status{font-size:.75rem;font-weight:800;text-transform:uppercase;color:var(--accent)}</style>{% endblock %}
+{% block content %}
+<div class="topbar"><div><h1 class="pt">IPAWS Alerts</h1><p class="sub">Read-only public-safety alert history from FEMA IPAWS.</p></div></div>
+<section class="panel">
+{% for row in ipaws_rows %}
+<article class="record"><div class="record-head"><div class="record-title">{{ row.event or 'IPAWS alert' }}</div><div class="status">{{ row.msg_type or row.status or 'alert' }}</div></div><div class="record-meta">{{ row.ts|localtime(tz) }}{% if row.area %} &middot; {{ row.area }}{% endif %}</div>{% if row.headline %}<div class="record-detail">{{ row.headline }}</div>{% endif %}{% if row.text %}<div class="record-text">{{ row.text }}</div>{% endif %}</article>
+{% else %}<p class="hint">No IPAWS alerts yet.</p>{% endfor %}
+</section>
+{% endblock %}

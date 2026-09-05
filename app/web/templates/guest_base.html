@@ -22,12 +22,14 @@
     .guest-brand{font-size:1.25rem;font-weight:800}.guest-brand small{display:block;color:#b7c0e3;font-size:.72rem;font-weight:500;letter-spacing:.05em;text-transform:uppercase}
     main{max-width:1320px;margin:auto;padding:24px 20px 40px}.panel{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);padding:18px 20px;margin-bottom:18px}.topbar{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;margin-bottom:18px}.topbar .pt{margin:0;font-size:22px}.topbar .sub{margin:3px 0 0;color:var(--muted);font-size:13.5px}.hint{color:var(--muted);font-size:13px}.health-banner{border-radius:12px;padding:13px 16px;margin-bottom:16px;border:1px solid}.health-banner.warn{background:rgba(245,165,36,.12);border-color:rgba(245,165,36,.5)}
     .theme-toggle{background:rgba(255,255,255,.12);color:#fff;border:1px solid rgba(255,255,255,.2);border-radius:9px;padding:8px 12px;cursor:pointer;font:inherit;font-weight:600}.guest-version{color:#b7c0e3;font-size:.78rem;margin-left:8px}
+    .guest-nav{display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:8px max(20px,calc((100vw - 1320px)/2));background:var(--card);border-bottom:1px solid var(--line)}.guest-nav a{display:block;padding:8px 11px;border-radius:8px;color:var(--ink);font-size:.88rem;font-weight:700;text-decoration:none}.guest-nav a:hover{background:var(--inset);color:var(--accent)}
     :root[data-theme="dark"] .leaflet-control-zoom a{background:var(--card);color:var(--ink);border-bottom-color:var(--line)}:root[data-theme="dark"] .leaflet-control-attribution{background:rgba(22,29,46,.96);color:var(--ink)}:root[data-theme="dark"] .dark-map-labels{filter:brightness(1.45) contrast(1.15)}:root[data-theme="dark"] .leaflet-popup-content-wrapper,:root[data-theme="dark"] .leaflet-popup-tip{background:var(--card);color:var(--ink)}
   </style>
   {% block head %}{% endblock %}
 </head>
 <body>
   <header class="guest-header"><div class="guest-brand">WXDispatch<small>Guest alert view</small></div><div><button class="theme-toggle" id="theme-toggle" type="button">Switch theme</button><span class="guest-version">v{{ version }}</span></div></header>
+  <nav class="guest-nav" aria-label="Guest navigation"><a href="/">Dashboard</a><a href="/map">Local Alert Map</a><a href="/history">NOAA History</a><a href="/ipaws">IPAWS History</a></nav>
   <main>{% block content %}{% endblock %}</main>
   <script>
     (function(){var toggle=document.getElementById('theme-toggle');toggle.addEventListener('click',function(){var theme=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=theme;try{localStorage.setItem('wxdispatch-theme',theme)}catch(e){}window.dispatchEvent(new CustomEvent('wxdispatch:themechange',{detail:{theme:theme}}))})})();

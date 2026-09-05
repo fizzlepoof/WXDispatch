@@ -1,0 +1,40 @@
+{% extends "guest_base.html" %}
+{% block head %}
+<style>
+  .guest-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.wide{grid-column:1/-1}.panel-title{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.panel-title h2,.panel-title h3{margin:0}.alert-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}.alert-card{border:1px solid var(--line);border-left:5px solid #ed8b22;border-radius:12px;padding:14px;background:var(--inset)}.alert-card.severe,.alert-card.extreme{border-left-color:#d83b3b}.alert-event{font-weight:800;font-size:1.05rem}.alert-area{margin-top:5px}.alert-headline,.alert-meta{color:var(--muted);font-size:.86rem;margin-top:6px}.unavailable{padding:14px;border-radius:10px;background:rgba(220,130,30,.12);color:#a86413;font-weight:700}.empty{color:var(--muted);padding:8px 0}.record{padding:13px 0;border-top:1px solid var(--line)}.record:first-of-type{border-top:0}.record-title{font-weight:750}.record-meta,.record-text{font-size:.87rem;color:var(--muted);margin-top:3px}.record-text{color:var(--ink)}
+  @media(max-width:800px){.guest-grid{grid-template-columns:1fr}.wide{grid-column:auto}}
+</style>
+{% endblock %}
+{% block content %}
+<div class="topbar"><div><h1 class="pt">Dashboard</h1><p class="sub">Current watched alerts and recent public alert history.</p></div></div>
+<div class="guest-grid">
+  <section class="panel wide">
+    <div class="panel-title"><h2>Active alerts</h2><a href="/map">View map &rarr;</a></div>
+    {% if active_alerts %}
+    <div class="alert-grid">
+      {% for alert in active_alerts %}
+      <article class="alert-card {{ (alert.severity or 'unknown')|lower }}">
+        <div class="alert-event">{{ alert.event or 'NWS alert' }}</div>
+        <div class="alert-area">{{ alert.local_counties|default([])|join(', ') or alert.area or 'Watched area' }}</div>
+        {% if alert.headline %}<div class="alert-headline">{{ alert.headline }}</div>{% endif %}
+        {% if alert.ends or alert.expires %}<div class="alert-meta">Valid through {{ (alert.ends or alert.expires)|localtime(tz) }}</div>{% endif %}
+      </article>
+      {% endfor %}
+    </div>
+    {% elif alerts_unavailable %}<div class="unavailable">Active alert status is temporarily unavailable.</div>
+    {% else %}<div class="empty">No active alerts for watched counties.</div>{% endif %}
+  </section>
+  <section class="panel">
+    <div class="panel-title"><h3>Recent NOAA alerts</h3><a href="/history">View all &rarr;</a></div>
+    {% for row in noaa_rows %}
+    <article class="record"><div class="record-title">{{ row.event or 'NOAA alert' }}</div><div class="record-meta">{{ row.ts|localtime(tz) }}{% if row.area %} &middot; {{ row.area }}{% endif %}</div>{% if row.transmitted_text %}<div class="record-text">{{ row.transmitted_text }}</div>{% endif %}</article>
+    {% else %}<div class="empty">No NOAA history yet.</div>{% endfor %}
+  </section>
+  <section class="panel">
+    <div class="panel-title"><h3>Recent IPAWS alerts</h3><a href="/ipaws">View all &rarr;</a></div>
+    {% for row in ipaws_rows %}
+    <article class="record"><div class="record-title">{{ row.event or 'IPAWS alert' }}</div><div class="record-meta">{{ row.ts|localtime(tz) }}{% if row.area %} &middot; {{ row.area }}{% endif %}</div>{% if row.text %}<div class="record-text">{{ row.text }}</div>{% endif %}</article>
+    {% else %}<div class="empty">No IPAWS history yet.</div>{% endfor %}
+  </section>
+</div>
+{% endblock %}
