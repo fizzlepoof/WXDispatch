@@ -1,0 +1,30 @@
+[Unit]
+Description=WXDispatch password-protected guest alert map
+After=network-online.target mesh-wx.service
+Wants=network-online.target
+Requires=mesh-wx.service
+
+[Service]
+Type=simple
+User=__USER__
+Group=__GROUP__
+WorkingDirectory=__DIR__
+Environment=MESH_WX_GUEST_PASSWORD_FILE=/etc/mesh-wx/guest-password
+ExecStart=__DIR__/.venv/bin/python -m app.guest
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

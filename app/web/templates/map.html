@@ -1,4 +1,4 @@
-{% extends "base.html" %}
+{% extends "guest_base.html" if guest_view|default(false) else "base.html" %}
 {% block title %} &middot; Local Alert Map{% endblock %}
 {% block head %}
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
@@ -96,7 +96,7 @@
     if(data.stale)list.appendChild(el('p','NWS data is stale; displayed alerts may not reflect current conditions.','health-banner warn'));
     if(data.zone_errors.length)list.appendChild(el('p','Some county boundaries could not load ('+data.zone_errors.length+').','hint'));
     if(data.alert_errors.length)list.appendChild(el('p','Current alert checks failed for '+data.alert_errors.length+' local '+(data.alert_errors.length===1?'area':'areas')+'.','health-banner warn'));
-    if(!data.county_count){list.appendChild(el('p','No county coverage is configured. Add counties in Settings or Routing.','hint'));return;}
+    if(!data.county_count){list.appendChild(el('p',{{ ('No county coverage is available.' if guest_view|default(false) else 'No county coverage is configured. Add counties in Settings or Routing.')|tojson }},'hint'));return;}
     if(!data.alerts.length){list.appendChild(el('p','No active NWS alerts in the local area.','hint'));return;}
     data.alerts.forEach(function(item){
       var card=el('article',undefined,item.watched?'alert-card watched':'alert-card regional');
@@ -152,7 +152,7 @@
   function load(){
     if(loading)return;
     loading=true;
-    fetch('/api/map-data',{credentials:'same-origin'}).then(function(response){
+    fetch({{ map_data_url|default('/api/map-data')|tojson }},{credentials:'same-origin'}).then(function(response){
       if(!response.ok)throw new Error('Map data request failed');return response.json();
     }).then(render).catch(function(){
       document.getElementById('map-status').textContent='Could not load local alert map data. Retrying automatically.';

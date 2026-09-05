@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <b>Status: v2.4.0.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
+  <b>Status: v2.4.1.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
 </p>
 
 ---
@@ -276,6 +276,21 @@ separate channel secret is accepted or stored. Anyone who knows the exact hash-c
 derive the same key. **Load all channels** reads every device-reported slot, including empty slots,
 in one operation. That inventory requires administrator authentication because it reveals all exact
 hash-channel names; channel keys are never returned or displayed.
+
+### Password-protected guest map
+
+The optional **WXDispatch guest view** is a separate read-only process with only three routes:
+the regional alert map at `/`, its map-data endpoint, and `/healthz`. It contains no dashboard,
+history, routing, settings, transmission, troubleshooting, write, OpenAPI, or documentation routes.
+Run it with `mesh-wx-guest.service`; the backend authenticates HTTP Basic username `guest`.
+
+For public access, put the guest process behind HTTPS and use a **Pangolin shared password**
+as the user-facing credential. Configure Pangolin header authentication to inject a separate backend
+credential from `/etc/mesh-wx/guest-password`; do not reuse or forward the user-facing shared
+password to port `8111`. That file must be an absolute, regular, non-symlink file owned by the
+16–256 character password. It is never placed in the unit, repository, URL, page, or logs. Expose
+the guest service only through HTTPS. A reverse proxy or tunnel must target guest port `8111` and
+must not expose port `8110`, which remains the private operator interface.
 
 The default database location when `MESH_WX_DB` is unset deliberately retains the original
 MeshWX paths so upgrades reuse existing settings and history:
