@@ -261,6 +261,15 @@ def test_sequence_tracker_retired_process_memory_is_bounded() -> None:
     assert tracker.retired_count == 2
 
 
+def test_sequence_tracker_rejects_replay_after_seen_window_eviction() -> None:
+    tracker = SequenceTracker(max_seen=2)
+    for stream_id in ("worker.1", "worker.2", "worker.3"):
+        assert tracker.observe(stream_id).accepted is True
+    replay = tracker.observe("worker.1")
+    assert replay.accepted is False
+    assert replay.replay is True
+
+
 def test_sequence_tracker_accepts_product_objects() -> None:
     product = parse_nwws_stanza(OFFICIAL_STANZA)
     assert isinstance(product, NWWSProduct)

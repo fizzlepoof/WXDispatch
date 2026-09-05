@@ -11,3 +11,5 @@ meshtastic>=2.7.5,<3
 pyserial>=3.5,<4
 meshcore>=2.3.8,<3
 tzdata>=2024.1
+slixmpp>=1.17,<2
+defusedxml>=0.7,<1

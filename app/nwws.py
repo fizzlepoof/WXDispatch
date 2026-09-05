@@ -1,12 +1,13 @@
-"""Bounded, dependency-free NWWS-OI product parsing helpers."""
+"""Bounded, hardened NWWS-OI product parsing helpers."""
 from __future__ import annotations
 
 import re
 import unicodedata
-import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+
+from defusedxml import ElementTree as ET
 
 MAX_STANZA_BYTES = 256 * 1024
 MAX_RAW_TEXT_BYTES = 200 * 1024
@@ -127,6 +128,9 @@ class SequenceTracker:
             self._seen_order.clear()
             self._seen.clear()
         elif stream_id in self._seen:
+            return SequenceDecision(stream_id=stream_id, accepted=False, replay=True)
+
+        if self._last_sequence is not None and sequence <= self._last_sequence:
             return SequenceDecision(stream_id=stream_id, accepted=False, replay=True)
 
         gap = None
@@ -649,6 +653,12 @@ def parse_nwws_stanza(stanza: bytes | str) -> NWWSProduct | NWWSHistory:
         raise NWWSParseError("expected message stanza")
     if root.attrib.get("type") != "groupchat":
         raise NWWSParseError("expected groupchat message")
+
+    if any(
+        child.tag in {"{urn:xmpp:delay}delay", "{jabber:x:delay}x"}
+        for child in root
+    ):
+        return NWWSHistory(body="delayed XMPP history")
 
     x_children = [child for child in root if child.tag.rsplit("}", 1)[-1] == "x"]
     if any(child.tag != "{nwws-oi}x" for child in x_children):
