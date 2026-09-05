@@ -313,6 +313,26 @@ def _dash_ctx(request) -> dict:
             % int(abs(skew))))
     health_level = ("critical" if any(l == "critical" for l, _ in problems)
                     else "warn" if problems else "ok")
+    nwws_service = getattr(request.app.state, "nwws", None)
+    nwws_health = getattr(nwws_service, "health", None)
+
+    def _nwws_counter(name):
+        try:
+            return max(0, int(getattr(nwws_health, name, 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    nwws_status = {
+        "state": getattr(getattr(nwws_health, "state", None), "value", "disabled"),
+        "shadow": bool(getattr(request.app.state, "nwws_shadow", True)),
+        "received": _nwws_counter("received"),
+        "delivered": _nwws_counter("delivered"),
+        "ignored": _nwws_counter("ignored"),
+        "malformed": _nwws_counter("malformed"),
+        "dropped": _nwws_counter("dropped"),
+        "reconnects": _nwws_counter("reconnects"),
+        "error_category": getattr(nwws_health, "error_category", None),
+    }
 
     return {
         "health_level": health_level,
@@ -332,6 +352,7 @@ def _dash_ctx(request) -> dict:
         "spark_line": spark_line, "spark_fill": spark_fill,
         "recent": recent, "last_tx": last_tx,
         "transports": tx.status(),
+        "nwws_status": nwws_status,
     }
 
 

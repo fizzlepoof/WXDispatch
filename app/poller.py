@@ -22,9 +22,34 @@ from .formatter import build_routed_mesh_text
 from .meshwx_v4 import encode_alert
 from .models import Alert
 from .nws import NWSClient, NWSError
+from .nwws import parse_vtec, vtec_correlation_key, vtec_event_year
 from .routing import RoutedDestination, route_alert
 
 logger = logging.getLogger("mesh_wx.poller")
+
+
+def _vtec_identity(feature: dict) -> str | None:
+    """Return a validated source-neutral identity for one VTEC product."""
+    if not isinstance(feature, dict):
+        return None
+    props = feature.get("properties")
+    if not isinstance(props, dict):
+        return None
+    parameters = props.get("parameters")
+    vtec_lines = parameters.get("VTEC") if isinstance(parameters, dict) else None
+    if not isinstance(vtec_lines, list) or len(vtec_lines) != 1:
+        return None
+    issue_text = props.get("effective") or props.get("sent") or props.get("onset")
+    try:
+        vtec = parse_vtec(vtec_lines[0]) if isinstance(vtec_lines[0], str) else None
+        if vtec is None:
+            return None
+        issue = datetime.fromisoformat(str(issue_text).replace("Z", "+00:00"))
+        if issue.tzinfo is None:
+            return None
+        return vtec_correlation_key(vtec, vtec_event_year(vtec, issue))
+    except (TypeError, ValueError):
+        return None
 
 
 def _delivery_hash(alert: Alert, matched_areas) -> str:
@@ -85,6 +110,17 @@ class WxPoller:
         self._stopped = False
         self._pending_deliveries: dict[tuple[str, str, int, str, int], dict] = {}
         self._conditional_chains: set[tuple[str, int]] = set()
+        saved_aliases = self._db.get_setting("nwws_vtec_aliases", {})
+        saved_alias_items = (
+            list(saved_aliases.items())[-512:] if isinstance(saved_aliases, dict) else []
+        )
+        self._vtec_aliases = {
+            str(key): str(value)
+            for key, value in saved_alias_items
+            if str(key).startswith("urn:nws:vtec:")
+            and 1 <= len(str(key)) <= 96
+            and 1 <= len(str(value)) <= 512
+        }
         saved_sequence = self._db.get_setting("meshwx_v4_sequence", None)
         try:
             self._meshwx_sequence = int(saved_sequence) & 0xFFFF
@@ -115,6 +151,54 @@ class WxPoller:
     def poke(self) -> None:
         """Wake the loop early (e.g. after a settings change)."""
         self._wake.set()
+
+    async def ingest_feature(self, feature: dict, *, source: str, shadow: bool) -> bool:
+        """Process an externally received NWS feature through the shared path."""
+        alert = Alert.from_feature(feature)
+        if not alert.nws_id:
+            return False
+        if shadow:
+            logger.info(
+                "%s shadow observed %s from %s",
+                source, alert.event[:80], alert.area_desc[:80],
+            )
+            return True
+        settings = self._db.all_settings()
+        await self._process(
+            feature,
+            FilterRules.from_settings(settings),
+            settings.get("display_timezone", ""),
+            int(settings.get("channel_index", 0)),
+            bool(settings.get("dry_run", True)),
+        )
+        return True
+
+    def _correlate_feature(self, feature: dict) -> dict:
+        """Map NWWS and REST copies together without re-keying existing REST state."""
+        identity = _vtec_identity(feature)
+        if identity is None:
+            return feature
+        props = feature.get("properties", {}) or {}
+        parameters = props.get("parameters", {}) or {}
+        sources = parameters.get("NWSSource", []) if isinstance(parameters, dict) else []
+        is_nwws = isinstance(sources, list) and "NWWS-OI" in sources
+        original_id = feature.get("id") or props.get("id") or props.get("@id")
+        if not isinstance(original_id, str) or not 1 <= len(original_id) <= 512:
+            return feature
+        target_id = self._vtec_aliases.get(identity)
+        if target_id is None:
+            target_id = identity if is_nwws else original_id
+            self._vtec_aliases[identity] = target_id
+            while len(self._vtec_aliases) > 512:
+                self._vtec_aliases.pop(next(iter(self._vtec_aliases)))
+            self._db.set_setting("nwws_vtec_aliases", self._vtec_aliases)
+        if original_id == target_id:
+            return feature
+        correlated = dict(feature)
+        correlated["properties"] = dict(props)
+        correlated["id"] = target_id
+        correlated["properties"]["id"] = target_id
+        return correlated
 
     def _meshwx_channel(self) -> int | None:
         if not bool(self._db.get_setting("meshwx_v4_enabled", False)):
@@ -346,6 +430,7 @@ class WxPoller:
                 self._db.add_error("poller", f"process error: {exc}")
 
     async def _process(self, feature, rules, tz_name, channel, dry_run) -> None:
+        feature = self._correlate_feature(feature)
         alert = Alert.from_feature(feature)
         if not alert.nws_id:
             return

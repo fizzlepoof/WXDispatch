@@ -252,8 +252,18 @@ lives in the UI and the database.
 | -------------- | ---------------------------------------- | ------------------ |
 | `MESH_WX_PORT` | `8000` (`8110` for the systemd service)  | HTTP port          |
 | `MESH_WX_HOST` | `0.0.0.0`                                | HTTP bind address  |
-|| `MESH_WX_DB`   | per-OS data dir (see below)              | SQLite file path   |
-|| `MESHWX_ADMIN_PASSWORD` | unset | Enables MeshCore companion channel set/clear and all-slot inventory; HTTP Basic username is `admin` |
+| `MESH_WX_DB`   | per-OS data dir (see below)              | SQLite file path   |
+| `MESHWX_ADMIN_PASSWORD` | unset | Enables MeshCore companion channel set/clear and all-slot inventory; HTTP Basic username is `admin` |
+| `MESH_WX_NWWS_ENABLED` | `false` | Starts the optional NWWS-OI receiver |
+| `MESH_WX_NWWS_USERNAME` | unset | NWWS-OI account localpart (not a full JID) |
+| `MESH_WX_NWWS_PASSWORD_FILE` | unset | Private regular file containing the NWWS password |
+| `MESH_WX_NWWS_OFFICES` | `KOHX` | Comma-separated four-letter office allowlist |
+| `MESH_WX_NWWS_SHADOW` | `true` | Observe and validate products without routing them to radios |
+
+NWWS-OI stays disabled unless explicitly enabled. Native systemd installs may place the
+non-secret values above in `/etc/mesh-wx/nwws.env`; the password itself must remain in a
+separate service-readable `0600` file. Start in shadow mode and verify the sanitized
+NWWS-OI counters on the dashboard before setting `MESH_WX_NWWS_SHADOW=false`.
 
 When `MESHWX_ADMIN_PASSWORD` is unset, channel set/clear fail closed with HTTP 503 and the UI
 marks channel administration disabled. The password is read from the process environment and is

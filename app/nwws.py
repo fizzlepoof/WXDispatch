@@ -440,7 +440,7 @@ def _iso_z(value: datetime) -> str | None:
     return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _vtec_event_year(vtec: VTEC, issue: datetime) -> int:
+def vtec_event_year(vtec: VTEC, issue: datetime) -> int:
     """Resolve the yearly ETN namespace using deterministic VTEC evidence."""
     if vtec.start is not None:
         return vtec.start.year
@@ -513,7 +513,7 @@ def project_to_feature(product: NWWSProduct) -> dict | None:
         return None
 
     stream_id = product.stream_id
-    event_year = _vtec_event_year(vtec, product.issue_time)
+    event_year = vtec_event_year(vtec, product.issue_time)
     try:
         correlation_key = vtec_correlation_key(vtec, event_year)
         canonical_vtec = _canonical_vtec(vtec)

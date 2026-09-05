@@ -10,8 +10,11 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 from app.nwws import MAX_STANZA_BYTES, NWWSHistory, parse_nwws_stanza
+from app.config import NWWSAppConfig, load_nwws_config
+from app.main import _nwws_product_handler, create_app
 from app.nwws_runtime import (
     EXPECTED_ROOM,
     AuthenticationError,
@@ -38,6 +41,105 @@ def test_delayed_payload_is_non_actionable_history() -> None:
         b"</x><delay xmlns='urn:xmpp:delay' stamp='2026-09-05T01:01:00Z'/></message>",
     )
     assert isinstance(parse_nwws_stanza(delayed), NWWSHistory)
+
+
+def test_nwws_app_config_is_disabled_and_shadowed_by_default(monkeypatch) -> None:
+    for key in (
+        "MESH_WX_NWWS_ENABLED", "MESH_WX_NWWS_USERNAME",
+        "MESH_WX_NWWS_PASSWORD_FILE", "MESH_WX_NWWS_OFFICES",
+        "MESH_WX_NWWS_SHADOW",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    configured = load_nwws_config()
+    assert configured.runtime.enabled is False
+    assert configured.shadow is True
+
+
+def test_nwws_app_config_loads_bounded_env_values(monkeypatch, tmp_path: Path) -> None:
+    password_file = tmp_path / "secret"
+    monkeypatch.setenv("MESH_WX_NWWS_ENABLED", "true")
+    monkeypatch.setenv("MESH_WX_NWWS_USERNAME", "weatherbot")
+    monkeypatch.setenv("MESH_WX_NWWS_PASSWORD_FILE", str(password_file))
+    monkeypatch.setenv("MESH_WX_NWWS_OFFICES", "KOHX,KPAH")
+    monkeypatch.setenv("MESH_WX_NWWS_SHADOW", "false")
+    configured = load_nwws_config()
+    assert configured.runtime.username == "weatherbot"
+    assert configured.runtime.password_file == password_file
+    assert configured.runtime.offices == frozenset({"KOHX", "KPAH"})
+    assert configured.shadow is False
+
+
+def test_malformed_nwws_boolean_values_fail_to_safe_defaults(monkeypatch) -> None:
+    monkeypatch.setenv("MESH_WX_NWWS_ENABLED", "typo")
+    monkeypatch.setenv("MESH_WX_NWWS_SHADOW", "typo")
+    configured = load_nwws_config()
+    assert configured.runtime.enabled is False
+    assert configured.shadow is True
+
+
+@pytest.mark.asyncio
+async def test_app_handler_projects_product_into_shared_poller() -> None:
+    calls = []
+
+    class Poller:
+        async def ingest_feature(self, feature, *, source, shadow):
+            calls.append((feature, source, shadow))
+            return True
+
+    product = parse_nwws_stanza(STANZA)
+    await _nwws_product_handler(Poller(), shadow=True)(product)
+    assert len(calls) == 1
+    assert calls[0][0]["properties"]["parameters"]["NWWSStreamID"] == ["worker.42"]
+    assert calls[0][1:] == ("nwws", True)
+
+
+def test_app_lifespan_keeps_disabled_nwws_inert(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("MESH_WX_DB", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MESH_WX_NWWS_ENABLED", "false")
+    with TestClient(create_app()) as client:
+        assert client.get("/healthz").text == "ok"
+        assert client.app.state.nwws.health.state is RuntimeState.DISABLED
+
+
+def test_bad_nwws_credentials_do_not_block_existing_app(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("MESH_WX_DB", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MESH_WX_NWWS_ENABLED", "true")
+    monkeypatch.delenv("MESH_WX_NWWS_USERNAME", raising=False)
+    monkeypatch.delenv("MESH_WX_NWWS_PASSWORD_FILE", raising=False)
+    with TestClient(create_app()) as client:
+        assert client.get("/healthz").text == "ok"
+        assert client.app.state.nwws.health.state is RuntimeState.MISCONFIGURED
+
+
+def test_app_lifespan_starts_and_stops_enabled_nwws(monkeypatch, tmp_path: Path) -> None:
+    import app.main as main_module
+
+    instances = []
+
+    class Runtime:
+        def __init__(self, runtime_config, *, on_product):
+            self.health = SimpleNamespace(state=RuntimeState.STOPPED)
+            self.started = False
+            self.stopped = False
+            instances.append(self)
+
+        async def start(self):
+            self.started = True
+            self.health.state = RuntimeState.CONNECTED
+
+        async def stop(self):
+            self.stopped = True
+
+    monkeypatch.setenv("MESH_WX_DB", str(tmp_path / "app.db"))
+    monkeypatch.setattr(main_module, "NWWSRuntimeService", Runtime)
+    monkeypatch.setattr(
+        main_module, "load_nwws_config",
+        lambda: NWWSAppConfig(NWWSRuntimeConfig(enabled=True), shadow=True),
+    )
+    with TestClient(create_app()) as client:
+        assert client.get("/healthz").status_code == 200
+        assert instances[0].started is True
+    assert instances[0].stopped is True
 
 
 class FakeTransport:

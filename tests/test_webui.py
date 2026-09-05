@@ -136,6 +136,26 @@ def test_readme_prominently_documents_routing_upgrade_auth_and_acceptance_limits
     assert "logged **sent** only when the radio really keyed up" not in normalized
 
 
+def test_dashboard_exposes_only_sanitized_nwws_health(web):
+    client, _db, _tx = web
+    client.app.state.nwws = SimpleNamespace(health=SimpleNamespace(
+        state=SimpleNamespace(value="connected"), received=12, delivered=4,
+        ignored=7, malformed=1, dropped=0, reconnects=2,
+        error_category=None,
+    ))
+    client.app.state.nwws_shadow = True
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "NWWS-OI connected" in response.text
+    assert "shadow" in response.text
+    assert "12 received" in response.text
+    assert "password" not in response.text.casefold()
+    client.app.state.nwws.health.received = None
+    degraded = client.get("/")
+    assert degraded.status_code == 200
+    assert "0 received" in degraded.text
+
+
 def test_state_changes_require_matching_csrf_token(web):
     client, _db, _tx = web
 

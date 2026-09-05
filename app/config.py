@@ -10,6 +10,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .nwws_runtime import NWWSRuntimeConfig
+
 # Preserve legacy data directories so upgrading from MeshWX never strands the
 # existing database. This is intentionally not the public product name.
 APP_DIRNAME = "MeshWX"
@@ -43,6 +45,43 @@ class BootstrapConfig:
     http_host: str
     http_port: int
     db_path: str
+
+
+@dataclass(frozen=True)
+class NWWSAppConfig:
+    runtime: NWWSRuntimeConfig
+    shadow: bool = True
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def load_nwws_config() -> NWWSAppConfig:
+    """Load optional NWWS settings without reading the credential itself."""
+    password_path = os.environ.get("MESH_WX_NWWS_PASSWORD_FILE", "").strip()
+    offices = frozenset(
+        value.strip().upper()
+        for value in os.environ.get("MESH_WX_NWWS_OFFICES", "KOHX").split(",")
+        if value.strip()
+    )
+    return NWWSAppConfig(
+        runtime=NWWSRuntimeConfig(
+            enabled=_env_bool("MESH_WX_NWWS_ENABLED", False),
+            username=os.environ.get("MESH_WX_NWWS_USERNAME", "").strip(),
+            password_file=Path(password_path) if password_path else None,
+            offices=offices,
+        ),
+        shadow=_env_bool("MESH_WX_NWWS_SHADOW", True),
+    )
 
 
 def load_bootstrap() -> BootstrapConfig:

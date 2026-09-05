@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from . import __version__
-from .config import load_bootstrap
+from .config import load_bootstrap, load_nwws_config
 from .db import Database
 from .logging_setup import setup_logging
 from .poller import WxPoller
@@ -16,8 +16,20 @@ from .ipaws import IpawsPoller
 from .transmit import TransmitManager
 from .watchdog import Liveness
 from .web.routes import router
+from .nwws import NWWSProduct, project_to_feature
+from .nwws_runtime import NWWSRuntimeService
 
 logger = logging.getLogger("mesh_wx.main")
+
+
+def _nwws_product_handler(poller: WxPoller, *, shadow: bool):
+    async def handle(product: NWWSProduct) -> None:
+        feature = project_to_feature(product)
+        if feature is None:
+            return
+        await poller.ingest_feature(feature, source="nwws", shadow=shadow)
+
+    return handle
 
 
 async def _heartbeat(liveness: Liveness) -> None:
@@ -58,12 +70,19 @@ async def lifespan(app: FastAPI):
     tx = TransmitManager(db)
     poller = WxPoller(db, tx)
     ipaws = IpawsPoller(db, tx)
+    nwws_config = load_nwws_config()
+    nwws = NWWSRuntimeService(
+        nwws_config.runtime,
+        on_product=_nwws_product_handler(poller, shadow=nwws_config.shadow),
+    )
 
     app.state.cfg = cfg
     app.state.db = db
     app.state.tx = tx
     app.state.poller = poller
     app.state.ipaws = ipaws
+    app.state.nwws = nwws
+    app.state.nwws_shadow = nwws_config.shadow
 
     # Liveness watchdog: force a restart if the event loop ever wedges.
     liveness = Liveness(stall_seconds=90.0)
@@ -78,6 +97,8 @@ async def lifespan(app: FastAPI):
     app.state.startup_task = startup_task
     poller.start()
     ipaws.start()
+    await nwws.start()
+    logger.info("NWWS runtime state=%s shadow=%s", nwws.health.state.value, nwws_config.shadow)
 
     try:
         yield
@@ -87,6 +108,7 @@ async def lifespan(app: FastAPI):
         beat_task.cancel()
         if not startup_task.done():
             startup_task.cancel()
+        await nwws.stop()
         await poller.stop()
         await ipaws.stop()
         await tx.stop()

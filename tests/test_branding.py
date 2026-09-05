@@ -102,6 +102,8 @@ def test_legacy_runtime_identifiers_remain_for_upgrades():
     assert '${MESHWX_DIR:-/opt/MeshWX}' in installer
     assert "mesh-wx.service" in (ROOT / "packaging/install-linux.sh").read_text()
     assert "MESH_WX_DB" in service
+    assert "EnvironmentFile=-/etc/mesh-wx/nwws.env" in service
+    assert "MESH_WX_NWWS_PASSWORD=" not in service
     assert (ROOT / "docker-compose.yml").read_text().count("mesh-wx") >= 2
 
 

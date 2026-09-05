@@ -4,9 +4,11 @@
 Policy: EVERY distinct alert pulled from NOAA is logged to history exactly once
 (deduped by nws_id -- we re-poll every cycle), recording its disposition and the
 reason, whether or not it was broadcast. Re-polls of the same id add no new row."""
+import copy
 import pytest
 
 from app.db import Database
+from app.filters import FilterRules
 from app.poller import WxPoller
 
 
@@ -132,6 +134,80 @@ async def test_active_alert_logged_once_across_polls(wired):
     filtered = [r for r in db.query_history(limit=500) if r["disposition"] == "filtered"]
     assert len(filtered) == 1
     assert filtered[0]["detail"]  # reason recorded
+
+
+async def test_external_feature_shadow_is_observed_without_db_or_radio(wired):
+    db, poller, feature = wired
+    accepted = await poller.ingest_feature(
+        _future(feature("tornado_warning")), source="nwws", shadow=True
+    )
+    assert accepted is True
+    assert poller._tx.sent == []
+    assert db.query_history(limit=10) == []
+
+
+async def test_malformed_rest_vtec_falls_back_to_original_identity(wired):
+    _db, poller, feature = wired
+    malformed = _future(feature("tornado_warning"))
+    malformed["properties"]["parameters"] = {
+        "VTEC": ["/O.NEW.KCHS.TO.W.0001.991332T2510Z-991332T2610Z/"],
+    }
+    assert await poller.ingest_feature(
+        malformed, source="nwws", shadow=True
+    ) is True
+
+
+async def test_external_feature_uses_shared_dedupe_with_rest(wired):
+    db, poller, feature = wired
+    db.set_setting("dry_run", False)
+    rest = _future(feature("tornado_warning"))
+    rest["properties"]["parameters"] = {
+        "VTEC": ["/O.NEW.KCHS.TO.W.0001.990520T2010Z-990520T2045Z/"]
+    }
+    nwws = copy.deepcopy(rest)
+    nwws["id"] = "urn:nws:vtec:2099:KCHS:TO:W:0001"
+    nwws["properties"]["parameters"]["VTECCorrelationKey"] = [nwws["id"]]
+    await poller._process(
+        rest, FilterRules.from_settings(db.all_settings()), "", 0, False
+    )
+    sent_after_rest = len(poller._tx.sent)
+    assert db.query_history(limit=1)[0]["nws_id"] == rest["id"]
+    assert await poller.ingest_feature(nwws, source="nwws", shadow=False) is True
+    assert sent_after_rest == 1
+    assert len(poller._tx.sent) == sent_after_rest
+    restarted_tx = FakeTx()
+    restarted = WxPoller(db, restarted_tx)
+    assert await restarted.ingest_feature(nwws, source="nwws", shadow=False) is True
+    assert restarted_tx.sent == []
+
+
+async def test_external_feature_update_uses_shared_supersession_path(wired):
+    db, poller, feature = wired
+    db.set_setting("dry_run", False)
+    initial = _future(feature("tornado_warning"))
+    initial["properties"]["parameters"] = {
+        "VTEC": ["/O.NEW.KCHS.TO.W.0001.990520T2010Z-990520T2045Z/"]
+    }
+    update = copy.deepcopy(initial)
+    update["id"] = "urn:nwws:stream.22"
+    update["properties"]["parameters"]["VTEC"] = [
+        "/O.CON.KCHS.TO.W.0001.990520T2010Z-990520T2100Z/"
+    ]
+    update["properties"]["messageType"] = "Update"
+    update["properties"]["headline"] += " updated"
+    cancel = copy.deepcopy(update)
+    cancel["id"] = "urn:nwws:stream.23"
+    cancel["properties"]["parameters"]["VTEC"] = [
+        "/O.CAN.KCHS.TO.W.0001.000000T0000Z-000000T0000Z/"
+    ]
+    cancel["properties"]["messageType"] = "Cancel"
+    cancel["properties"]["headline"] += " cancelled"
+    await poller._process(
+        initial, FilterRules.from_settings(db.all_settings()), "", 0, False
+    )
+    await poller.ingest_feature(update, source="nwws", shadow=False)
+    await poller.ingest_feature(cancel, source="nwws", shadow=False)
+    assert len(poller._tx.sent) == 3
 
 
 class ResultTx:
