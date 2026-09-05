@@ -18,11 +18,12 @@ from app.nwws import (
     parse_ugc,
     parse_vtec,
     project_to_feature,
+    vtec_correlation_key,
 )
 from app.models import Alert
 
 
-OFFICIAL_STANZA = b"""<message from='nwws@host/resource' to='client@example'>
+OFFICIAL_STANZA = b"""<message type='groupchat' from='nwws@host/resource' to='client@example'>
   <x xmlns='nwws-oi' cccc='KOHX' ttaaii='WFUS54' issue='2026-09-05T01:00:00Z'
      awipsid='TOROHX' id='654321.42'>WFUS54 KOHX 050100
 TOROHX
@@ -50,7 +51,7 @@ def test_parses_official_style_nwws_oi_stanza() -> None:
 
 def test_body_only_history_stanza_is_explicitly_incomplete() -> None:
     parsed = parse_nwws_stanza(
-        "<message><body>NWWS history is not replayable product metadata</body></message>"
+        "<message type='groupchat'><body>NWWS history is not replayable product metadata</body></message>"
     )
 
     assert isinstance(parsed, NWWSHistory)
@@ -58,15 +59,37 @@ def test_body_only_history_stanza_is_explicitly_incomplete() -> None:
     assert parsed.body == "NWWS history is not replayable product metadata"
 
 
+@pytest.mark.parametrize("message_type", [None, "chat"])
+def test_rejects_non_groupchat_message_stanzas(message_type: str | None) -> None:
+    stanza = OFFICIAL_STANZA
+    if message_type is None:
+        stanza = stanza.replace(b" type='groupchat'", b"")
+    else:
+        stanza = stanza.replace(b"type='groupchat'", f"type='{message_type}'".encode())
+
+    with pytest.raises(NWWSParseError, match="expected groupchat message"):
+        parse_nwws_stanza(stanza)
+
+
+def test_wrong_namespace_x_is_not_downgraded_to_history() -> None:
+    stanza = b"""<message type='groupchat'>
+      <x xmlns='urn:not-nwws'>untrusted payload</x>
+      <body>history-looking body</body>
+    </message>"""
+
+    with pytest.raises(NWWSParseError, match="invalid x namespace"):
+        parse_nwws_stanza(stanza)
+
+
 @pytest.mark.parametrize(
     "stanza, error",
     [
         (b"<message><x", "malformed XML"),
-        (b"<message/>", "missing nwws-oi payload"),
+        (b"<message type='groupchat'/>", "missing nwws-oi payload"),
         (
-            b"<message><x xmlns='wrong' cccc='KOHX' ttaaii='WFUS54' "
+            b"<message type='groupchat'><x xmlns='wrong' cccc='KOHX' ttaaii='WFUS54' "
             b"issue='2026-09-05T01:00:00Z' awipsid='TOROHX' id='1.1'>x</x></message>",
-            "missing nwws-oi payload",
+            "invalid x namespace",
         ),
         (
             OFFICIAL_STANZA.replace(b" issue='2026-09-05T01:00:00Z'", b""),
@@ -102,6 +125,37 @@ def test_rejects_oversized_xml_and_raw_product() -> None:
     )
     with pytest.raises(NWWSParseError, match="product text too large"):
         parse_nwws_stanza(oversized)
+
+
+def test_official_product_header_may_follow_sequence_line() -> None:
+    parsed = parse_nwws_stanza(
+        OFFICIAL_STANZA.replace(b">WFUS54 KOHX 050100", b">111\nWFUS54 KOHX 050100")
+    )
+
+    assert isinstance(parsed, NWWSProduct)
+    assert parsed.raw_text.startswith("111\nWFUS54 KOHX 050100\nTOROHX")
+
+
+@pytest.mark.parametrize(
+    "header, error",
+    [
+        (b"WFUS55 KOHX 050100\nTOROHX", "product header mismatch"),
+        (b"WFUS54 KOUN 050100\nTOROHX", "product header mismatch"),
+        (b"WFUS54 KOHX 050100\nSVROHX", "product header mismatch"),
+        (b"WFUS54 KOHX 052460\nTOROHX", "invalid product headers"),
+        (b"TOROHX", "invalid product headers"),
+        (b"WFUS54 KOHX 050100", "invalid product headers"),
+    ],
+)
+def test_rejects_missing_malformed_or_mismatched_product_headers(
+    header: bytes, error: str
+) -> None:
+    stanza = OFFICIAL_STANZA.replace(
+        b"WFUS54 KOHX 050100\nTOROHX", header
+    )
+
+    with pytest.raises(NWWSParseError, match=error):
+        parse_nwws_stanza(stanza)
 
 
 def test_sequence_tracker_detects_same_process_gap() -> None:
@@ -223,7 +277,7 @@ def test_projects_sanitized_nws_like_feature_for_alert_model() -> None:
     feature = project_to_feature(product)
 
     assert feature is not None
-    assert feature["id"] == "urn:nwws-oi:654321.42"
+    assert feature["id"] == "urn:nws:vtec:2026:KOHX:TO:W:0042"
     assert feature["properties"]["messageType"] == "Alert"
     assert feature["properties"]["event"] == "Tornado Warning"
     assert feature["properties"]["geocode"]["UGC"] == [
@@ -231,10 +285,42 @@ def test_projects_sanitized_nws_like_feature_for_alert_model() -> None:
     ]
     assert feature["properties"]["expires"] == "2026-09-05T02:00:00Z"
     assert feature["properties"]["parameters"]["NWWSStreamID"] == ["654321.42"]
+    assert feature["properties"]["parameters"]["VTEC"] == [
+        "/O.NEW.KOHX.TO.W.0042.260905T0100Z-260905T0200Z/"
+    ]
+    assert feature["properties"]["parameters"]["VTECPhenomena"] == ["TO"]
+    assert feature["properties"]["parameters"]["VTECSignificance"] == ["W"]
+    assert feature["properties"]["parameters"]["VTECStartTime"] == [
+        "2026-09-05T01:00:00Z"
+    ]
+    assert feature["properties"]["parameters"]["VTECEndTime"] == [
+        "2026-09-05T02:00:00Z"
+    ]
     assert "SECRET RAW BODY" not in repr(feature)
     alert = Alert.from_feature(feature)
-    assert alert.nws_id == "urn:nwws-oi:654321.42"
+    assert alert.nws_id == "urn:nws:vtec:2026:KOHX:TO:W:0042"
     assert alert.event == "Tornado Warning"
+
+
+def test_vtec_identity_is_stable_across_nwws_process_sequences() -> None:
+    first = parse_nwws_stanza(OFFICIAL_STANZA)
+    replayed_elsewhere = parse_nwws_stanza(
+        OFFICIAL_STANZA.replace(b"654321.42", b"worker_b.987")
+    )
+    assert isinstance(first, NWWSProduct)
+    assert isinstance(replayed_elsewhere, NWWSProduct)
+
+    metadata = parse_product_metadata(first.raw_text)
+    assert metadata.vtec is not None
+    expected = vtec_correlation_key(metadata.vtec, 2026)
+
+    assert expected == "urn:nws:vtec:2026:KOHX:TO:W:0042"
+    first_feature = project_to_feature(first)
+    replayed_feature = project_to_feature(replayed_elsewhere)
+    assert first_feature is not None
+    assert replayed_feature is not None
+    assert first_feature["id"] == expected
+    assert replayed_feature["id"] == expected
 
 
 @pytest.mark.parametrize(

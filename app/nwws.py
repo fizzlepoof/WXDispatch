@@ -18,6 +18,8 @@ _SAFE_OFFICE = re.compile(r"[A-Z]{4}")
 _SAFE_WMO = re.compile(r"[A-Z]{4}[0-9]{2}")
 _SAFE_AWIPS = re.compile(r"[A-Z0-9]{3,9}")
 _SAFE_PROCESS = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_WMO_HEADER = re.compile(r"([A-Z]{4}[0-9]{2})[ \t]+([A-Z]{4})[ \t]+([0-9]{6})")
+_SEQUENCE_HEADER = re.compile(r"[0-9]{3}")
 _VALID_UGC_AREAS = frozenset(
     "AL AK AS AZ AR CA CO CT DE DC FL GA GU HI ID IL IN IA KS KY LA ME MD MA MI "
     "MN MS MO MT NE NV NH NJ NM NY NC ND MP OH OK OR PA PR RI SC SD TN TX UT VT "
@@ -343,6 +345,46 @@ def parse_product_metadata(text: str) -> ProductMetadata:
     return ProductMetadata(ugc=parse_ugc(text), vtec=vtec, event=event)
 
 
+def vtec_correlation_key(vtec: VTEC, year: int) -> str:
+    """Return a source-neutral identity for one yearly VTEC event."""
+    if (
+        not isinstance(vtec, VTEC)
+        or not isinstance(year, int)
+        or isinstance(year, bool)
+        or not 1 <= year <= 9999
+        or _SAFE_OFFICE.fullmatch(vtec.office) is None
+        or len(vtec.phenomena) != 2
+        or not vtec.phenomena.isascii()
+        or not vtec.phenomena.isalpha()
+        or len(vtec.significance) != 1
+        or not vtec.significance.isascii()
+        or not vtec.significance.isalpha()
+        or not isinstance(vtec.etn, int)
+        or isinstance(vtec.etn, bool)
+        or not 0 <= vtec.etn <= 9999
+    ):
+        raise ValueError("invalid VTEC correlation fields")
+    return (
+        f"urn:nws:vtec:{year:04d}:{vtec.office}:"
+        f"{vtec.phenomena.upper()}:{vtec.significance.upper()}:{vtec.etn:04d}"
+    )
+
+
+def _vtec_wire_time(value: datetime | None) -> str:
+    if value is None:
+        return "000000T0000Z"
+    if _iso_z(value) is None:
+        raise ValueError("invalid VTEC time")
+    return value.astimezone(timezone.utc).strftime("%y%m%dT%H%MZ")
+
+
+def _canonical_vtec(vtec: VTEC) -> str:
+    return (
+        f"/O.{vtec.action}.{vtec.office}.{vtec.phenomena}.{vtec.significance}."
+        f"{vtec.etn:04d}.{_vtec_wire_time(vtec.start)}-{_vtec_wire_time(vtec.end)}/"
+    )
+
+
 _ACTION_MESSAGE_TYPES = {
     "NEW": "Alert",
     "CAN": "Cancel",
@@ -414,13 +456,19 @@ def project_to_feature(product: NWWSProduct) -> dict | None:
         return None
 
     stream_id = product.stream_id
+    event_year = vtec.start.year if vtec.start is not None else product.issue_time.year
+    try:
+        correlation_key = vtec_correlation_key(vtec, event_year)
+        canonical_vtec = _canonical_vtec(vtec)
+    except (TypeError, ValueError):
+        return None
     event = metadata.event[:80]
     area_desc = "; ".join(metadata.ugc)[:2048]
     headline = f"{event} issued by NWS {product.issuing_office}"[:160]
     if message_type is None or not area_desc:
         return None
     return {
-        "id": f"urn:nwws-oi:{stream_id}",
+        "id": correlation_key,
         "type": "Feature",
         "geometry": None,
         "properties": {
@@ -441,9 +489,15 @@ def project_to_feature(product: NWWSProduct) -> dict | None:
                 "NWWSSequence": [str(product.sequence)],
                 "WMOIdentifier": [product.wmo_id],
                 "AWIPSIdentifier": [product.awips_id],
+                "VTEC": [canonical_vtec],
+                "VTECCorrelationKey": [correlation_key],
                 "VTECAction": [vtec.action],
                 "VTECOffice": [vtec.office],
+                "VTECPhenomena": [vtec.phenomena],
+                "VTECSignificance": [vtec.significance],
                 "VTECEventTrackingNumber": [f"{vtec.etn:04d}"],
+                "VTECStartTime": [_iso_z(vtec.start) if vtec.start is not None else ""],
+                "VTECEndTime": [expires],
             },
         },
     }
@@ -499,6 +553,32 @@ def _utc_datetime(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _validate_product_headers(
+    text: str, *, ttaaii: str, cccc: str, awipsid: str
+) -> None:
+    """Validate the authoritative WMO and AWIPS lines at the product start."""
+    lines = text.splitlines()
+    index = 0
+    if lines and _SEQUENCE_HEADER.fullmatch(lines[0].strip()) is not None:
+        index = 1
+    if len(lines) < index + 2:
+        raise NWWSParseError("invalid product headers")
+
+    match = _WMO_HEADER.fullmatch(lines[index].strip())
+    product_awips = lines[index + 1].strip()
+    if match is None or _SAFE_AWIPS.fullmatch(product_awips) is None:
+        raise NWWSParseError("invalid product headers")
+    product_ttaaii, product_cccc, ddhhmm = match.groups()
+    if (
+        not 1 <= int(ddhhmm[:2]) <= 31
+        or int(ddhhmm[2:4]) > 23
+        or int(ddhhmm[4:]) > 59
+    ):
+        raise NWWSParseError("invalid product headers")
+    if (product_ttaaii, product_cccc, product_awips) != (ttaaii, cccc, awipsid):
+        raise NWWSParseError("product header mismatch")
+
+
 def parse_nwws_stanza(stanza: bytes | str) -> NWWSProduct | NWWSHistory:
     """Parse exactly one bounded NWWS-OI XMPP message stanza.
 
@@ -512,8 +592,13 @@ def parse_nwws_stanza(stanza: bytes | str) -> NWWSProduct | NWWSHistory:
         raise NWWSParseError("malformed XML") from exc
     if root.tag.rsplit("}", 1)[-1] != "message":
         raise NWWSParseError("expected message stanza")
+    if root.attrib.get("type") != "groupchat":
+        raise NWWSParseError("expected groupchat message")
 
-    payloads = [child for child in root if child.tag == "{nwws-oi}x"]
+    x_children = [child for child in root if child.tag.rsplit("}", 1)[-1] == "x"]
+    if any(child.tag != "{nwws-oi}x" for child in x_children):
+        raise NWWSParseError("invalid x namespace")
+    payloads = [child for child in x_children if child.tag == "{nwws-oi}x"]
     if not payloads:
         bodies = [child for child in root if child.tag.rsplit("}", 1)[-1] == "body"]
         if len(bodies) == 1 and not list(bodies[0]):
@@ -551,8 +636,8 @@ def parse_nwws_stanza(stanza: bytes | str) -> NWWSProduct | NWWSHistory:
     raw_text = (payload.text or "").strip()
     if not raw_text:
         raise NWWSParseError("empty product text")
-    if len(raw_text.encode("utf-8")) > MAX_RAW_TEXT_BYTES:
-        raise NWWSParseError("product text too large")
+    raw_text = _bounded_product_text(raw_text)
+    _validate_product_headers(raw_text, ttaaii=wmo_id, cccc=office, awipsid=awips_id)
 
     return NWWSProduct(
         issuing_office=office,
