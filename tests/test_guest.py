@@ -130,8 +130,8 @@ def test_guest_service_documentation_keeps_password_out_of_service_metadata():
     assert "mesh-wx-guest.service" in readme
     assert "/etc/mesh-wx/guest-password" in readme
     assert "username `guest`" in normalized
-    assert "separate backend credential" in normalized
-    assert "Pangolin shared password" in normalized
+    assert "Pangolin header authentication" in normalized
+    assert "extended compatibility mode" in normalized
     assert "HTTPS" in readme
     assert "must not expose port `8110`" in normalized
 

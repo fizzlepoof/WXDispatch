@@ -39,6 +39,7 @@ _CSRF_SECRET = secrets.token_bytes(32)
 _CHANNEL_ADMIN_AUTH = HTTPBasic(auto_error=False)
 _ALERT_MAP_CACHE = RegionalZoneGeometryCache()
 _AREA_ALERT_CACHE = AreaAlertCache()
+_DASHBOARD_ALERT_TIMEOUT_SECONDS = 2.0
 
 
 def _new_csrf_token() -> str:
@@ -356,6 +357,40 @@ def _dash_ctx(request) -> dict:
     }
 
 
+async def _active_alert_ctx(request: Request) -> dict:
+    """Current NWS alerts affecting watched counties; display-only."""
+    db = _db(request)
+    configured = configured_counties(db)
+    contact = str(db.get_setting("nws_contact", "") or "")
+    try:
+        alerts, errors, stale, last_success = await asyncio.wait_for(
+            _AREA_ALERT_CACHE.get_many(configured, contact),
+            timeout=_DASHBOARD_ALERT_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        alerts, errors, stale, last_success = [], ["unavailable"], True, ""
+    county_names = {county["code"]: county["name"] for county in configured}
+    active = []
+    for alert in alerts:
+        if not isinstance(alert, dict) or not bool(alert.get("watched")):
+            continue
+        local_zones = alert.get("local_zones", [])
+        if not isinstance(local_zones, list):
+            local_zones = []
+        names = [county_names.get(str(code), str(code)) for code in local_zones]
+        item = dict(alert)
+        item["local_counties"] = names
+        end = item.get("ends") or item.get("expires")
+        item["until"] = fmt_local(str(end), db.get_setting("display_timezone", "")) if end else ""
+        active.append(item)
+    return {
+        "active_alerts": active,
+        "active_alert_stale": bool(stale),
+        "active_alert_errors": len(errors),
+        "active_alert_last_success": last_success,
+    }
+
+
 # ---- liveness probe ----------------------------------------------------
 @router.get("/healthz", response_class=PlainTextResponse)
 async def healthz(request: Request):
@@ -368,7 +403,9 @@ async def healthz(request: Request):
 # ---- dashboard ---------------------------------------------------------
 @router.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    return render(request, "dashboard.html", **_dash_ctx(request))
+    context = _dash_ctx(request)
+    context.update(await _active_alert_ctx(request))
+    return render(request, "dashboard.html", **context)
 
 
 @router.get("/map", response_class=HTMLResponse)
@@ -456,8 +493,10 @@ async def status_partial(request: Request):
 
 @router.get("/partials/dashboard", response_class=HTMLResponse)
 async def dashboard_cols_partial(request: Request):
-    # The recent-alerts list + radios + broadcasting columns, for live polling.
-    return render(request, "_dash_cols.html", **_dash_ctx(request))
+    # Current active alerts + recent-alerts list + radio/routing status.
+    context = _dash_ctx(request)
+    context.update(await _active_alert_ctx(request))
+    return render(request, "_dash_cols.html", **context)
 
 
 @router.get("/partials/ipaws", response_class=HTMLResponse)

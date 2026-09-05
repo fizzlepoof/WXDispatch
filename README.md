@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <b>Status: v2.4.1.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
+  <b>Status: v2.4.2.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
 </p>
 
 ---
@@ -284,11 +284,12 @@ the regional alert map at `/`, its map-data endpoint, and `/healthz`. It contain
 history, routing, settings, transmission, troubleshooting, write, OpenAPI, or documentation routes.
 Run it with `mesh-wx-guest.service`; the backend authenticates HTTP Basic username `guest`.
 
-For public access, put the guest process behind HTTPS and use a **Pangolin shared password**
-as the user-facing credential. Configure Pangolin header authentication to inject a separate backend
-credential from `/etc/mesh-wx/guest-password`; do not reuse or forward the user-facing shared
-password to port `8111`. That file must be an absolute, regular, non-symlink file owned by the
-16–256 character password. It is never placed in the unit, repository, URL, page, or logs. Expose
+For public access, put the guest process behind HTTPS and use **Pangolin header authentication**
+in extended compatibility mode. Pangolin challenges for HTTP Basic username `guest` and passes the
+same credential to the guest backend. Because the Pangolin-to-backend hop is HTTP, keep port `8111`
+on a trusted private network and never expose it directly to the internet. The password is read from
+`/etc/mesh-wx/guest-password`; that file must be an absolute, regular, non-symlink file owned by the
+service account with mode `0600`, and it must contain a 16–256 character password. It is never placed in the unit, repository, URL, page, or logs. Expose
 the guest service only through HTTPS. A reverse proxy or tunnel must target guest port `8111` and
 must not expose port `8110`, which remains the private operator interface.
 

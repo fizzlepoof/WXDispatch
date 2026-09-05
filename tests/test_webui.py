@@ -96,9 +96,17 @@ class DummyPoller:
         pass
 
 
+class DummyAreaAlertCache:
+    async def get_many(self, counties, contact):
+        return [], [], False, ""
+
+
 @pytest.fixture
 def web(tmp_path, monkeypatch):
+    import app.web.routes as routes_mod
+
     monkeypatch.setenv("MESHWX_ADMIN_PASSWORD", "correct horse battery staple")
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", DummyAreaAlertCache())
     db = Database(str(tmp_path / "web.db"))
     app = FastAPI()
     app.state.db = db
@@ -586,6 +594,125 @@ def test_local_alert_map_data_includes_regional_alerts_and_watched_priority(web,
     assert payload["regional_alert_count"] == 1
     assert payload["scope_areas"] == ["TN"]
     assert db.query_history() == history_before
+
+
+def test_dashboard_shows_current_watched_alerts_not_regional_context(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    client, db, tx = web
+    destination_id = db.create_destination("Todd mesh", "meshcore", 7, True)
+    db.create_routing_rule(
+        "Todd County", 100, True, True,
+        [("KYC219", "Todd County")], [], [destination_id], [], True,
+    )
+
+    class FakeAreaCache:
+        async def get_many(self, counties, contact):
+            assert counties == [{"code": "KYC219", "name": "Todd County"}]
+            return [
+                {
+                    "id": "watched", "event": "Tornado Warning", "severity": "Extreme",
+                    "area": "Todd County", "headline": "Tornado Warning issued for Todd County",
+                    "ends": "2099-01-01T01:00:00+00:00", "expires": "",
+                    "local_zones": ["KYC219"], "affected_zones": ["KYC219"],
+                    "watched": True,
+                },
+                {
+                    "id": "regional", "event": "Heat Advisory", "severity": "Moderate",
+                    "area": "Nearby County", "headline": "Regional heat",
+                    "ends": "2099-01-01T02:00:00+00:00", "expires": "",
+                    "local_zones": [], "affected_zones": ["KYC047"],
+                    "watched": False,
+                },
+            ], [], False, "2099-01-01T00:00:00+00:00"
+
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", FakeAreaCache())
+    history_before = db.query_history()
+    tx_before = list(tx.transports)
+
+    response = client.get("/")
+    partial = client.get("/partials/dashboard")
+
+    assert response.status_code == 200
+    assert partial.status_code == 200
+    for body in (response.text, partial.text):
+        assert "Active alerts" in body
+        assert "Tornado Warning" in body
+        assert "Todd County" in body
+        assert "Extreme" in body
+        assert "Heat Advisory" not in body
+        assert "No active alerts for watched counties." not in body
+    assert db.query_history() == history_before
+    assert tx.transports == tx_before
+
+
+def test_dashboard_active_alert_section_handles_empty_and_malformed_cache_data(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    client, db, _tx = web
+    destination_id = db.create_destination("Todd mesh", "meshcore", 7, True)
+    db.create_routing_rule(
+        "Todd County", 100, True, True,
+        [("KYC219", "Todd County")], [], [destination_id], [], True,
+    )
+
+    class FakeAreaCache:
+        async def get_many(self, counties, contact):
+            return [{
+                "event": "Malformed local zones", "severity": "Unknown", "watched": True,
+                "area": "Todd County", "local_zones": None,
+            }], ["KY"], True, ""
+
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", FakeAreaCache())
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "Active alerts" in response.text
+    assert "Malformed local zones" in response.text
+    assert "Todd County" in response.text
+    assert "Active NWS data is stale." in response.text
+    assert "Some current alert checks are temporarily unavailable." in response.text
+
+
+def test_dashboard_survives_active_alert_cache_failure(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    class BrokenAreaCache:
+        async def get_many(self, counties, contact):
+            raise RuntimeError("must not escape into dashboard")
+
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", BrokenAreaCache())
+
+    response = web[0].get("/")
+
+    assert response.status_code == 200
+    assert "Active alerts" in response.text
+    assert "Active alert status is unavailable." in response.text
+    assert "No active alerts for watched counties." not in response.text
+    assert 'class="active-empty unavailable"' in response.text
+    assert "must not escape" not in response.text
+
+
+def test_dashboard_caps_active_alert_lookup_latency(web, monkeypatch):
+    import time
+    import app.web.routes as routes_mod
+
+    class SlowAreaCache:
+        async def get_many(self, counties, contact):
+            import asyncio
+            await asyncio.sleep(0.25)
+            return [], [], False, ""
+
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", SlowAreaCache())
+    monkeypatch.setattr(routes_mod, "_DASHBOARD_ALERT_TIMEOUT_SECONDS", 0.01)
+    started = time.monotonic()
+
+    response = web[0].get("/")
+
+    assert time.monotonic() - started < 0.2
+    assert response.status_code == 200
+    assert "Active alert status is unavailable." in response.text
 
 
 def test_dashboard_broadcast_counts_include_routed_accepted_and_partial_outcomes(web):

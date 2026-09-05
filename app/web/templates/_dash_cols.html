@@ -1,3 +1,26 @@
+<section class="panel active-alert-panel" style="padding:0;grid-column:1/-1;">
+  <div class="panel-head"><h3>Active alerts</h3><a class="see" href="/map">View map &rarr;</a></div>
+  {% if active_alerts and active_alert_stale %}<div class="health-banner warn" style="margin:14px 20px 0;">Active NWS data is stale.</div>{% endif %}
+  {% if active_alerts and active_alert_errors %}<div class="hint" style="padding:10px 20px 0;">Some current alert checks are temporarily unavailable.</div>{% endif %}
+  {% if active_alerts %}
+  <div class="active-alert-grid">
+    {% for alert in active_alerts %}
+    <article class="active-alert severity-{{ (alert.severity or 'unknown')|lower }}">
+      <div class="active-alert-top"><span class="pill active">Active</span><span class="active-severity">{{ alert.severity or 'Unknown' }}</span></div>
+      <div class="active-event">{{ alert.event or 'NWS alert' }}</div>
+      <div class="active-area">{{ alert.local_counties|join(', ') or alert.area }}</div>
+      {% if alert.headline %}<div class="active-headline">{{ alert.headline }}</div>{% endif %}
+      {% if alert.until %}<div class="active-until">Until {{ alert.until }}</div>{% endif %}
+    </article>
+    {% endfor %}
+  </div>
+  {% elif active_alert_stale or active_alert_errors %}
+  <div class="active-empty unavailable"><span class="warn-indicator">!</span><span>Active alert status is unavailable.</span></div>
+  {% else %}
+  <div class="active-empty"><span class="dot ok"></span><span>No active alerts for watched counties.</span></div>
+  {% endif %}
+</section>
+
 <section class="panel" style="padding:0;grid-column:1/-1;">
   <div class="panel-head"><h3>{{ 'Configured' if dry_run else 'Active' }} routing</h3><a class="see" href="/routing">Manage &rarr;</a></div>
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));">
