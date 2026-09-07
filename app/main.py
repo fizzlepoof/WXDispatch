@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from . import __version__
-from .config import load_bootstrap, load_nwws_config
+from .config import load_bootstrap, load_noaa_sdr_config, load_nwws_config
 from .db import Database
 from .logging_setup import setup_logging
 from .poller import WxPoller
@@ -18,6 +18,11 @@ from .watchdog import Liveness
 from .web.routes import router
 from .nwws import NWWSProduct, project_to_feature
 from .nwws_runtime import NWWSRuntimeService
+from .noaa_same import SameEndMessage, SameObservation
+from .noaa_sdr import (
+    NoaaSdrConfig, NoaaSdrSupervisor, project_same_to_feature,
+    raspberry_pi_temperature,
+)
 
 logger = logging.getLogger("mesh_wx.main")
 
@@ -30,6 +35,25 @@ def _nwws_product_handler(poller: WxPoller, *, shadow: bool):
         await poller.ingest_feature(feature, source="nwws", shadow=shadow)
 
     return handle
+
+
+def _noaa_sdr_handler(poller: WxPoller, *, config: NoaaSdrConfig, shadow: bool):
+    async def handle(message: SameObservation | SameEndMessage) -> None:
+        feature = project_same_to_feature(message, config)
+        if feature is not None:
+            await poller.ingest_feature(feature, source="noaa_sdr", shadow=shadow)
+
+    return handle
+
+
+async def _run_noaa_sdr(supervisor: NoaaSdrSupervisor) -> None:
+    """Contain receiver failures so web and internet alert paths stay up."""
+    try:
+        await supervisor.run()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("NOAA SDR receiver stopped unexpectedly")
 
 
 async def _heartbeat(liveness: Liveness) -> None:
@@ -75,6 +99,14 @@ async def lifespan(app: FastAPI):
         nwws_config.runtime,
         on_product=_nwws_product_handler(poller, shadow=nwws_config.shadow),
     )
+    noaa_sdr_config = load_noaa_sdr_config()
+    noaa_sdr = NoaaSdrSupervisor(
+        noaa_sdr_config.receiver,
+        callback=_noaa_sdr_handler(
+            poller, config=noaa_sdr_config.receiver, shadow=noaa_sdr_config.shadow,
+        ),
+        thermal_provider=raspberry_pi_temperature,
+    )
 
     app.state.cfg = cfg
     app.state.db = db
@@ -83,6 +115,9 @@ async def lifespan(app: FastAPI):
     app.state.ipaws = ipaws
     app.state.nwws = nwws
     app.state.nwws_shadow = nwws_config.shadow
+    app.state.noaa_sdr = noaa_sdr
+    app.state.noaa_sdr_shadow = noaa_sdr_config.shadow
+    app.state.noaa_sdr_config_error = noaa_sdr_config.error
 
     # Liveness watchdog: force a restart if the event loop ever wedges.
     liveness = Liveness(stall_seconds=90.0)
@@ -98,6 +133,8 @@ async def lifespan(app: FastAPI):
     poller.start()
     ipaws.start()
     await nwws.start()
+    noaa_sdr_task = asyncio.create_task(_run_noaa_sdr(noaa_sdr), name="noaa-sdr")
+    app.state.noaa_sdr_task = noaa_sdr_task
     logger.info("NWWS runtime state=%s shadow=%s", nwws.health.state.value, nwws_config.shadow)
 
     try:
@@ -108,6 +145,12 @@ async def lifespan(app: FastAPI):
         beat_task.cancel()
         if not startup_task.done():
             startup_task.cancel()
+        if not noaa_sdr_task.done():
+            noaa_sdr_task.cancel()
+        try:
+            await noaa_sdr_task
+        except asyncio.CancelledError:
+            pass
         await nwws.stop()
         await poller.stop()
         await ipaws.stop()

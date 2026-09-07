@@ -7,6 +7,7 @@ only supervises an explicitly selected RTL-SDR and reports confirmed SAME messag
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import math
 import os
@@ -17,6 +18,7 @@ import struct
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Awaitable, Callable, Final
 
 from app.noaa_same import SameEndMessage, SameObservation, SameRepeatConfirmer, parse_same
@@ -137,6 +139,75 @@ class NoaaSdrHealth:
     last_error: str | None = None
 
 
+def project_same_to_feature(
+    message: SameObservation | SameEndMessage,
+    config: NoaaSdrConfig,
+) -> dict | None:
+    """Project an actionable confirmed SAME header into the shared alert shape.
+
+    The raw header is used only for an opaque stable ID and is never returned.
+    """
+    if (
+        not isinstance(message, SameObservation)
+        or not message.route_eligible
+        or message.invalid_locations
+    ):
+        return None
+    same_codes = list(dict.fromkeys(message.locations))
+    ugc_codes = list(dict.fromkeys(message.county_ugcs))
+    if not same_codes or not ugc_codes:
+        return None
+    digest = hashlib.sha256(message.raw_header.encode("ascii")).hexdigest()[:32]
+    feature_id = f"urn:wxdispatch:noaa-same:{digest}"
+    issued = message.issued_at.isoformat()
+    expires = message.expires_at.isoformat()
+    return {
+        "id": feature_id,
+        "type": "Feature",
+        "geometry": None,
+        "properties": {
+            "id": feature_id,
+            "event": message.event_name[:160],
+            "headline": f"{config.callsign} {message.event_name}"[:256],
+            "areaDesc": "; ".join(ugc_codes)[:512],
+            "effective": issued,
+            "onset": issued,
+            "expires": expires,
+            "ends": expires,
+            "messageType": "Alert",
+            "status": "Actual",
+            "category": "Met",
+            # SAME carries an event code and location/purge time, but not CAP's
+            # severity/urgency/certainty fields. Do not invent them.
+            "severity": "Unknown",
+            "urgency": "Unknown",
+            "certainty": "Unknown",
+            "senderName": f"NOAA Weather Radio {config.callsign}"[:128],
+            "geocode": {"SAME": same_codes, "UGC": ugc_codes},
+            "parameters": {
+                "NWSSource": ["NOAA Weather Radio SAME"],
+                "SAMECallsign": [config.callsign],
+                "SAMEReceiverID": [config.receiver_id],
+                "SAMEFrequencyHz": [str(config.frequency_hz)],
+                "SAMEOriginator": [message.originator],
+                "SAMEEventCode": [message.event_code],
+                "SAMESender": [message.sender],
+            },
+        },
+    }
+
+
+def raspberry_pi_temperature(
+    path: Path = Path("/sys/class/thermal/thermal_zone0/temp"),
+) -> float | None:
+    """Read the Raspberry Pi CPU temperature without invoking a subprocess."""
+    try:
+        value = float(path.read_text(encoding="ascii").strip()) / 1000.0
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return value if math.isfinite(value) and -50 <= value <= 150 else None
+
+
 class _CycleEnded(RuntimeError):
     pass
 
@@ -229,15 +300,26 @@ class NoaaSdrSupervisor:
                 if self._thermal_latched
                 else self.config.thermal_start_hold_c
             )
+            if temperature is None:
+                # A missing reading must not clear an over-temperature latch.
+                if self._thermal_latched:
+                    self._update(state="thermal_hold")
+                    await self._sleep(self.config.thermal_poll_interval)
+                    continue
+                return
             if temperature < threshold:
                 self._thermal_latched = False
                 return
             self._update(state="thermal_hold")
             await self._sleep(self.config.thermal_poll_interval)
 
-    def _read_temperature(self) -> float:
+    def _read_temperature(self) -> float | None:
         assert self._temperature is not None
-        value = float(self._temperature())
+        reading = self._temperature()
+        if reading is None:
+            self._update(temperature_c=None)
+            return None
+        value = float(reading)
         if not math.isfinite(value) or not -50 <= value <= 150:
             raise RuntimeError("invalid thermal reading")
         self._update(temperature_c=value)
@@ -333,7 +415,10 @@ class NoaaSdrSupervisor:
             raise _CycleEnded("decoder stdout unavailable")
         malformed = 0
         while True:
-            line = await asyncio.wait_for(source.readline(), self.config.stall_timeout)
+            # multimon-ng emits nothing between SAME headers. Decoder silence is
+            # normal; PCM stalling and child-process exit are monitored by the
+            # sibling tasks in _run_cycle.
+            line = await source.readline()
             if not line:
                 return
             self._update(last_decoder=self._monotonic())
@@ -384,7 +469,7 @@ class NoaaSdrSupervisor:
     async def _watch_temperature(self) -> None:
         while True:
             temperature = self._read_temperature()
-            if temperature >= self.config.thermal_stop_c:
+            if temperature is not None and temperature >= self.config.thermal_stop_c:
                 self._thermal_latched = True
                 raise _ThermalStop(f"temperature {temperature:.1f} C")
             await self._sleep(self.config.thermal_poll_interval)

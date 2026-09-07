@@ -261,11 +261,50 @@ lives in the UI and the database.
 | `MESH_WX_NWWS_PASSWORD_FILE` | unset | Private regular file containing the NWWS password |
 | `MESH_WX_NWWS_OFFICES` | `KOHX` | Comma-separated four-letter office allowlist |
 | `MESH_WX_NWWS_SHADOW` | `true` | Observe and validate products without routing them to radios |
+| `MESH_WX_NOAA_SDR_ENABLED` | `false` | Start the optional receive-only NOAA Weather Radio decoder |
+| `MESH_WX_NOAA_SDR_DEVICE_SERIAL` | unset | Exact RTL-SDR serial to claim; required when enabled |
+| `MESH_WX_NOAA_SDR_FREQUENCY_HZ` | unset | One validated NOAA channel in hertz; WWH37 is `162500000` |
+| `MESH_WX_NOAA_SDR_CALLSIGN` | `WWH37` | Bounded receiver/transmitter label shown in health |
+| `MESH_WX_NOAA_SDR_GAIN` | `auto` | RTL-SDR gain in dB, or `auto`; Rocky is initially qualified at `40.2` |
+| `MESH_WX_NOAA_SDR_PPM` | `0` | RTL-SDR frequency correction from -200 through 200 ppm |
+| `MESH_WX_NOAA_SDR_SHADOW` | `true` | Decode and observe confirmed SAME headers without radio delivery |
 
 NWWS-OI stays disabled unless explicitly enabled. Native systemd installs may place the
 non-secret values above in `/etc/mesh-wx/nwws.env`; the password itself must remain in a
 separate service-readable `0600` file. Start in shadow mode and verify the sanitized
 NWWS-OI counters on the dashboard before setting `MESH_WX_NWWS_SHADOW=false`.
+
+### NOAA Weather Radio SDR
+
+The optional SDR source is disabled by default and has no transmit capability. On Debian or
+Raspberry Pi OS, install its receiver tools and reserve RTL2832U hardware for userspace with:
+
+```bash
+sudo MESHWX_INSTALL_NOAA_SDR=1 ./packaging/install-linux.sh
+```
+
+Native installs load non-secret settings from `/etc/mesh-wx/noaa-sdr.env`. Rocky's initial
+WWH37 configuration is:
+
+```text
+MESH_WX_NOAA_SDR_ENABLED=true
+MESH_WX_NOAA_SDR_DEVICE_SERIAL=00000001
+MESH_WX_NOAA_SDR_FREQUENCY_HZ=162500000
+MESH_WX_NOAA_SDR_CALLSIGN=WWH37
+MESH_WX_NOAA_SDR_RECEIVER_ID=rocky-attic
+MESH_WX_NOAA_SDR_GAIN=40.2
+MESH_WX_NOAA_SDR_PPM=0
+MESH_WX_NOAA_SDR_SHADOW=true
+```
+
+The receiver runs `rtl_fm` into `multimon-ng`, requires two matching bounded SAME headers,
+and rejects tests, administrative messages, and invalid locations. Confirmed eligible headers are
+projected through WXDispatch's normal filtering and deduplication machinery **in shadow mode only**,
+so they create no radio delivery. Direct SDR routing is deliberately rejected until source-neutral
+REST/NWWS/SAME correlation is implemented; this prevents duplicate broadcasts of the same hazard.
+Use a real alert or scheduled weekly SAME test to validate reception. The dashboard should show a
+stable receiver, nonzero audio, no thermal stop, and the expected county scope. Raw SAME headers and
+device errors are never rendered in the dashboard.
 
 When `MESHWX_ADMIN_PASSWORD` is unset, channel set/clear fail closed with HTTP 503 and the UI
 marks channel administration disabled. The password is read from the process environment and is
@@ -330,9 +369,9 @@ power, and a path to the National Weather Service. Plan for both.
   internet, so if your cable or fiber dies with the grid, it goes quiet. A satellite
   link such as Starlink, on its own battery or solar, keeps alerts flowing when
   terrestrial service is down.
-- **Know the limit.** With no internet and no backup path, WXDispatch cannot fetch new
-  alerts. It is a bridge from the NWS to your mesh, not a weather source of its own.
-  Keep a NOAA Weather Radio as the offline fallback.
+- **Know the limit.** Without internet, REST/NWWS/IPAWS feeds are unavailable. An enabled,
+  independently powered NOAA SDR can still observe local SAME headers, but its coverage is limited
+  to the selected transmitter and confirmed reception. Keep additional official warning methods.
 
 ## Credits
 

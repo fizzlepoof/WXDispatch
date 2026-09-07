@@ -17,6 +17,8 @@ Environment=MESH_WX_DB=__DIR__/data/mesh-wx.db
 # Optional NWWS-OI metadata only. The password itself stays in the private file
 # named by MESH_WX_NWWS_PASSWORD_FILE; a missing env file leaves NWWS disabled.
 EnvironmentFile=-/etc/mesh-wx/nwws.env
+# Optional receive-only NOAA Weather Radio RTL-SDR metadata. Disabled when absent.
+EnvironmentFile=-/etc/mesh-wx/noaa-sdr.env
 ExecStart=__DIR__/.venv/bin/python -m app.main
 Restart=on-failure
 RestartSec=5

@@ -1,3 +1,3 @@
 """WXDispatch: route NWS and IPAWS alerts over mesh radios."""
 
-__version__ = "2.4.3"
+__version__ = "2.4.4"

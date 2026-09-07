@@ -3,11 +3,18 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from fastapi.testclient import TestClient
 
-from app.noaa_same import SameEndMessage, SameObservation
-from app.noaa_sdr import NoaaSdrConfig, NoaaSdrHealth, NoaaSdrSupervisor, build_multimon_argv, build_rtl_fm_argv
+from app.config import NoaaSdrAppConfig, load_noaa_sdr_config
+from app.main import _noaa_sdr_handler, create_app
+from app.noaa_same import SameEndMessage, SameObservation, parse_same
+from app.noaa_sdr import (
+    NoaaSdrConfig, NoaaSdrHealth, NoaaSdrSupervisor, build_multimon_argv,
+    build_rtl_fm_argv, project_same_to_feature, raspberry_pi_temperature,
+)
 
 
 def test_config_defaults_and_exact_safe_commands() -> None:
@@ -53,6 +60,220 @@ def test_gain_is_optional_or_bounded_numeric() -> None:
     assert "-g" not in build_rtl_fm_argv(auto)
     argv = build_rtl_fm_argv(manual)
     assert argv[argv.index("-g") + 1] == "28"
+
+
+def test_sdr_env_config_is_disabled_and_shadowed_by_default(monkeypatch) -> None:
+    for key in (
+        "MESH_WX_NOAA_SDR_ENABLED", "MESH_WX_NOAA_SDR_DEVICE_SERIAL",
+        "MESH_WX_NOAA_SDR_FREQUENCY_HZ", "MESH_WX_NOAA_SDR_CALLSIGN",
+        "MESH_WX_NOAA_SDR_RECEIVER_ID", "MESH_WX_NOAA_SDR_SHADOW",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    configured = load_noaa_sdr_config()
+
+    assert configured.receiver.enabled is False
+    assert configured.shadow is True
+    assert configured.error is None
+
+
+def test_sdr_env_requires_explicit_serial_and_frequency_when_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("MESH_WX_NOAA_SDR_ENABLED", "true")
+    monkeypatch.delenv("MESH_WX_NOAA_SDR_DEVICE_SERIAL", raising=False)
+    monkeypatch.delenv("MESH_WX_NOAA_SDR_FREQUENCY_HZ", raising=False)
+
+    configured = load_noaa_sdr_config()
+
+    assert configured.receiver.enabled is False
+    assert configured.shadow is True
+    assert configured.error == "configuration"
+
+
+def test_sdr_env_rejects_unsafe_direct_routing(monkeypatch) -> None:
+    monkeypatch.setenv("MESH_WX_NOAA_SDR_ENABLED", "true")
+    monkeypatch.setenv("MESH_WX_NOAA_SDR_DEVICE_SERIAL", "000123")
+    monkeypatch.setenv("MESH_WX_NOAA_SDR_FREQUENCY_HZ", "162500000")
+    monkeypatch.setenv("MESH_WX_NOAA_SDR_CALLSIGN", "WWH37")
+    monkeypatch.setenv("MESH_WX_NOAA_SDR_RECEIVER_ID", "rocky-attic")
+    monkeypatch.setenv("MESH_WX_NOAA_SDR_SHADOW", "false")
+
+    configured = load_noaa_sdr_config()
+
+    assert configured.receiver.enabled is False
+    assert configured.shadow is True
+    assert configured.error == "direct-routing-unsupported"
+
+
+def test_sdr_env_loads_wwh37_shadow_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("MESH_WX_NOAA_SDR_ENABLED", "true")
+    monkeypatch.setenv("MESH_WX_NOAA_SDR_DEVICE_SERIAL", "000123")
+    monkeypatch.setenv("MESH_WX_NOAA_SDR_FREQUENCY_HZ", "162500000")
+    monkeypatch.setenv("MESH_WX_NOAA_SDR_CALLSIGN", "WWH37")
+    monkeypatch.setenv("MESH_WX_NOAA_SDR_RECEIVER_ID", "rocky-attic")
+    monkeypatch.setenv("MESH_WX_NOAA_SDR_SHADOW", "true")
+
+    configured = load_noaa_sdr_config()
+
+    assert configured.receiver == NoaaSdrConfig(
+        enabled=True, device_serial="000123", frequency_hz=162_500_000,
+        callsign="WWH37", receiver_id="rocky-attic",
+    )
+    assert configured.shadow is True
+    assert configured.error is None
+
+
+def test_route_eligible_same_projects_to_bounded_stable_nws_feature() -> None:
+    now = datetime(2026, 9, 6, 18, 31, tzinfo=timezone.utc)
+    observation = parse_same(
+        "ZCZC-WXR-TOR-047125+0030-2491830-KOHX/NWS-", now=now,
+    )
+    assert isinstance(observation, SameObservation)
+    config = NoaaSdrConfig(
+        enabled=True, device_serial="000123", frequency_hz=162_500_000,
+        callsign="WWH37", receiver_id="rocky-attic",
+    )
+
+    first = project_same_to_feature(observation, config)
+    second = project_same_to_feature(observation, config)
+
+    assert first == second
+    assert first is not None
+    assert first["type"] == "Feature"
+    assert first["geometry"] is None
+    assert first["id"].startswith("urn:wxdispatch:noaa-same:")
+    assert len(first["id"]) <= 80
+    properties = first["properties"]
+    assert properties["event"] == "Tornado Warning"
+    assert properties["geocode"] == {"SAME": ["047125"], "UGC": ["TNC125"]}
+    assert properties["effective"] == "2026-09-06T18:30:00+00:00"
+    assert properties["expires"] == "2026-09-06T19:00:00+00:00"
+    assert properties["parameters"]["SAMECallsign"] == ["WWH37"]
+    assert properties["parameters"]["SAMEFrequencyHz"] == ["162500000"]
+    assert properties["parameters"]["SAMESender"] == ["KOHX/NWS"]
+    assert properties["severity"] == "Unknown"
+    assert properties["urgency"] == "Unknown"
+    assert properties["certainty"] == "Unknown"
+    assert "raw_header" not in repr(first)
+    assert observation.raw_header not in repr(first)
+
+
+@pytest.mark.parametrize("header", [
+    "ZCZC-WXR-RWT-047125+0030-2491830-KOHX/NWS-",
+    "ZCZC-WXR-ADR-047125+0030-2491830-KOHX/NWS-",
+    "ZCZC-WXR-TOR-099999+0030-2491830-KOHX/NWS-",
+])
+def test_test_administrative_and_invalid_same_do_not_project(header: str) -> None:
+    observation = parse_same(
+        header, now=datetime(2026, 9, 6, 18, 31, tzinfo=timezone.utc),
+    )
+    config = NoaaSdrConfig(enabled=True, device_serial="000123")
+
+    assert project_same_to_feature(observation, config) is None
+
+
+def test_eom_does_not_project() -> None:
+    config = NoaaSdrConfig(enabled=True, device_serial="000123")
+    assert project_same_to_feature(SameEndMessage(), config) is None
+
+
+@pytest.mark.asyncio
+async def test_sdr_handler_feeds_only_actionable_features_to_shared_poller() -> None:
+    calls = []
+
+    class Poller:
+        async def ingest_feature(self, feature, *, source, shadow):
+            calls.append((feature, source, shadow))
+            return True
+
+    config = NoaaSdrConfig(enabled=True, device_serial="000123")
+    observation = parse_same(
+        "ZCZC-WXR-TOR-047125+0030-2491830-KOHX/NWS-",
+        now=datetime(2026, 9, 6, 18, 31, tzinfo=timezone.utc),
+    )
+    handler = _noaa_sdr_handler(Poller(), config=config, shadow=True)
+
+    await handler(observation)
+    await handler(SameEndMessage())
+
+    assert len(calls) == 1
+    assert calls[0][0]["properties"]["event"] == "Tornado Warning"
+    assert calls[0][1:] == ("noaa_sdr", True)
+
+
+def test_raspberry_pi_temperature_reads_bounded_sysfs_value(tmp_path: Path) -> None:
+    thermal = tmp_path / "temp"
+    thermal.write_text("70625\n")
+    assert raspberry_pi_temperature(thermal) == 70.625
+    thermal.write_text("not-temperature\n")
+    assert raspberry_pi_temperature(thermal) is None
+
+
+def test_app_lifespan_starts_cancels_and_awaits_sdr_task(monkeypatch, tmp_path: Path) -> None:
+    import app.main as main_module
+
+    instances = []
+
+    class Supervisor:
+        def __init__(self, config, *, callback, thermal_provider):
+            self.config = config
+            self.callback = callback
+            self.thermal_provider = thermal_provider
+            self.health = SimpleNamespace(state="new")
+            self.started = False
+            self.cancelled = False
+            instances.append(self)
+
+        async def run(self):
+            self.started = True
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    receiver = NoaaSdrConfig(enabled=True, device_serial="000123")
+    monkeypatch.setenv("MESH_WX_DB", str(tmp_path / "app.db"))
+    monkeypatch.setattr(main_module, "NoaaSdrSupervisor", Supervisor)
+    monkeypatch.setattr(
+        main_module, "load_noaa_sdr_config",
+        lambda: NoaaSdrAppConfig(receiver=receiver, shadow=True),
+    )
+
+    with TestClient(create_app()) as client:
+        assert client.get("/healthz").status_code == 200
+        assert instances[0].started is True
+        assert instances[0].thermal_provider is main_module.raspberry_pi_temperature
+        assert client.app.state.noaa_sdr_task.done() is False
+
+    assert instances[0].cancelled is True
+    assert client.app.state.noaa_sdr_task.done() is True
+
+
+def test_sdr_task_failure_does_not_crash_web_app(monkeypatch, tmp_path: Path) -> None:
+    import app.main as main_module
+
+    class Supervisor:
+        health = SimpleNamespace(state="backoff", last_error="receiver failed")
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def run(self):
+            raise RuntimeError("receiver failed")
+
+    monkeypatch.setenv("MESH_WX_DB", str(tmp_path / "app.db"))
+    monkeypatch.setattr(main_module, "NoaaSdrSupervisor", Supervisor)
+    monkeypatch.setattr(
+        main_module, "load_noaa_sdr_config",
+        lambda: NoaaSdrAppConfig(
+            receiver=NoaaSdrConfig(enabled=True, device_serial="000123"),
+            shadow=True,
+        ),
+    )
+
+    with TestClient(create_app()) as client:
+        assert client.get("/healthz").text == "ok"
+        assert client.app.state.noaa_sdr_task.done() is True
 
 
 class Reader:
@@ -236,7 +457,7 @@ async def test_nonzero_child_exit_is_detected_and_reported() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pcm_or_decoder_stall_forces_restart() -> None:
+async def test_pcm_stall_forces_restart() -> None:
     rtl = Process(stdout=HangingReader())
     decoder = Process(stdout=HangingReader(), stdin=Writer())
     supervisor = NoaaSdrSupervisor(
@@ -246,6 +467,46 @@ async def test_pcm_or_decoder_stall_forces_restart() -> None:
     await supervisor.run(max_cycles=1)
     assert supervisor.health.restarts == 1
     assert supervisor.health.state == "backoff"
+
+
+@pytest.mark.asyncio
+async def test_thermal_latch_stays_fail_closed_when_sensor_becomes_unavailable() -> None:
+    readings = iter([None, 70.0])
+    sleeps: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    supervisor = NoaaSdrSupervisor(
+        NoaaSdrConfig(enabled=True, device_serial="x", thermal_poll_interval=.01),
+        executable_lookup=lambda n: n,
+        thermal_provider=lambda: next(readings),
+        sleep=sleep,
+    )
+    supervisor._thermal_latched = True
+
+    await supervisor._wait_until_cool()
+
+    assert sleeps == [.01]
+    assert supervisor._thermal_latched is False
+    assert supervisor.health.temperature_c == 70.0
+
+
+@pytest.mark.asyncio
+async def test_decoder_silence_does_not_restart_while_pcm_is_alive() -> None:
+    """multimon emits no stdout between SAME headers; that silence is healthy."""
+    decoder = Process(stdout=HangingReader(), stdin=Writer())
+    supervisor = NoaaSdrSupervisor(
+        NoaaSdrConfig(enabled=True, device_serial="x", stall_timeout=.01),
+    )
+
+    task = asyncio.create_task(supervisor._decode_lines(decoder))
+    await asyncio.sleep(.03)
+
+    assert task.done() is False
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 @pytest.mark.asyncio

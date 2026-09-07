@@ -45,6 +45,10 @@ if command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y -qq python3 python3-venv python3-pip git
+  if [ "${MESHWX_INSTALL_NOAA_SDR:-0}" = "1" ]; then
+    say "installing optional NOAA Weather Radio receiver tools"
+    apt-get install -y -qq rtl-sdr multimon-ng
+  fi
 elif command -v dnf >/dev/null 2>&1; then
   say "installing system packages via dnf"
   dnf install -y python3 python3-pip git
@@ -71,6 +75,24 @@ say "installing WXDispatch dependencies (this can take a couple of minutes)"
 # ---- 3. serial access ---------------------------------------------------
 say "granting serial access: adding $SVC_USER to the 'dialout' group"
 usermod -aG dialout "$SVC_USER" || warn "could not add $SVC_USER to dialout; add it manually."
+if [ "${MESHWX_INSTALL_NOAA_SDR:-0}" = "1" ]; then
+  getent group plugdev >/dev/null 2>&1 \
+    && usermod -aG plugdev "$SVC_USER" \
+    || warn "could not add $SVC_USER to plugdev; verify RTL-SDR USB permissions manually."
+  install -d -m 0755 /etc/modprobe.d
+  if [ ! -e /etc/modprobe.d/blacklist-rtl-sdr.conf ]; then
+    printf '%s\n' \
+      '# Reserve RTL2832U devices for rtl-sdr userspace tools.' \
+      'blacklist dvb_usb_rtl28xxu' \
+      'blacklist rtl2832' \
+      'blacklist rtl2832_sdr' \
+      > /etc/modprobe.d/blacklist-rtl-sdr.conf
+    command -v update-initramfs >/dev/null 2>&1 && update-initramfs -u || true
+    warn "RTL-SDR kernel blacklist installed; reboot may be required before userspace can claim the receiver."
+  else
+    warn "preserving existing /etc/modprobe.d/blacklist-rtl-sdr.conf; verify required RTL2832U blacklist entries manually."
+  fi
+fi
 
 # ---- 4. data dir + systemd service -------------------------------------
 mkdir -p "$DIR/data"

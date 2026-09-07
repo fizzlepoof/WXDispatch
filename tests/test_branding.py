@@ -14,15 +14,15 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_product_identity_is_wxdispatch_2():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
 
-    assert __version__ == "2.4.3"
+    assert __version__ == "2.4.4"
     assert project["project"]["name"] == "wxdispatch"
-    assert project["project"]["version"] == "2.4.3"
+    assert project["project"]["version"] == "2.4.4"
     assert project["project"]["urls"]["Repository"] == \
         "https://github.com/fizzlepoof/WXDispatch"
     assert GITHUB_REPO == "fizzlepoof/WXDispatch"
     app = create_app()
     assert app.title == "WXDispatch"
-    assert app.version == "2.4.3"
+    assert app.version == "2.4.4"
 
 
 def test_python_package_includes_web_templates():
@@ -107,7 +107,11 @@ def test_legacy_runtime_identifiers_remain_for_upgrades():
     assert "systemctl restart mesh-wx-guest.service" in installer_text
     assert "MESH_WX_DB" in service
     assert "EnvironmentFile=-/etc/mesh-wx/nwws.env" in service
+    assert "EnvironmentFile=-/etc/mesh-wx/noaa-sdr.env" in service
     assert "MESH_WX_NWWS_PASSWORD=" not in service
+    assert "rtl-sdr multimon-ng" in installer_text
+    assert "blacklist dvb_usb_rtl28xxu" in installer_text
+    assert "blacklist rtl2832_sdr" in installer_text
     guest_service = (ROOT / "packaging/mesh-wx-guest.service").read_text()
     assert "python -m app.guest" in guest_service
     assert "MESH_WX_GUEST_PASSWORD_FILE=/etc/mesh-wx/guest-password" in guest_service

@@ -17,6 +17,10 @@
       <p class="sub">NWS &rarr; {{ rnames | join(' + ') if rnames else 'no radios' }}
         &middot; <span>NWWS-OI {{ nwws_status.state }}</span>{% if nwws_status.shadow %} (shadow){% endif %}
         &middot; {{ nwws_status.received }} received / {{ nwws_status.delivered }} handled
+        <br><span>NOAA SDR {{ sdr_status.callsign }} {{ sdr_status.state }}</span>{% if sdr_status.shadow %} (shadow){% endif %}
+        &middot; {{ '%.3f'|format(sdr_status.frequency_mhz) }} MHz
+        &middot; audio {{ '%.1f'|format(sdr_status.audio_percent) }}%
+        {% if sdr_status.temperature_c is not none %}&middot; {{ '%.1f'|format(sdr_status.temperature_c) }}&deg;C{% endif %}
       </p>
     </div>
     <div class="topbar-right">

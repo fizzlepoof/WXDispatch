@@ -10,6 +10,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .noaa_sdr import NoaaSdrConfig
 from .nwws_runtime import NWWSRuntimeConfig
 
 # Preserve legacy data directories so upgrading from MeshWX never strands the
@@ -53,6 +54,13 @@ class NWWSAppConfig:
     shadow: bool = True
 
 
+@dataclass(frozen=True)
+class NoaaSdrAppConfig:
+    receiver: NoaaSdrConfig
+    shadow: bool = True
+    error: str | None = None
+
+
 def _env_bool(name: str, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -82,6 +90,51 @@ def load_nwws_config() -> NWWSAppConfig:
         ),
         shadow=_env_bool("MESH_WX_NWWS_SHADOW", True),
     )
+
+
+def _noaa_gain(value: str) -> str | float:
+    normalized = value.strip().casefold()
+    return "auto" if normalized == "auto" else float(normalized)
+
+
+def load_noaa_sdr_config() -> NoaaSdrAppConfig:
+    """Load the opt-in SDR receiver, failing closed on bad configuration."""
+    enabled = _env_bool("MESH_WX_NOAA_SDR_ENABLED", False)
+    shadow = _env_bool("MESH_WX_NOAA_SDR_SHADOW", True)
+    if not enabled:
+        return NoaaSdrAppConfig(receiver=NoaaSdrConfig(enabled=False), shadow=shadow)
+    # SAME lacks a source-neutral CAP/VTEC identity. Until correlation is
+    # implemented, direct routing alongside REST/NWWS could transmit one
+    # hazard twice. Fail closed if direct SDR routing is requested.
+    if not shadow:
+        return NoaaSdrAppConfig(
+            receiver=NoaaSdrConfig(enabled=False), shadow=True,
+            error="direct-routing-unsupported",
+        )
+
+    serial = os.environ.get("MESH_WX_NOAA_SDR_DEVICE_SERIAL", "").strip()
+    frequency_text = os.environ.get("MESH_WX_NOAA_SDR_FREQUENCY_HZ", "").strip()
+    if not serial or not frequency_text:
+        return NoaaSdrAppConfig(
+            receiver=NoaaSdrConfig(enabled=False), shadow=True, error="configuration",
+        )
+    try:
+        receiver = NoaaSdrConfig(
+            enabled=True,
+            device_serial=serial,
+            frequency_hz=int(frequency_text),
+            callsign=os.environ.get("MESH_WX_NOAA_SDR_CALLSIGN", "WWH37").strip(),
+            receiver_id=os.environ.get(
+                "MESH_WX_NOAA_SDR_RECEIVER_ID", "noaa-wwh37"
+            ).strip(),
+            ppm=int(os.environ.get("MESH_WX_NOAA_SDR_PPM", "0").strip()),
+            gain=_noaa_gain(os.environ.get("MESH_WX_NOAA_SDR_GAIN", "auto")),
+        )
+    except (TypeError, ValueError):
+        return NoaaSdrAppConfig(
+            receiver=NoaaSdrConfig(enabled=False), shadow=True, error="configuration",
+        )
+    return NoaaSdrAppConfig(receiver=receiver, shadow=shadow)
 
 
 def load_bootstrap() -> BootstrapConfig:

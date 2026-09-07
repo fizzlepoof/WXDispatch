@@ -164,6 +164,29 @@ def test_dashboard_exposes_only_sanitized_nwws_health(web):
     assert "0 received" in degraded.text
 
 
+def test_dashboard_exposes_only_sanitized_noaa_sdr_health(web):
+    client, _db, _tx = web
+    client.app.state.noaa_sdr = SimpleNamespace(
+        config=SimpleNamespace(enabled=True, callsign="WWH37", frequency_hz=162_500_000),
+        health=SimpleNamespace(
+            state="running", restarts=0, audio_rms=0.11665, audio_peak=0.17889,
+            temperature_c=69.6, last_valid_header=None, last_rwt=None,
+            last_error="SECRET DEVICE DETAIL",
+        ),
+    )
+    client.app.state.noaa_sdr_shadow = True
+    client.app.state.noaa_sdr_config_error = None
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "NOAA SDR WWH37 running" in response.text
+    assert "162.500 MHz" in response.text
+    assert "shadow" in response.text
+    assert "audio 11.7%" in response.text
+    assert "SECRET DEVICE DETAIL" not in response.text
+
+
 def test_state_changes_require_matching_csrf_token(web):
     client, _db, _tx = web
 

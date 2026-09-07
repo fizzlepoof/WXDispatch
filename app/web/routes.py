@@ -335,6 +335,55 @@ def _dash_ctx(request) -> dict:
         "error_category": getattr(nwws_health, "error_category", None),
     }
 
+    sdr_service = getattr(request.app.state, "noaa_sdr", None)
+    sdr_health = getattr(sdr_service, "health", None)
+    sdr_config = getattr(sdr_service, "config", None)
+    sdr_state = str(getattr(sdr_health, "state", "disabled"))
+    if sdr_state not in {
+        "new", "disabled", "running", "backoff", "thermal_hold",
+        "missing_tools", "stopped",
+    }:
+        sdr_state = "unknown"
+
+    def _bounded_number(value, low, high, default=0.0):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        return number if low <= number <= high else default
+
+    sdr_enabled = bool(getattr(sdr_config, "enabled", False))
+    sdr_config_error = bool(getattr(request.app.state, "noaa_sdr_config_error", None))
+    temperature_value = getattr(sdr_health, "temperature_c", None)
+    sdr_status = {
+        "enabled": sdr_enabled,
+        "state": sdr_state,
+        "shadow": bool(getattr(request.app.state, "noaa_sdr_shadow", True)),
+        "callsign": str(getattr(sdr_config, "callsign", "WWH37"))[:16],
+        "frequency_mhz": _bounded_number(
+            getattr(sdr_config, "frequency_hz", 162_500_000),
+            162_400_000, 162_550_000, 162_500_000,
+        ) / 1_000_000,
+        "audio_percent": _bounded_number(
+            getattr(sdr_health, "audio_rms", 0.0), 0.0, 1.0,
+        ) * 100,
+        "peak_percent": _bounded_number(
+            getattr(sdr_health, "audio_peak", 0.0), 0.0, 1.0,
+        ) * 100,
+        "temperature_c": (
+            None if temperature_value is None
+            else _bounded_number(temperature_value, -50.0, 150.0)
+        ),
+        "restarts": max(0, int(getattr(sdr_health, "restarts", 0) or 0)),
+        "has_error": bool(getattr(sdr_health, "last_error", None)),
+    }
+    if sdr_config_error:
+        problems.append(("warn", "NOAA SDR configuration is invalid; receiver is disabled."))
+    elif sdr_enabled and sdr_state not in {"running", "thermal_hold"}:
+        problems.append(("warn", "NOAA SDR receiver is %s." % sdr_state.replace("_", " ")))
+    health_level = ("critical" if any(level == "critical" for level, _ in problems)
+                    else "warn" if problems else "ok")
+
     return {
         "health_level": health_level,
         "health_problems": [m for _, m in problems],
@@ -354,6 +403,7 @@ def _dash_ctx(request) -> dict:
         "recent": recent, "last_tx": last_tx,
         "transports": tx.status(),
         "nwws_status": nwws_status,
+        "sdr_status": sdr_status,
     }
 
 
