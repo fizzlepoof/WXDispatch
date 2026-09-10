@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Final
 
-from app.noaa_same import SameEndMessage, SameObservation, SameRepeatConfirmer, parse_same
+from app.noaa_same import SameEndMessage, SameObservation, parse_same
 
 NOAA_FREQUENCIES_HZ: Final = frozenset(
     {162_400_000, 162_425_000, 162_450_000, 162_475_000, 162_500_000, 162_525_000, 162_550_000}
@@ -243,7 +243,6 @@ class NoaaSdrSupervisor:
         self._monotonic = monotonic
         self._health = NoaaSdrHealth()
         self._processes: list[object] = []
-        self._confirmer = SameRepeatConfirmer(confirmation_window=5.0)
         self._thermal_latched = False
 
     @property
@@ -431,20 +430,22 @@ class NoaaSdrSupervisor:
                     malformed += 1
                 else:
                     malformed = 0
-                    confirmed = self._confirmer.process(parsed, monotonic_now=self._monotonic())
-                    if confirmed is not None:
-                        now = self._wall_clock()
-                        if isinstance(confirmed, SameEndMessage):
-                            self._update(last_eom=now)
-                        else:
-                            changes: dict[str, object] = {"last_valid_header": now}
-                            if confirmed.event_code == "RWT":
-                                changes["last_rwt"] = now
-                            self._update(**changes)
-                        if self.callback is not None:
-                            result = self.callback(confirmed)
-                            if inspect.isawaitable(result):
-                                await result
+                    # multimon-ng's EAS demodulator emits a header only after
+                    # two of the three over-the-air copies agree. Requiring a
+                    # second identical output here makes every header vanish.
+                    confirmed = parsed
+                    now = self._wall_clock()
+                    if isinstance(confirmed, SameEndMessage):
+                        self._update(last_eom=now)
+                    else:
+                        changes: dict[str, object] = {"last_valid_header": now}
+                        if confirmed.event_code == "RWT":
+                            changes["last_rwt"] = now
+                        self._update(**changes)
+                    if self.callback is not None:
+                        result = self.callback(confirmed)
+                        if inspect.isawaitable(result):
+                            await result
             if malformed >= self.config.max_malformed_lines:
                 raise _CycleEnded("malformed decoder flood")
 

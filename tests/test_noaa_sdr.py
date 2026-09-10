@@ -382,9 +382,11 @@ async def test_enabled_requires_both_executables_before_spawn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pumps_aligned_bounded_pcm_confirms_headers_and_eom() -> None:
+async def test_accepts_single_multimon_consensus_header_and_eom() -> None:
+    # multimon-ng's EAS demodulator already requires two matching RF headers
+    # before emitting one consensus line; do not require a second output line.
     header = b"ZCZC-WXR-TOR-047125+0030-2491830-KOHX/NWS-\n"
-    rtl, decoder = make_pair(pcm=[b"\x01\x00\x02", b"\x00\x03\x00", b""], lines=[header, header, b"NNNN\n", b""])
+    rtl, decoder = make_pair(pcm=[b"\x01\x00\x02", b"\x00\x03\x00", b""], lines=[header, b"NNNN\n", b""])
     factory = Factory([(rtl, decoder)])
     observed: list[SameObservation | SameEndMessage] = []
     supervisor = NoaaSdrSupervisor(
