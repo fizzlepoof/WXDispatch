@@ -567,6 +567,77 @@ async def local_alert_map_data(request: Request):
     }, headers={"Cache-Control": "no-store"})
 
 
+def _bounded_ha_alert_text(value: Any, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    return text[:limit]
+
+
+def _bounded_ha_alert_list(value: Any, *, limit: int = 32) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [
+        text for item in value[:limit]
+        if (text := _bounded_ha_alert_text(item, 96))
+    ]
+
+
+@router.get("/api/home-assistant/alerts", response_class=JSONResponse)
+async def home_assistant_alert_data(request: Request):
+    try:
+        db = _db(request)
+        configured = configured_counties(db)
+        contact = str(db.get_setting("nws_contact", "") or "")
+        alerts, alert_errors, stale, last_success = await _AREA_ALERT_CACHE.get_many(
+            configured, contact,
+        )
+    except Exception:
+        return JSONResponse({
+            "count": 0,
+            "alerts": [],
+            "last_poll_success": "",
+            "stale": True,
+            "error": "WXDispatch watched-alert data is temporarily unavailable.",
+        }, headers={"Cache-Control": "no-store"})
+    county_names = {county["code"]: county["name"] for county in configured}
+    summaries = []
+    for raw in alerts:
+        if not isinstance(raw, dict) or not raw.get("watched"):
+            continue
+        local_zones = _bounded_ha_alert_list(raw.get("local_zones"))
+        local_counties = _bounded_ha_alert_list(raw.get("local_counties"))
+        if not local_counties:
+            local_counties = [county_names.get(code, code) for code in local_zones]
+        summaries.append({
+            "event": _bounded_ha_alert_text(raw.get("event"), 96),
+            "headline": _bounded_ha_alert_text(raw.get("headline"), 256),
+            "severity": _bounded_ha_alert_text(raw.get("severity"), 24),
+            "urgency": _bounded_ha_alert_text(raw.get("urgency"), 24),
+            "certainty": _bounded_ha_alert_text(raw.get("certainty"), 24),
+            "onset": _bounded_ha_alert_text(raw.get("onset"), 128),
+            "ends": _bounded_ha_alert_text(raw.get("ends"), 128),
+            "expires": _bounded_ha_alert_text(raw.get("expires"), 128),
+            "local_counties": local_counties,
+            "local_zones": local_zones,
+        })
+        if len(summaries) >= 32:
+            break
+    if not configured:
+        error = "No watched counties are configured in WXDispatch."
+    elif alert_errors and not last_success:
+        error = "Current WXDispatch watched-alert data is unavailable."
+    elif alert_errors:
+        error = "Some WXDispatch watched-alert checks failed; results may be incomplete."
+    else:
+        error = ""
+    return JSONResponse({
+        "count": len(summaries),
+        "alerts": summaries,
+        "last_poll_success": _bounded_ha_alert_text(last_success, 128),
+        "stale": bool(stale or alert_errors),
+        "error": error,
+    }, headers={"Cache-Control": "no-store"})
+
+
 @router.get("/partials/status", response_class=HTMLResponse)
 async def status_partial(request: Request):
     return render(request, "_dash_top.html", **_dash_ctx(request))

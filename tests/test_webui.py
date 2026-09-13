@@ -607,6 +607,127 @@ def test_local_alert_map_data_uses_county_scoped_alerts_and_configured_route_cou
     assert payload["error"] == ""
 
 
+def test_home_assistant_alert_feed_is_bounded_and_watched_only(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    client, db, _tx = web
+    rule_id = db.create_route("home assistant", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+
+    class FakeAreaCache:
+        async def get_many(self, counties, contact):
+            return [
+                {
+                    "id": "watched", "event": "Tornado Warning", "headline": "Local warning",
+                    "area": "Montgomery County", "severity": "Extreme",
+                    "urgency": "Immediate", "certainty": "Observed",
+                    "onset": "2099-01-01T00:00:00+00:00", "ends": "",
+                    "expires": "2099-01-01T01:00:00+00:00",
+                    "local_zones": ["TNC125"], "local_counties": ["Montgomery County"],
+                    "geometry": {"type": "Polygon", "coordinates": [[[1, 2]]]},
+                    "description": "must not leak", "watched": True,
+                    "affected_zones": ["TNC125"], "internal": "must not leak",
+                },
+                {
+                    "id": "regional", "event": "Flood Warning", "headline": "Nearby",
+                    "area": "Davidson County", "severity": "Severe", "urgency": "Expected",
+                    "certainty": "Likely", "onset": "", "ends": "", "expires": "",
+                    "local_zones": [], "local_counties": [], "geometry": None,
+                    "watched": False, "affected_zones": ["TNC037"],
+                },
+            ], [], False, "2099-01-01T00:00:00+00:00"
+
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", FakeAreaCache())
+    history_before = db.query_history()
+
+    response = client.get("/api/home-assistant/alerts")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "count": 1,
+        "alerts": [{
+            "event": "Tornado Warning",
+            "headline": "Local warning",
+            "severity": "Extreme",
+            "urgency": "Immediate",
+            "certainty": "Observed",
+            "onset": "2099-01-01T00:00:00+00:00",
+            "ends": "",
+            "expires": "2099-01-01T01:00:00+00:00",
+            "local_counties": ["Montgomery County"],
+            "local_zones": ["TNC125"],
+        }],
+        "last_poll_success": "2099-01-01T00:00:00+00:00",
+        "stale": False,
+        "error": "",
+    }
+    assert db.query_history() == history_before
+
+
+def test_home_assistant_alert_feed_degrades_without_leaking_cache_errors(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    class BrokenAreaCache:
+        async def get_many(self, counties, contact):
+            raise RuntimeError("private upstream failure must not leak")
+
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", BrokenAreaCache())
+
+    response = web[0].get("/api/home-assistant/alerts")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "count": 0,
+        "alerts": [],
+        "last_poll_success": "",
+        "stale": True,
+        "error": "WXDispatch watched-alert data is temporarily unavailable.",
+    }
+    assert "private upstream failure" not in response.text
+
+
+def test_home_assistant_alert_feed_marks_partial_state_failures(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    client, db, _tx = web
+    rule_id = db.create_route("multi-state", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+
+    class PartialAreaCache:
+        async def get_many(self, counties, contact):
+            return [], ["KY"], False, "2099-01-01T00:00:00+00:00"
+
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", PartialAreaCache())
+
+    response = client.get("/api/home-assistant/alerts")
+
+    assert response.status_code == 200
+    assert response.json()["stale"] is True
+    assert response.json()["error"] == (
+        "Some WXDispatch watched-alert checks failed; results may be incomplete."
+    )
+
+
+def test_home_assistant_alert_feed_degrades_on_database_failure(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    def broken_db(_request):
+        raise RuntimeError("private database failure must not leak")
+
+    monkeypatch.setattr(routes_mod, "_db", broken_db)
+
+    response = web[0].get("/api/home-assistant/alerts")
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 0
+    assert response.json()["stale"] is True
+    assert response.json()["error"] == (
+        "WXDispatch watched-alert data is temporarily unavailable."
+    )
+    assert "private database failure" not in response.text
+
+
 def test_local_alert_map_data_includes_regional_alerts_and_watched_priority(web, monkeypatch):
     import app.web.routes as routes_mod
 
