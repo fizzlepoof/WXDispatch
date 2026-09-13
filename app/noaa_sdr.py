@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import logging
 import math
 import os
 import random
@@ -22,6 +23,8 @@ from pathlib import Path
 from typing import Awaitable, Callable, Final
 
 from app.noaa_same import SameEndMessage, SameObservation, parse_same
+
+logger = logging.getLogger("mesh_wx.noaa_sdr")
 
 NOAA_FREQUENCIES_HZ: Final = frozenset(
     {162_400_000, 162_425_000, 162_450_000, 162_475_000, 162_500_000, 162_525_000, 162_550_000}
@@ -126,11 +129,16 @@ def build_multimon_argv(*, executable: str = "multimon-ng") -> list[str]:
 class NoaaSdrHealth:
     state: str = "new"
     restarts: int = 0
+    confirmed_headers: int = 0
+    confirmed_eom: int = 0
     last_pcm: float | None = None
     last_decoder: float | None = None
     last_valid_header: datetime | None = None
     last_rwt: datetime | None = None
     last_eom: datetime | None = None
+    last_event_code: str | None = None
+    last_event_name: str | None = None
+    last_location_count: int = 0
     audio_rms: float = 0.0
     audio_peak: float = 0.0
     audio_dc: float = 0.0
@@ -436,12 +444,31 @@ class NoaaSdrSupervisor:
                     confirmed = parsed
                     now = self._wall_clock()
                     if isinstance(confirmed, SameEndMessage):
-                        self._update(last_eom=now)
+                        self._update(
+                            last_eom=now,
+                            confirmed_eom=self._health.confirmed_eom + 1,
+                        )
+                        logger.info(
+                            "NOAA SAME end marker received callsign=%s",
+                            self.config.callsign,
+                        )
                     else:
-                        changes: dict[str, object] = {"last_valid_header": now}
+                        changes: dict[str, object] = {
+                            "last_valid_header": now,
+                            "confirmed_headers": self._health.confirmed_headers + 1,
+                            "last_event_code": confirmed.event_code,
+                            "last_event_name": confirmed.event_name,
+                            "last_location_count": len(confirmed.locations),
+                        }
                         if confirmed.event_code == "RWT":
                             changes["last_rwt"] = now
                         self._update(**changes)
+                        logger.info(
+                            "NOAA SAME header received callsign=%s event=%s locations=%d",
+                            self.config.callsign,
+                            confirmed.event_code,
+                            len(confirmed.locations),
+                        )
                     if self.callback is not None:
                         result = self.callback(confirmed)
                         if inspect.isawaitable(result):

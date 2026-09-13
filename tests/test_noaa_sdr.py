@@ -409,6 +409,33 @@ async def test_accepts_single_multimon_consensus_header_and_eom() -> None:
 
 
 @pytest.mark.asyncio
+async def test_health_records_safe_confirmed_same_summary(caplog) -> None:
+    caplog.set_level("INFO", logger="mesh_wx.noaa_sdr")
+    header = b"ZCZC-WXR-RWT-047125+0030-2491830-KOHX/NWS-\n"
+    rtl, decoder = make_pair(pcm=[b"\x01\x00"], lines=[header, b"NNNN\n", b""])
+    supervisor = NoaaSdrSupervisor(
+        NoaaSdrConfig(enabled=True, device_serial="x"),
+        process_factory=Factory([(rtl, decoder)]),
+        executable_lookup=lambda name: name,
+        wall_clock=lambda: datetime(2026, 9, 6, 18, 31, tzinfo=timezone.utc),
+    )
+
+    await supervisor.run(max_cycles=1)
+
+    health = supervisor.health
+    assert health.confirmed_headers == 1
+    assert health.confirmed_eom == 1
+    assert health.last_event_code == "RWT"
+    assert health.last_event_name == "Required Weekly Test"
+    assert health.last_location_count == 1
+    assert health.last_rwt == datetime(2026, 9, 6, 18, 31, tzinfo=timezone.utc)
+    assert "ZCZC" not in repr(health)
+    assert "NOAA SAME header received callsign=WWH37 event=RWT locations=1" in caplog.text
+    assert "NOAA SAME end marker received callsign=WWH37" in caplog.text
+    assert header.decode().strip() not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_malformed_flood_restarts_with_capped_backoff() -> None:
     lines = [b"garbage\n"] * 4
     pairs = [make_pair(pcm=[b"\x00\x00"], lines=lines) for _ in range(3)]

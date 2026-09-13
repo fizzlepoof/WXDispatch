@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import datetime
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -171,6 +172,8 @@ def test_dashboard_exposes_only_sanitized_noaa_sdr_health(web):
         health=SimpleNamespace(
             state="running", restarts=0, audio_rms=0.11665, audio_peak=0.17889,
             temperature_c=69.6, last_valid_header=None, last_rwt=None,
+            confirmed_headers=0, confirmed_eom=0, last_event_code=None,
+            last_event_name=None, last_location_count=0,
             last_error="SECRET DEVICE DETAIL",
         ),
     )
@@ -184,7 +187,31 @@ def test_dashboard_exposes_only_sanitized_noaa_sdr_health(web):
     assert "162.500 MHz" in response.text
     assert "shadow" in response.text
     assert "audio 11.7%" in response.text
+    assert "0 confirmed SAME headers" in response.text
+    assert "awaiting first valid SAME header" in response.text
     assert "SECRET DEVICE DETAIL" not in response.text
+
+    client.app.state.noaa_sdr.health.confirmed_headers = "invalid"
+    client.app.state.noaa_sdr.health.confirmed_eom = float("nan")
+    client.app.state.noaa_sdr.health.last_location_count = object()
+    degraded = client.get("/")
+    assert degraded.status_code == 200
+    assert "0 confirmed SAME headers" in degraded.text
+
+    observed_at = datetime.datetime(2026, 9, 13, 14, 6, tzinfo=datetime.timezone.utc)
+    client.app.state.noaa_sdr.health.confirmed_headers = 1
+    client.app.state.noaa_sdr.health.last_event_code = "RWT"
+    client.app.state.noaa_sdr.health.last_valid_header = observed_at
+    client.app.state.noaa_sdr.health.last_rwt = observed_at
+    observed = client.get("/")
+    assert observed.status_code == 200
+    assert "1 confirmed SAME headers" in observed.text
+    assert "last RWT" in observed.text
+
+    client.app.state.noaa_sdr.health.last_valid_header = datetime.datetime(2026, 9, 13)
+    client.app.state.noaa_sdr.health.last_rwt = object()
+    malformed_time = client.get("/")
+    assert malformed_time.status_code == 200
 
 
 def test_state_changes_require_matching_csrf_token(web):

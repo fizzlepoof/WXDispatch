@@ -352,6 +352,20 @@ def _dash_ctx(request) -> dict:
             return default
         return number if low <= number <= high else default
 
+    def _health_time(value: object) -> str:
+        if not isinstance(value, datetime.datetime):
+            return ""
+        if value.tzinfo is None or value.utcoffset() is None:
+            return ""
+        return fmt_local(value.isoformat(), tz)
+
+    def _bounded_count(value: Any, maximum: int = 2_147_483_647) -> int:
+        try:
+            count = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(0, min(maximum, count))
+
     sdr_enabled = bool(getattr(sdr_config, "enabled", False))
     sdr_config_error = bool(getattr(request.app.state, "noaa_sdr_config_error", None))
     temperature_value = getattr(sdr_health, "temperature_c", None)
@@ -374,7 +388,24 @@ def _dash_ctx(request) -> dict:
             None if temperature_value is None
             else _bounded_number(temperature_value, -50.0, 150.0)
         ),
-        "restarts": max(0, int(getattr(sdr_health, "restarts", 0) or 0)),
+        "restarts": _bounded_count(getattr(sdr_health, "restarts", 0)),
+        "confirmed_headers": _bounded_count(
+            getattr(sdr_health, "confirmed_headers", 0)
+        ),
+        "confirmed_eom": _bounded_count(getattr(sdr_health, "confirmed_eom", 0)),
+        "last_event_code": str(
+            getattr(sdr_health, "last_event_code", "") or ""
+        )[:3],
+        "last_event_name": str(
+            getattr(sdr_health, "last_event_name", "") or ""
+        )[:95],
+        "last_location_count": _bounded_count(
+            getattr(sdr_health, "last_location_count", 0), 31
+        ),
+        "last_header_local": _health_time(
+            getattr(sdr_health, "last_valid_header", None)
+        ),
+        "last_rwt_local": _health_time(getattr(sdr_health, "last_rwt", None)),
         "has_error": bool(getattr(sdr_health, "last_error", None)),
     }
     if sdr_config_error:

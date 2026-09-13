@@ -21,6 +21,13 @@
         &middot; {{ '%.3f'|format(sdr_status.frequency_mhz) }} MHz
         &middot; audio {{ '%.1f'|format(sdr_status.audio_percent) }}%
         {% if sdr_status.temperature_c is not none %}&middot; {{ '%.1f'|format(sdr_status.temperature_c) }}&deg;C{% endif %}
+        &middot; {{ sdr_status.confirmed_headers }} confirmed SAME headers
+        {% if sdr_status.last_header_local %}
+          &middot; last {{ sdr_status.last_event_code }} {{ sdr_status.last_header_local }}
+        {% elif sdr_status.enabled and sdr_status.state == 'running' %}
+          &middot; awaiting first valid SAME header
+        {% endif %}
+        {% if sdr_status.last_rwt_local %}&middot; last RWT {{ sdr_status.last_rwt_local }}{% endif %}
       </p>
     </div>
     <div class="topbar-right">
