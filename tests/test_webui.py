@@ -515,6 +515,28 @@ def test_local_alert_map_page_uses_pinned_leaflet_and_safe_dom_rendering(web):
     assert "https://www.openstreetmap.org/copyright" in response.text
 
 
+def test_local_alert_map_auto_enables_public_radar_for_nearby_alerts(web):
+    client, _db, _tx = web
+
+    response = client.get("/map")
+
+    assert response.status_code == 200
+    assert 'id="radar-toggle"' in response.text
+    assert 'id="radar-opacity"' in response.text
+    assert 'id="radar-status"' in response.text
+    assert "https://mesonet.agron.iastate.edu/cgi-bin/wms/nexrad/n0q.cgi" in response.text
+    assert "L.tileLayer.wms" in response.text
+    assert "nexrad-n0q-900913" in response.text
+    assert "Iowa Environmental Mesonet" in response.text
+    assert "National Weather Service" in response.text
+    assert "Array.isArray(data.alerts)&&data.alerts.length>0" in response.text
+    assert "radarLayer.addTo(map)" in response.text
+    assert "map.removeLayer(radarLayer)" in response.text
+    assert "radarLayer.setOpacity" in response.text
+    assert "radarLayer.setParams" in response.text
+    assert "Radar automatically appears while nearby alerts are active." in response.text
+
+
 def test_local_alert_map_data_uses_county_scoped_alerts_and_configured_route_counties(web, monkeypatch):
     import app.web.routes as routes_mod
 

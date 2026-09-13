@@ -129,6 +129,10 @@ def test_authenticated_guest_navigation_exposes_only_requested_read_only_pages(
     map_page = client.get("/map", headers=guest_auth())
     assert "Current regional alerts" in map_page.text
     assert 'fetch("/api/map-data"' in map_page.text
+    assert "radaromega" not in map_page.text.casefold()
+    assert "api_key" not in map_page.text.casefold()
+    assert 'id="radar-toggle"' in map_page.text
+    assert "mesonet.agron.iastate.edu" in map_page.text
 
 
 def test_guest_histories_are_bounded_sanitized_and_database_is_read_only(
