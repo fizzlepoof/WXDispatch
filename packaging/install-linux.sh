@@ -9,6 +9,7 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SVC_USER="${SUDO_USER:-$(whoami)}"
+SVC_GROUP="$(id -gn "$SVC_USER")"
 
 say()  { printf '\033[1;36m>> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m!! %s\033[0m\n' "$*" >&2; }
@@ -44,6 +45,10 @@ if command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y -qq python3 python3-venv python3-pip git
+  if [ "${MESHWX_INSTALL_NOAA_SDR:-0}" = "1" ]; then
+    say "installing optional NOAA Weather Radio receiver tools"
+    apt-get install -y -qq rtl-sdr multimon-ng
+  fi
 elif command -v dnf >/dev/null 2>&1; then
   say "installing system packages via dnf"
   dnf install -y python3 python3-pip git
@@ -70,16 +75,51 @@ say "installing WXDispatch dependencies (this can take a couple of minutes)"
 # ---- 3. serial access ---------------------------------------------------
 say "granting serial access: adding $SVC_USER to the 'dialout' group"
 usermod -aG dialout "$SVC_USER" || warn "could not add $SVC_USER to dialout; add it manually."
+if [ "${MESHWX_INSTALL_NOAA_SDR:-0}" = "1" ]; then
+  getent group plugdev >/dev/null 2>&1 \
+    && usermod -aG plugdev "$SVC_USER" \
+    || warn "could not add $SVC_USER to plugdev; verify RTL-SDR USB permissions manually."
+  install -d -m 0755 /etc/modprobe.d
+  if [ ! -e /etc/modprobe.d/blacklist-rtl-sdr.conf ]; then
+    printf '%s\n' \
+      '# Reserve RTL2832U devices for rtl-sdr userspace tools.' \
+      'blacklist dvb_usb_rtl28xxu' \
+      'blacklist rtl2832' \
+      'blacklist rtl2832_sdr' \
+      > /etc/modprobe.d/blacklist-rtl-sdr.conf
+    command -v update-initramfs >/dev/null 2>&1 && update-initramfs -u || true
+    warn "RTL-SDR kernel blacklist installed; reboot may be required before userspace can claim the receiver."
+  else
+    warn "preserving existing /etc/modprobe.d/blacklist-rtl-sdr.conf; verify required RTL2832U blacklist entries manually."
+  fi
+fi
 
 # ---- 4. data dir + systemd service -------------------------------------
 mkdir -p "$DIR/data"
 chown -R "$SVC_USER" "$DIR/data" "$DIR/.venv"
 
-say "installing systemd service"
+say "installing systemd services"
 sed -e "s#__USER__#$SVC_USER#g" -e "s#__DIR__#$DIR#g" \
   "$DIR/packaging/mesh-wx.service" > /etc/systemd/system/mesh-wx.service
+sed -e "s#__USER__#$SVC_USER#g" -e "s#__GROUP__#$SVC_GROUP#g" -e "s#__DIR__#$DIR#g" \
+  "$DIR/packaging/mesh-wx-guest.service" > /etc/systemd/system/mesh-wx-guest.service
 systemctl daemon-reload
 systemctl enable --now mesh-wx.service
+
+if [ -f /etc/mesh-wx/guest-password ]; then
+  GUEST_MODE="$(stat -c '%a' /etc/mesh-wx/guest-password 2>/dev/null || true)"
+  GUEST_OWNER="$(stat -c '%U' /etc/mesh-wx/guest-password 2>/dev/null || true)"
+  if [ ! -L /etc/mesh-wx/guest-password ] \
+     && [ "$GUEST_MODE" = "600" ] && [ "$GUEST_OWNER" = "$SVC_USER" ]; then
+    systemctl enable mesh-wx-guest.service
+    systemctl restart mesh-wx-guest.service
+  else
+    warn "guest password file must be a non-symlink, mode 0600, owned by $SVC_USER; guest service disabled"
+    systemctl disable --now mesh-wx-guest.service 2>/dev/null || true
+  fi
+else
+  systemctl disable --now mesh-wx-guest.service 2>/dev/null || true
+fi
 
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 echo ""

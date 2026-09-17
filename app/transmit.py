@@ -18,7 +18,14 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from .config import BURST_GAP_SECONDS, REPEAT_GAP_SECONDS, QUEUE_MAX, MAX_PAYLOAD_BYTES
+from .config import (
+    BURST_GAP_SECONDS,
+    REPEAT_GAP_SECONDS,
+    QUEUE_MAX,
+    MAX_PAYLOAD_BYTES,
+    meshcore_flood_scope_override,
+    normalise_meshcore_flood_scope,
+)
 
 
 class TxUnsent(Exception):
@@ -250,9 +257,35 @@ class MeshCoreTransmitter(Transmitter):
     # app's previous eight-slot behavior rather than probing arbitrary indexes.
     FALLBACK_MAX_CHANNELS = 8
 
-    def __init__(self, conn: str, port: str = "", host: str = "", baud: int = 115200):
+    def __init__(self, conn: str, port: str = "", host: str = "", baud: int = 115200,
+                 flood_scope: str = "", require_flood_scope: bool = False):
         self.conn, self.port, self.host, self.baud = conn, port, host, baud
+        self.flood_scope = normalise_meshcore_flood_scope(flood_scope)
+        self.require_flood_scope = bool(require_flood_scope)
         self._mc = None
+
+    async def _apply_flood_scope(self) -> None:
+        """Select the configured scope immediately before a channel send.
+
+        The companion scope is mutable state. TransmitManager serializes radio
+        operations under its shared lock, so setting it here cannot leak across
+        concurrent WXDispatch sends. A failed scope command fails closed rather
+        than transmitting over an unscoped flood.
+        """
+        if not self.flood_scope:
+            if self.require_flood_scope:
+                raise TxUnsent(
+                    "scope", "flood scope is required; refusing unscoped send"
+                )
+            return
+        if self._mc is None:
+            raise RuntimeError("not connected")
+        from meshcore import EventType
+        result = await self._mc.commands.set_flood_scope(self.flood_scope)
+        if getattr(result, "type", None) != EventType.OK:
+            raise TxUnsent(
+                "scope", "companion rejected flood scope; refusing unscoped send"
+            )
 
     async def _device_info(self) -> dict:
         if self._mc is None:
@@ -384,6 +417,7 @@ class MeshCoreTransmitter(Transmitter):
         if self._mc is None:
             raise RuntimeError("not connected")
         from meshcore import EventType
+        await self._apply_flood_scope()
         res = await self._mc.commands.send_chan_msg(channel, text)
         result_type = getattr(res, "type", None)
         if result_type != EventType.OK:
@@ -404,6 +438,7 @@ class MeshCoreTransmitter(Transmitter):
         if not payload or len(payload) > 163:
             raise TxUnsent("too_large", "binary channel data must contain 1-163 bytes")
         from meshcore import EventType
+        await self._apply_flood_scope()
         data = b"\x3e" + bytes([channel, 0xFF]) + (0xFFFF).to_bytes(2, "little") + payload
         with _suppress_meshcore_dependency_logging():
             result = await self._mc.commands.send(data, [EventType.OK, EventType.ERROR])
@@ -499,6 +534,8 @@ class QueueItem:
     destination_id: int | None = None
     correlation_key: object = None
     require_prior_success: bool = False
+    followup_text: str = ""
+    delivery_attempt_id: int | None = None
 
 
 def _build_transports(db) -> dict:
@@ -524,12 +561,29 @@ def _build_transports(db) -> dict:
         repeat=rep("meshtastic_repeat"), test_channel=num("meshtastic_test_channel", 1),
     )
     mc_conn = g("meshcore_conn", "serial") or "serial"
+    deployment_scope = meshcore_flood_scope_override()
+    meshcore_scope = (
+        deployment_scope
+        if deployment_scope is not None
+        else (g("meshcore_flood_scope", "") or "")
+    )
+    meshcore_scope_required = (
+        True
+        if deployment_scope is not None
+        else bool(g("meshcore_require_flood_scope", False))
+    )
     mc = Transport(
         name="meshcore", label="MeshCore",
         enabled=bool(g("meshcore_enabled", False)),
         conn=mc_conn, channel=num("meshcore_channel", 0),
         target=(g("meshcore_host", "") if mc_conn == "tcp" else g("meshcore_port", "")) or "",
-        make=lambda: MeshCoreTransmitter(mc_conn, g("meshcore_port", "") or "", g("meshcore_host", "") or ""),
+        make=lambda: MeshCoreTransmitter(
+            mc_conn,
+            g("meshcore_port", "") or "",
+            g("meshcore_host", "") or "",
+            flood_scope=meshcore_scope,
+            require_flood_scope=meshcore_scope_required,
+        ),
         repeat=rep("meshcore_repeat"), test_channel=num("meshcore_test_channel", 1),
     )
     return {"meshtastic": mt, "meshcore": mc}
@@ -538,10 +592,13 @@ def _build_transports(db) -> dict:
 class TransmitManager:
     """Serializes node access, paces bursts, fans out to all enabled transports."""
 
+    supports_delivery_attempt_id = True
+
     def __init__(self, db):
         self._db = db
         self._transports = _build_transports(db)
         self._queue: deque[QueueItem] = deque(maxlen=QUEUE_MAX)        # high: weather/live
+        self._queue_detail: deque[QueueItem] = deque(maxlen=QUEUE_MAX) # medium: alert details
         self._queue_low: deque[QueueItem] = deque(maxlen=QUEUE_MAX)    # low: IPAWS/test
         self._queue_event = asyncio.Event()
         self._lock = asyncio.Lock()
@@ -569,10 +626,14 @@ class TransmitManager:
             if t.tx:
                 await t.tx.close()
 
-    async def reconfigure(self) -> None:
+    async def reconfigure(self, settings: dict | None = None) -> None:
         """Rebuild transports from settings and connect the enabled ones.
-        Called at startup and after a settings save."""
+        Called at startup and after a settings save. Settings supplied here are
+        committed under the transmit lock so no send can cross the activation
+        boundary with the previous transport configuration."""
         async with self._lock:
+            for key, value in (settings or {}).items():
+                self._db.set_setting(key, value)
             for t in self._transports.values():
                 if t.tx:
                     try:
@@ -581,8 +642,12 @@ class TransmitManager:
                         pass
             self._transports = _build_transports(self._db)
             targets = [t for t in self._transports.values() if t.enabled and t.target]
-        for t in targets:
-            await self._ensure(t)
+            # Connection establishment is part of the configuration boundary.
+            # Keeping it under the shared lock prevents sends (or a newer
+            # reconfiguration) from racing this transport or opening an obsolete
+            # transport after it has already been replaced.
+            for t in targets:
+                await self._ensure(t)
 
     # ---- status / compat ------------------------------------------------
     @property
@@ -595,7 +660,7 @@ class TransmitManager:
 
     @property
     def queue_depth(self) -> int:
-        return len(self._queue)
+        return len(self._queue) + len(self._queue_detail) + len(self._queue_low)
 
     @property
     def last_error(self) -> str:
@@ -873,7 +938,8 @@ class TransmitManager:
     def enqueue_destination_chain(self, text: str, transport: str, channel: int,
                                   destination_id: int, correlation_key,
                                   require_prior_success: bool = False,
-                                  on_result=None) -> bool:
+                                  on_result=None,
+                                  delivery_attempt_id: int | None = None) -> bool:
         if transport not in self._transports:
             if on_result:
                 self._safe_result(on_result, False, "unknown transport")
@@ -883,12 +949,44 @@ class TransmitManager:
             transport=transport, channel=channel, destination_id=destination_id,
             correlation_key=correlation_key,
             require_prior_success=require_prior_success,
+            delivery_attempt_id=delivery_attempt_id,
+        )
+
+    def enqueue_destination_card(self, text: str, transport: str, channel: int,
+                                 destination_id: int, correlation_key,
+                                 followup_text: str = "",
+                                 require_prior_success: bool = False,
+                                 on_result=None,
+                                 delivery_attempt_id: int | None = None) -> bool:
+        if transport not in self._transports:
+            if on_result:
+                self._safe_result(on_result, False, "unknown transport")
+            return False
+        return self._enqueue(
+            self._queue, text, on_test=False, log_tx=True, on_result=on_result,
+            transport=transport, channel=channel, destination_id=destination_id,
+            correlation_key=correlation_key, followup_text=followup_text,
+            require_prior_success=require_prior_success,
+            delivery_attempt_id=delivery_attempt_id,
+        )
+
+    def enqueue_destination_detail(self, text: str, transport: str, channel: int,
+                                   destination_id: int, correlation_key,
+                                   on_result=None) -> bool:
+        if transport not in self._transports:
+            if on_result:
+                self._safe_result(on_result, False, "unknown transport")
+            return False
+        return self._enqueue(
+            self._queue_detail, text, on_test=False, log_tx=True, on_result=on_result,
+            transport=transport, channel=channel, destination_id=destination_id,
+            correlation_key=correlation_key,
         )
 
     def cancel_queued_correlation(self, correlation_key) -> int:
         """Remove unsent items in a delivery chain; an in-flight item is untouched."""
         removed = []
-        for lane in (self._queue, self._queue_low):
+        for lane in (self._queue, self._queue_detail, self._queue_low):
             kept = [item for item in lane if item.correlation_key != correlation_key]
             removed.extend(item for item in lane if item.correlation_key == correlation_key)
             lane.clear()
@@ -907,7 +1005,8 @@ class TransmitManager:
 
     def _enqueue(self, lane, text, on_test, log_tx, on_result, transport=None,
                  channel=None, destination_id=None, correlation_key=None,
-                 require_prior_success=False) -> bool:
+                 require_prior_success=False, followup_text="",
+                 delivery_attempt_id=None) -> bool:
         dropped = len(lane) == lane.maxlen
         if dropped:
             # The item we are about to drop never gets a send: report it failed so
@@ -919,7 +1018,9 @@ class TransmitManager:
                               on_result=on_result, transport=transport, channel=channel,
                               destination_id=destination_id,
                               correlation_key=correlation_key,
-                              require_prior_success=require_prior_success))
+                              require_prior_success=require_prior_success,
+                              followup_text=followup_text,
+                              delivery_attempt_id=delivery_attempt_id))
         self._queue_event.set()
         if dropped:
             logger.warning("transmit queue full; dropped oldest")
@@ -1170,6 +1271,15 @@ class TransmitManager:
                     logger.info("resent via %s on ch %d", t.name, channel)
             return ok, ("" if ok else err)
 
+    async def resend_with_followup(self, name: str, text: str, followup_text: str,
+                                   channel: int) -> tuple[bool, str]:
+        ok, err = await self.resend(name, text, channel)
+        if not ok or not followup_text:
+            return ok, err
+        await asyncio.sleep(BURST_GAP_SECONDS)
+        detail_ok, detail_err = await self.resend(name, followup_text, channel)
+        return detail_ok, detail_err
+
     async def _transmit_item(self, item: QueueItem) -> tuple[bool, str]:
         """Send one queued item on the right channel (live vs test), confirmed per
         radio. Weather items also write the transmit_log; IPAWS items do not."""
@@ -1190,7 +1300,9 @@ class TransmitManager:
                 if item.log_tx:
                     self._db.add_transmit_log(ch, blen, ok, item.text, False,
                                               error=("" if ok else err), transport=t.name,
-                                              destination_id=item.destination_id)
+                                              destination_id=item.destination_id,
+                                              followup_text=item.followup_text,
+                                              delivery_attempt_id=item.delivery_attempt_id)
                 any_ok = any_ok or ok
                 if not ok:
                     last = err
@@ -1199,7 +1311,7 @@ class TransmitManager:
     async def _worker(self) -> None:
         first = True
         while not self._stopped:
-            if not self._queue and not self._queue_low:
+            if not self._queue and not self._queue_detail and not self._queue_low:
                 self._queue_event.clear()
                 try:
                     await self._queue_event.wait()
@@ -1212,9 +1324,11 @@ class TransmitManager:
                     await asyncio.sleep(BURST_GAP_SECONDS)   # pace EVERY send, both lanes
                 except asyncio.CancelledError:
                     return
-            # Weather (high) always drains before IPAWS (low), so a real warning
-            # never waits behind a backlog of secondary alerts.
-            item = self._queue.popleft() if self._queue else self._queue_low.popleft()
+            # Alert cards always drain before details, and details before the low
+            # IPAWS/MeshWX lane. A follow-up can never delay or evict a warning.
+            item = (self._queue.popleft() if self._queue else
+                    self._queue_detail.popleft() if self._queue_detail else
+                    self._queue_low.popleft())
             if (item.require_prior_success and
                     self._chain_results.get(item.correlation_key) is not True):
                 if item.on_result is not None:

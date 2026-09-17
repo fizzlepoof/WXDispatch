@@ -14,7 +14,21 @@
     <div>
       <h2 class="pt">Dashboard</h2>
       {% set rnames = transports | selectattr('enabled') | map(attribute='label') | list %}
-      <p class="sub">NWS &rarr; {{ rnames | join(' + ') if rnames else 'no radios' }}</p>
+      <p class="sub">NWS &rarr; {{ rnames | join(' + ') if rnames else 'no radios' }}
+        &middot; <span>NWWS-OI {{ nwws_status.state }}</span>{% if nwws_status.shadow %} (shadow){% endif %}
+        &middot; {{ nwws_status.received }} received / {{ nwws_status.delivered }} handled
+        <br><span>NOAA SDR {{ sdr_status.callsign }} {{ sdr_status.state }}</span>{% if sdr_status.shadow %} (shadow){% endif %}
+        &middot; {{ '%.3f'|format(sdr_status.frequency_mhz) }} MHz
+        &middot; audio {{ '%.1f'|format(sdr_status.audio_percent) }}%
+        {% if sdr_status.temperature_c is not none %}&middot; {{ '%.1f'|format(sdr_status.temperature_c) }}&deg;C{% endif %}
+        &middot; {{ sdr_status.confirmed_headers }} confirmed SAME headers
+        {% if sdr_status.last_header_local %}
+          &middot; last {{ sdr_status.last_event_code }} {{ sdr_status.last_header_local }}
+        {% elif sdr_status.enabled and sdr_status.state == 'running' %}
+          &middot; awaiting first valid SAME header
+        {% endif %}
+        {% if sdr_status.last_rwt_local %}&middot; last RWT {{ sdr_status.last_rwt_local }}{% endif %}
+      </p>
     </div>
     <div class="topbar-right">
       <span class="live-pill{{ ' paused' if dry_run else '' }}"><span class="dot"></span>{{ "PAUSED" if dry_run else "Broadcasting LIVE" }}</span>
@@ -29,7 +43,7 @@
     <div class="hero-top">
       <div>
         <div class="hlbl">Broadcaster status</div>
-        <h2 class="hero-h">Watching {{ zone_count }} zones &middot; every {{ poll_interval }}s</h2>
+        <h2 class="hero-h">{{ route_count }} routing {{ 'rule' if route_count == 1 else 'rules' }} configured &middot; polling every {{ poll_interval }}s</h2>
       </div>
       <div class="hero-right">
         <div class="m"><div class="k">Last poll</div><div class="v">{{ last_poll_local }}</div></div>
@@ -54,8 +68,8 @@
   </section>
 
   <section class="dstats">
-    <div class="dstat"><div class="top"><svg viewBox="0 0 24 24"><path d="M12 21s-7-5.5-7-11a7 7 0 0114 0c0 5.5-7 11-7 11z"/><circle cx="12" cy="10" r="2.4"/></svg><span class="t">Coverage</span></div>
-      <div class="big">{{ zone_count }}</div><div class="s2">{{ forecast_count }} forecast + {{ county_count }} county</div></div>
+    <div class="dstat"><div class="top"><svg viewBox="0 0 24 24"><path d="M12 21s-7-5.5-7-11a7 7 0 0114 0c0 5.5-7 11-7 11z"/><circle cx="12" cy="10" r="2.4"/></svg><span class="t">Routing</span></div>
+      <div class="big">{{ route_count }}</div><div class="s2">{{ route_counties }} {{ 'county' if route_counties == 1 else 'counties' }} &middot; {{ route_destinations }} {{ 'destination' if route_destinations == 1 else 'destinations' }}</div></div>
     <div class="dstat"><div class="top"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span class="t">Poll interval</span></div>
       <div class="big">{{ poll_interval }}<span class="unit">s</span></div><div class="s2">every cycle, automatic</div></div>
     <div class="dstat"><div class="top"><svg viewBox="0 0 24 24"><path d="M4 8a12 12 0 0116 0"/><path d="M7 12a7 7 0 0110 0"/><circle cx="12" cy="16" r="1.6" fill="currentColor" stroke="none"/></svg><span class="t">Accepted &middot; 7d</span></div>

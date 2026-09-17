@@ -189,6 +189,22 @@
     .chips{display:flex;flex-wrap:wrap;gap:7px;padding:14px 20px;}
     .chip{background:var(--inset);border:1px solid var(--line);border-radius:20px;padding:4px 11px;font-size:12.5px;color:var(--chip-ink);}
 
+    /* active watched-county alerts */
+    .active-alert-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:12px;padding:15px 20px 20px;}
+    .active-alert{border:1px solid var(--line);border-left:6px solid var(--accent);border-radius:11px;padding:13px 15px;background:var(--inset);}
+    .active-alert.severity-extreme,.active-alert.severity-severe{border-left-color:var(--bad);background:rgba(239,75,75,.10);}
+    .active-alert.severity-moderate{border-left-color:var(--warn);background:rgba(245,165,36,.10);}
+    .active-alert-top{display:flex;justify-content:space-between;align-items:center;gap:10px;}
+    .pill.active{background:rgba(239,75,75,.14);color:var(--bad-ink);}
+    .active-severity{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:700;}
+    .active-event{font-size:17px;font-weight:750;margin-top:9px;}
+    .active-area{font-size:13.5px;font-weight:650;margin-top:3px;}
+    .active-headline,.active-until{font-size:12.5px;color:var(--muted);margin-top:7px;}
+    .active-empty{display:flex;align-items:center;gap:10px;padding:18px 20px;color:var(--muted);}
+    .active-empty .dot{width:9px;height:9px;border-radius:50%;background:var(--good);box-shadow:0 0 0 4px rgba(35,194,107,.18);}
+    .active-empty.unavailable{color:var(--warn-ink);font-weight:650;}
+    .warn-indicator{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:50%;background:rgba(245,165,36,.18);color:var(--warn-ink);font-weight:800;}
+
     /* history record cards */
     .rec{padding:15px 20px;border-bottom:1px solid var(--line);}
     .rec:last-child{border-bottom:none;}
@@ -213,6 +229,8 @@
       color:var(--ink);cursor:pointer;text-transform:none;letter-spacing:0;}
     .chk input{width:auto;margin:0;flex:0 0 auto;}
     .chk b{font-weight:650;}
+    .event-option{display:grid;gap:5px;}
+    .detail-toggle{margin-left:25px;font-size:12px;color:var(--muted);}
     .grp-title{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
       font-weight:600;margin:16px 0 7px;}
     .fld-lbl{display:block;margin:14px 0 6px;color:var(--muted);font-size:13px;font-weight:500;}

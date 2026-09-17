@@ -1,4 +1,4 @@
-{% extends "base.html" %}
+{% extends "guest_base.html" if guest_view|default(false) else "base.html" %}
 {% block title %} &middot; Local Alert Map{% endblock %}
 {% block head %}
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
@@ -7,24 +7,39 @@
   #alert-map{height:min(62vh,680px);min-height:420px;border-radius:14px;border:1px solid var(--line);z-index:1;}
   .map-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(280px,1fr);gap:18px;}
   .alert-list{display:flex;flex-direction:column;gap:10px;max-height:min(62vh,680px);overflow:auto;}
-  .alert-card{background:var(--inset);border:1px solid var(--line);border-left:5px solid var(--accent);border-radius:10px;padding:12px;}
+  .alert-card{background:var(--inset);border:1px solid var(--line);border-left:5px solid var(--accent);border-radius:10px;padding:12px;opacity:.78;}
+  .alert-card.watched{background:color-mix(in srgb,var(--accent) 8%,var(--inset));border-width:2px;border-left-width:7px;box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 28%,transparent);opacity:1;}
+  .scope-badge{display:inline-block;margin-bottom:6px;padding:2px 7px;border-radius:999px;background:var(--panel);border:1px solid var(--line);font-size:.72rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;}
+  .alert-card.watched .scope-badge{background:color-mix(in srgb,var(--accent) 18%,var(--panel));border-color:var(--accent);}
   .alert-card h4{margin:0 0 5px}.alert-card p{margin:3px 0}.map-key{display:flex;gap:12px;flex-wrap:wrap;margin-top:10px;}
   .map-key span{display:inline-flex;align-items:center;gap:5px}.map-swatch{width:12px;height:12px;border-radius:3px;display:inline-block;}
+  .radar-controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:10px;padding:9px 11px;background:var(--inset);border:1px solid var(--line);border-radius:10px;}
+  .radar-controls label{display:inline-flex;align-items:center;gap:7px;margin:0;color:var(--ink);font-size:13px;}
+  .radar-controls input[type="checkbox"]{width:auto;margin:0;}
+  .radar-controls input[type="range"]{width:110px;margin:0;padding:0;}
+  #radar-status{font-size:12.5px;color:var(--muted);}
   @media(max-width:980px){.map-layout{grid-template-columns:1fr}.alert-list{max-height:none}#alert-map{height:55vh;}}
 </style>
 {% endblock %}
 {% block content %}
-<div class="topbar"><div><h2 class="pt">Local Alert Map</h2><p class="sub">Current NWS alerts for counties configured in Settings or Routing.</p></div></div>
+<div class="topbar"><div><h2 class="pt">Local Alert Map</h2><p class="sub">Regional NWS alerts, with your watched counties emphasized.</p></div></div>
 <div class="panel">
   <div id="map-status" class="hint" role="status">Loading county boundaries and current alerts…</div>
   <div class="map-layout">
     <div>
-      <div id="alert-map" aria-label="Map of configured counties and current NWS alerts"></div>
+      <div id="alert-map" aria-label="Map of regional NWS alerts and emphasized watched counties"></div>
+      <div class="radar-controls" aria-label="Weather radar controls">
+        <label><input id="radar-toggle" type="checkbox" checked disabled> Current radar</label>
+        <label>Opacity <input id="radar-opacity" type="range" min="20" max="85" value="58" step="1"></label>
+        <span id="radar-status" role="status">Radar standby — waiting for nearby active alerts.</span>
+      </div>
+      <p class="hint">Radar automatically appears while nearby alerts are active.</p>
       <div class="map-key" aria-label="Alert severity key">
         <span><i class="map-swatch" style="background:#991b1b"></i>Extreme</span>
         <span><i class="map-swatch" style="background:#dc2626"></i>Severe</span>
         <span><i class="map-swatch" style="background:#f59e0b"></i>Moderate</span>
         <span><i class="map-swatch" style="background:#3b82f6"></i>Minor / unknown</span>
+        <span><i class="map-swatch" style="background:transparent;border:3px solid #7c3aed"></i>Watched counties</span>
       </div>
     </div>
     <div id="current-alerts" class="alert-list" aria-live="polite"></div>
@@ -40,6 +55,7 @@
   var map=L.map('alert-map').setView([39,-98],4);
   var osmAttribution='<a href="https://www.openstreetmap.org/copyright">© OpenStreetMap contributors</a>';
   var esriAttribution='<a href="https://www.esri.com">Tiles © Esri</a> · Esri, HERE, Garmin, '+osmAttribution+', GIS user community';
+  var radarAttribution='Radar © <a href="https://mesonet.agron.iastate.edu/">Iowa Environmental Mesonet</a> · Data © National Weather Service';
   var tileLayers={
     light:L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
       maxZoom:19,attribution:osmAttribution
@@ -62,7 +78,42 @@
   window.addEventListener('wxdispatch:themechange',function(event){
     setBaseLayer(event.detail.theme);
   });
-  var layers=L.layerGroup().addTo(map);
+  var layers=L.featureGroup().addTo(map);
+  var radarLayer=L.tileLayer.wms('https://mesonet.agron.iastate.edu/cgi-bin/wms/nexrad/n0q.cgi',{
+    layers:'nexrad-n0q-900913',format:'image/png',transparent:true,opacity:.58,
+    attribution:radarAttribution,zIndex:250
+  });
+  var radarToggle=document.getElementById('radar-toggle');
+  var radarOpacity=document.getElementById('radar-opacity');
+  var radarStatus=document.getElementById('radar-status');
+  var nearbyAlerts=false;
+  var radarRefreshBucket='';
+  function refreshRadar(){
+    var bucket=String(Math.floor(Date.now()/300000));
+    if(bucket===radarRefreshBucket)return;
+    radarRefreshBucket=bucket;
+    radarLayer.setParams({_refresh:bucket},false);
+    if(map.hasLayer(radarLayer))radarLayer.redraw();
+  }
+  function syncRadar(active){
+    nearbyAlerts=active===true;
+    radarToggle.disabled=!nearbyAlerts;
+    if(nearbyAlerts&&radarToggle.checked){
+      if(!map.hasLayer(radarLayer))radarLayer.addTo(map);
+      refreshRadar();
+      radarStatus.textContent='Current NEXRAD reflectivity is shown for nearby alerts.';
+    }else{
+      if(map.hasLayer(radarLayer))map.removeLayer(radarLayer);
+      radarStatus.textContent=nearbyAlerts
+        ?'Radar hidden. Turn it on to restore the overlay.'
+        :'Radar standby — waiting for nearby active alerts.';
+    }
+  }
+  radarToggle.addEventListener('change',function(){syncRadar(nearbyAlerts);});
+  radarOpacity.addEventListener('input',function(){
+    var value=Math.max(20,Math.min(85,Number(radarOpacity.value)||58));
+    radarLayer.setOpacity(value/100);
+  });
   var fitted=false;
   var loading=false;
   var colors={Extreme:'#991b1b',Severe:'#dc2626',Moderate:'#f59e0b',Minor:'#3b82f6',Unknown:'#3b82f6'};
@@ -87,18 +138,19 @@
   }
   function renderList(data){
     var list=document.getElementById('current-alerts');list.replaceChildren();
-    list.appendChild(el('h3','Current local alerts'));
+    list.appendChild(el('h3','Current regional alerts'));
     if(data.error)list.appendChild(el('p',data.error,'hint'));
     if(data.stale)list.appendChild(el('p','NWS data is stale; displayed alerts may not reflect current conditions.','health-banner warn'));
     if(data.zone_errors.length)list.appendChild(el('p','Some county boundaries could not load ('+data.zone_errors.length+').','hint'));
-    if(data.alert_errors.length)list.appendChild(el('p','Current alert checks failed for '+data.alert_errors.length+' configured '+(data.alert_errors.length===1?'county':'counties')+'.','health-banner warn'));
-    if(!data.county_count){list.appendChild(el('p','No county coverage is configured. Add counties in Settings or Routing.','hint'));return;}
-    if(!data.alerts.length){list.appendChild(el('p','No active NWS alerts for the configured counties.','hint'));return;}
+    if(data.alert_errors.length)list.appendChild(el('p','Current alert checks failed for '+data.alert_errors.length+' local '+(data.alert_errors.length===1?'area':'areas')+'.','health-banner warn'));
+    if(!data.county_count){list.appendChild(el('p',{{ ('No county coverage is available.' if guest_view|default(false) else 'No county coverage is configured. Add counties in Settings or Routing.')|tojson }},'hint'));return;}
+    if(!data.alerts.length){list.appendChild(el('p','No active NWS alerts in the local area.','hint'));return;}
     data.alerts.forEach(function(item){
-      var card=el('article',undefined,'alert-card');
+      var card=el('article',undefined,item.watched?'alert-card watched':'alert-card regional');
       card.style.borderLeftColor=colors[item.severity]||colors.Unknown;
+      card.appendChild(el('span',item.watched?'Watched county':'Regional','scope-badge'));
       card.appendChild(el('h4',item.event||'NWS alert'));
-      card.appendChild(el('p',item.local_counties.join(', ')));
+      card.appendChild(el('p',item.watched?item.local_counties.join(', '):(item.area||'Regional area')));
       if(item.headline)card.appendChild(el('p',item.headline,'hint'));
       var end=item.ends||item.expires;
       if(end)card.appendChild(el('p','Until '+new Date(end).toLocaleString(),'hint'));
@@ -106,36 +158,49 @@
     });
   }
   function render(data){
+    syncRadar(Array.isArray(data.alerts)&&data.alerts.length>0);
     layers.clearLayers();
     var byZone={};
     data.alerts.forEach(function(alert){
-      alert.local_zones.forEach(function(code){(byZone[code]||(byZone[code]=[])).push(alert);});
+      Array.from(new Set(
+        (alert.affected_zones||[]).concat(alert.local_zones||[])
+      )).forEach(function(code){
+        (byZone[code]||(byZone[code]=[])).push(alert);
+      });
       if(alert.geometry){
         var color=colors[alert.severity]||colors.Unknown;
-        L.geoJSON({type:'Feature',properties:{},geometry:alert.geometry},{style:{color:color,weight:3,dashArray:'6 4',fillOpacity:.12}}).addTo(layers);
+        L.geoJSON({type:'Feature',properties:{},geometry:alert.geometry},{style:{
+          color:color,weight:alert.watched?5:2,opacity:alert.watched?1:.68,
+          dashArray:alert.watched?null:'6 5',fillOpacity:alert.watched?.30:.08
+        }}).addTo(layers);
       }
     });
     var countyLayer=L.geoJSON({type:'FeatureCollection',features:data.counties},{
       style:function(feature){
         var items=byZone[feature.properties.code]||[], best=bestAlert(items);
-        var color=best?(colors[best.severity]||colors.Unknown):'#64748b';
-        return {color:color,weight:2,fillColor:color,fillOpacity:best ? .32 : .06};
+        var watched=feature.properties.watched===true;
+        var fill=best?(colors[best.severity]||colors.Unknown):(watched?'#7c3aed':'#64748b');
+        var outline=watched?'#7c3aed':fill;
+        return {
+          color:outline,weight:watched?5:2,dashArray:watched?null:'5 4',fillColor:fill,
+          fillOpacity:best?(watched?.38:.18):(watched?.12:.04)
+        };
       },
       onEachFeature:function(feature,layer){
         var items=byZone[feature.properties.code]||[];
         layer.bindPopup(popupFor(feature.properties.name,items));
       }
     }).addTo(layers);
-    if(!fitted&&countyLayer.getLayers().length){map.fitBounds(countyLayer.getBounds(),{padding:[18,18]});fitted=true;}
+    if(!fitted&&layers.getLayers().length){map.fitBounds(layers.getBounds(),{padding:[18,18]});fitted=true;}
     renderList(data);
     var status=document.getElementById('map-status');
     var when=data.last_poll_success?new Date(data.last_poll_success).toLocaleString():'not yet';
-    status.textContent=(data.stale?'STALE · ':'')+'Last successful county alert update: '+when+' · '+data.alerts.length+' active local alert'+(data.alerts.length===1?'':'s');
+    status.textContent=(data.stale?'STALE · ':'')+'Last successful regional alert update: '+when+' · '+data.watched_alert_count+' watched · '+data.regional_alert_count+' regional';
   }
   function load(){
     if(loading)return;
     loading=true;
-    fetch('/api/map-data',{credentials:'same-origin'}).then(function(response){
+    fetch({{ map_data_url|default('/api/map-data')|tojson }},{credentials:'same-origin'}).then(function(response){
       if(!response.ok)throw new Error('Map data request failed');return response.json();
     }).then(render).catch(function(){
       document.getElementById('map-status').textContent='Could not load local alert map data. Retrying automatically.';

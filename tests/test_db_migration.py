@@ -3,7 +3,6 @@ import sqlite3
 
 from app.db import Database
 
-
 HEAD_SCHEMA = """
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE alert_state (
@@ -119,3 +118,89 @@ def test_complete_head_database_migrates_reopens_without_data_loss(tmp_path):
         assert db._conn.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] == 0
         assert db._conn.execute("SELECT COUNT(*) FROM meshwx_delivery_state").fetchone()[0] == 0
         db.close()
+
+
+def test_arbitration_schema_migration_is_idempotent_and_preserves_rows(tmp_path):
+    path = tmp_path / "arbitration.db"
+    db = Database(str(path))
+    db._conn.execute(
+        "INSERT INTO weather_arbitration_candidates "
+        "(canonical_id,event,office,issued_at,expires_at,deadline,rest_feature,"
+        "same_feature,vtec_key,phase,retain_until,correlation_ugcs,created_at,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("same-1", "Tornado Warning", "KOHX", "2099-01-01T00:00:00+00:00",
+         "2099-01-01T01:00:00+00:00", "2099-01-01T00:00:45+00:00", "", "{}",
+         None, "initial", "2099-01-03T01:00:00+00:00", "[]",
+         "2099-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00"),
+    )
+    db._conn.commit()
+    db.close()
+
+    for _ in range(2):
+        reopened = Database(str(path))
+        row = reopened._conn.execute(
+            "SELECT canonical_id,event FROM weather_arbitration_candidates"
+        ).fetchone()
+        assert tuple(row) == ("same-1", "Tornado Warning")
+        columns = {
+            item[1] for item in reopened._conn.execute(
+                "PRAGMA table_info(weather_arbitration_destinations)"
+            )
+        }
+        assert {"canonical_id", "destination_id", "state", "source"} <= columns
+        reopened.close()
+
+
+def test_partial_lifecycle_checks_are_rebuilt_to_normalized_schema(tmp_path):
+    path = tmp_path / "partial-checks.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        PRAGMA foreign_keys=ON;
+        CREATE TABLE weather_arbitration_candidates (
+            canonical_id TEXT PRIMARY KEY, event TEXT NOT NULL, office TEXT NOT NULL,
+            issued_at TEXT NOT NULL, expires_at TEXT NOT NULL, deadline TEXT NOT NULL,
+            rest_feature TEXT NOT NULL DEFAULT '', same_feature TEXT NOT NULL DEFAULT '',
+            vtec_key TEXT UNIQUE,
+            phase TEXT NOT NULL DEFAULT 'initial'
+                CHECK(phase IN ('initial','cancelled','expired')),
+            retain_until TEXT NOT NULL,
+            correlation_ugcs TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE weather_arbitration_destinations (
+            canonical_id TEXT NOT NULL REFERENCES weather_arbitration_candidates(canonical_id)
+                ON DELETE CASCADE,
+            destination_id INTEGER NOT NULL,
+            state TEXT NOT NULL
+                CHECK(state IN ('pending','queued','accepted','superseded','no_fallback')),
+            source TEXT NOT NULL DEFAULT '' CHECK(source IN ('','same','rest')),
+            same_eligible INTEGER NOT NULL DEFAULT 0 CHECK(same_eligible IN (0,1)),
+            rest_eligible INTEGER NOT NULL DEFAULT 0 CHECK(rest_eligible IN (0,1)),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(canonical_id, destination_id)
+        );
+    """)
+    conn.execute(
+        "INSERT INTO weather_arbitration_candidates VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("c1", "Tornado Warning", "KOHX", "2026-09-06T18:30:00+00:00",
+         "2026-09-06T19:00:00+00:00", "2026-09-06T18:30:45+00:00",
+         "", "{}", None, "cancelled", "2099-09-08T19:00:00+00:00", '["TNC165"]',
+         "2026-09-06T18:30:00+00:00", "2026-09-06T18:30:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(str(path))
+    row = db.get_arbitration_candidate("c1")
+    assert row is not None
+    assert row["phase"] == "cancelled"
+    assert row["retain_until"] == "2099-09-08T19:00:00+00:00"
+    assert row["correlation_ugcs"] == '["TNC165"]'
+    db._conn.execute(
+        "UPDATE weather_arbitration_candidates SET phase='updated' WHERE canonical_id='c1'"
+    )
+    db._conn.commit()
+    assert db.get_arbitration_candidate("c1")["phase"] == "updated"
+    assert db._conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    db.close()

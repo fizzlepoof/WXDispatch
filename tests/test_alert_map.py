@@ -285,6 +285,184 @@ async def test_county_alert_cache_maps_forecast_zone_alerts_to_each_queried_coun
     ]
 
 
+async def test_regional_zone_geometry_cache_loads_area_collections():
+    from app.alert_map import RegionalZoneGeometryCache
+
+    calls = []
+    geometry = {
+        "type": "Polygon",
+        "coordinates": [[[-87, 36], [-86, 36], [-86, 35], [-87, 36]]],
+    }
+
+    async def fetch_json(url, headers, timeout):
+        calls.append(url)
+        if "?type=" in url:
+            code = "TNC125" if "type=county" in url else "TNZ026"
+            name = "Montgomery" if code == "TNC125" else "Zone 26"
+            features = [{
+                "id": f"https://api.weather.gov/zones/{code}",
+                "geometry": None,
+                "properties": {"id": code, "name": name, "cwa": ["OHX"]},
+            }]
+            if "type=forecast" in url:
+                features.append({
+                    "id": "https://api.weather.gov/zones/TNZ001",
+                    "geometry": None,
+                    "properties": {"id": "TNZ001", "name": "Lake", "cwa": ["MEG"]},
+                })
+            return {"features": features}
+        code = url.rsplit("/", 1)[-1]
+        name = "Montgomery" if code == "TNC125" else "Zone 26"
+        return {"geometry": geometry, "properties": {"name": name}}
+
+    cache = RegionalZoneGeometryCache(fetch_json=fetch_json)
+    features, errors, scope_codes = await cache.get_many([
+        {"code": "TNC125", "name": "Montgomery County", "watched": True},
+        {"code": "TNZ026", "name": "TNZ026", "watched": False},
+        {"code": "TNZ001", "name": "TNZ001", "watched": False},
+        {"code": "KYZ001", "name": "KYZ001", "watched": False},
+    ], "operator@example.com")
+
+    assert errors == []
+    assert scope_codes == ["TNC125", "TNZ026"]
+    assert calls == [
+        "https://api.weather.gov/zones?type=county&area=TN",
+        "https://api.weather.gov/zones?type=forecast&area=TN",
+        "https://api.weather.gov/zones/county/TNC125",
+        "https://api.weather.gov/zones/forecast/TNZ026",
+    ]
+    assert features[0]["properties"] == {
+        "code": "TNC125", "name": "Montgomery County", "watched": True,
+    }
+    assert features[1]["properties"] == {
+        "code": "TNZ026", "name": "Zone 26", "watched": False,
+    }
+
+
+async def test_regional_zone_geometry_cache_keeps_stale_cwa_scope_on_refresh_failure():
+    from app.alert_map import RegionalZoneGeometryCache
+
+    monotonic = [100.0]
+    geometry = {
+        "type": "Polygon",
+        "coordinates": [[[-87, 36], [-86, 36], [-86, 35], [-87, 36]]],
+    }
+
+    async def fetch_json(url, headers, timeout):
+        if "?type=" in url:
+            if monotonic[0] > 100:
+                raise RuntimeError("temporary metadata failure")
+            code = "TNC125" if "type=county" in url else "TNZ026"
+            return {"features": [{
+                "properties": {"id": code, "name": code, "cwa": ["OHX"]},
+            }]}
+        return {"geometry": geometry, "properties": {"name": url.rsplit("/", 1)[-1]}}
+
+    cache = RegionalZoneGeometryCache(
+        fetch_json=fetch_json, ttl_seconds=10, clock=lambda: monotonic[0],
+    )
+    zones = [
+        {"code": "TNC125", "name": "Montgomery County", "watched": True},
+        {"code": "TNZ026", "name": "TNZ026", "watched": False},
+    ]
+    await cache.get_many(zones, "operator@example.com")
+    monotonic[0] = 111.0
+
+    features, errors, scope_codes = await cache.get_many(zones, "operator@example.com")
+
+    assert scope_codes == ["TNC125", "TNZ026"]
+    assert [feature["properties"]["code"] for feature in features] == scope_codes
+    assert errors == ["TNC125", "TNZ026"]
+
+
+async def test_area_alert_cache_includes_state_alerts_and_marks_watched_counties():
+    from app.alert_map import AreaAlertCache
+
+    calls = []
+    watched = _feature(
+        "watched", "Tornado Warning", ["TNC125"], area="Montgomery County",
+    )
+    nearby = _feature(
+        "nearby", "Flood Warning", ["TNC037"], area="Davidson County",
+    )
+
+    async def fetch_json(url, headers, timeout):
+        calls.append(url)
+        return {"features": [watched, nearby]}
+
+    now = datetime(2026, 9, 3, 23, 0, tzinfo=timezone.utc)
+    cache = AreaAlertCache(
+        fetch_json=fetch_json, clock=lambda: 100.0, wall_clock=lambda: now,
+    )
+    counties = [{"code": "TNC125", "name": "Montgomery County"}]
+
+    first = await cache.get_many(counties, "operator@example.com")
+    second = await cache.get_many(counties, "operator@example.com")
+
+    alerts, errors, stale, updated_at = first
+    assert second == first
+    assert errors == []
+    assert stale is False
+    assert updated_at == "2026-09-03T23:00:00+00:00"
+    assert calls == ["https://api.weather.gov/alerts/active?area=TN"]
+    assert [(alert["id"], alert["watched"]) for alert in alerts] == [
+        ("watched", True),
+        ("nearby", False),
+    ]
+    assert alerts[0]["local_zones"] == ["TNC125"]
+    assert alerts[0]["local_counties"] == ["Montgomery County"]
+    assert alerts[0]["affected_zones"] == ["TNC125"]
+    assert alerts[1]["local_zones"] == []
+    assert alerts[1]["local_counties"] == []
+    assert alerts[1]["affected_zones"] == ["TNC037"]
+
+
+async def test_area_alert_cache_uses_same_for_watched_forecast_zone_alerts():
+    from app.alert_map import AreaAlertCache
+
+    matched = _feature("matched", "Heat Advisory", ["TNZ026"])
+    matched["properties"]["geocode"]["SAME"] = ["047125"]
+    unmatched = _feature("unmatched", "Wind Advisory", ["TNZ026"])
+
+    async def fetch_json(url, headers, timeout):
+        return {"features": [matched, unmatched]}
+
+    cache = AreaAlertCache(fetch_json=fetch_json)
+    alerts, errors, stale, _updated_at = await cache.get_many(
+        [{"code": "TNC125", "name": "Montgomery County"}],
+        "operator@example.com",
+    )
+
+    assert errors == []
+    assert stale is False
+    assert [(alert["id"], alert["watched"]) for alert in alerts] == [
+        ("matched", True),
+        ("unmatched", False),
+    ]
+
+
+async def test_area_alert_cache_isolates_malformed_geocode_features():
+    from app.alert_map import AreaAlertCache
+
+    malformed = _feature("malformed", "Flood Warning", ["TNC037"])
+    malformed["properties"]["geocode"] = {"UGC": 123, "SAME": "047125"}
+    valid = _feature("valid", "Tornado Warning", ["TNC125"])
+
+    async def fetch_json(url, headers, timeout):
+        return {"features": [malformed, valid]}
+
+    cache = AreaAlertCache(fetch_json=fetch_json)
+    alerts, errors, stale, updated_at = await cache.get_many(
+        [{"code": "TNC125", "name": "Montgomery County"}],
+        "operator@example.com",
+    )
+
+    assert [alert["id"] for alert in alerts] == ["valid"]
+    assert errors == []
+    assert stale is False
+    assert updated_at
+
+
 async def test_county_alert_cache_drops_expired_alert_from_stale_response():
     from app.alert_map import CountyAlertCache
 

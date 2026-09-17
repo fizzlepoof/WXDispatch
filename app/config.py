@@ -10,6 +10,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .noaa_sdr import NoaaSdrConfig
+from .nwws_runtime import NWWSRuntimeConfig
+
 # Preserve legacy data directories so upgrading from MeshWX never strands the
 # existing database. This is intentionally not the public product name.
 APP_DIRNAME = "MeshWX"
@@ -43,6 +46,118 @@ class BootstrapConfig:
     http_host: str
     http_port: int
     db_path: str
+
+
+@dataclass(frozen=True)
+class NWWSAppConfig:
+    runtime: NWWSRuntimeConfig
+    shadow: bool = True
+
+
+@dataclass(frozen=True)
+class NoaaSdrAppConfig:
+    receiver: NoaaSdrConfig
+    shadow: bool = True
+    error: str | None = None
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def normalise_meshcore_flood_scope(value: str) -> str:
+    """Return a canonical MeshCore hash scope or raise on unsafe input."""
+    if not isinstance(value, str):
+        raise TypeError("MeshCore flood scope must be text")
+    scope = value.strip()
+    if not scope:
+        return ""
+    if not scope.startswith("#"):
+        scope = "#" + scope
+    if scope == "#" or "\x00" in scope:
+        raise ValueError("MeshCore flood scope is invalid")
+    if len(scope.encode("utf-8")) > 32:
+        raise ValueError("MeshCore flood scope must be at most 32 UTF-8 bytes")
+    return scope
+
+
+def meshcore_flood_scope_override() -> str | None:
+    """Read an optional deployment-locked scope from the environment.
+
+    Presence of the variable means the deployment intends to enforce a scope,
+    so an empty or malformed value is a startup error rather than permission to
+    transmit without one.
+    """
+    raw = os.environ.get("MESH_WX_MESHCORE_FLOOD_SCOPE")
+    if raw is None:
+        return None
+    scope = normalise_meshcore_flood_scope(raw)
+    if not scope:
+        raise ValueError("Deployment MeshCore flood scope must not be blank")
+    return scope
+
+
+def load_nwws_config() -> NWWSAppConfig:
+    """Load optional NWWS settings without reading the credential itself."""
+    password_path = os.environ.get("MESH_WX_NWWS_PASSWORD_FILE", "").strip()
+    offices = frozenset(
+        value.strip().upper()
+        for value in os.environ.get("MESH_WX_NWWS_OFFICES", "KOHX").split(",")
+        if value.strip()
+    )
+    return NWWSAppConfig(
+        runtime=NWWSRuntimeConfig(
+            enabled=_env_bool("MESH_WX_NWWS_ENABLED", False),
+            username=os.environ.get("MESH_WX_NWWS_USERNAME", "").strip(),
+            password_file=Path(password_path) if password_path else None,
+            offices=offices,
+        ),
+        shadow=_env_bool("MESH_WX_NWWS_SHADOW", True),
+    )
+
+
+def _noaa_gain(value: str) -> str | float:
+    normalized = value.strip().casefold()
+    return "auto" if normalized == "auto" else float(normalized)
+
+
+def load_noaa_sdr_config() -> NoaaSdrAppConfig:
+    """Load the opt-in SDR receiver, failing closed on bad configuration."""
+    enabled = _env_bool("MESH_WX_NOAA_SDR_ENABLED", False)
+    shadow = _env_bool("MESH_WX_NOAA_SDR_SHADOW", True)
+    if not enabled:
+        return NoaaSdrAppConfig(receiver=NoaaSdrConfig(enabled=False), shadow=shadow)
+    serial = os.environ.get("MESH_WX_NOAA_SDR_DEVICE_SERIAL", "").strip()
+    frequency_text = os.environ.get("MESH_WX_NOAA_SDR_FREQUENCY_HZ", "").strip()
+    if not serial or not frequency_text:
+        return NoaaSdrAppConfig(
+            receiver=NoaaSdrConfig(enabled=False), shadow=True, error="configuration",
+        )
+    try:
+        receiver = NoaaSdrConfig(
+            enabled=True,
+            device_serial=serial,
+            frequency_hz=int(frequency_text),
+            callsign=os.environ.get("MESH_WX_NOAA_SDR_CALLSIGN", "WWH37").strip(),
+            receiver_id=os.environ.get(
+                "MESH_WX_NOAA_SDR_RECEIVER_ID", "noaa-wwh37"
+            ).strip(),
+            ppm=int(os.environ.get("MESH_WX_NOAA_SDR_PPM", "0").strip()),
+            gain=_noaa_gain(os.environ.get("MESH_WX_NOAA_SDR_GAIN", "auto")),
+        )
+    except (TypeError, ValueError):
+        return NoaaSdrAppConfig(
+            receiver=NoaaSdrConfig(enabled=False), shadow=True, error="configuration",
+        )
+    return NoaaSdrAppConfig(receiver=receiver, shadow=shadow)
 
 
 def load_bootstrap() -> BootstrapConfig:
@@ -81,6 +196,8 @@ DEFAULT_SETTINGS: dict = {
     "meshcore_port": "",
     "meshcore_host": "",
     "meshcore_channel": 0,
+    "meshcore_flood_scope": "",
+    "meshcore_require_flood_scope": False,
     "meshcore_repeat": 2,
     "meshcore_test_channel": 1,
     "meshwx_v4_enabled": False,

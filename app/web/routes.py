@@ -20,9 +20,11 @@ from fastapi.templating import Jinja2Templates
 import httpx
 
 from .. import __version__
-from ..alert_map import CountyAlertCache, ZoneGeometryCache, configured_counties
+from ..alert_map import AreaAlertCache, RegionalZoneGeometryCache, configured_counties
 from ..config import (MAX_PAYLOAD_BYTES, POLL_INTERVAL_MIN, IPAWS_EVENT_TYPES,
-                      GITHUB_LATEST_RELEASE_API, GITHUB_RELEASES_URL)
+                      GITHUB_LATEST_RELEASE_API, GITHUB_RELEASES_URL,
+                      meshcore_flood_scope_override,
+                      normalise_meshcore_flood_scope)
 from ..serial_discovery import list_all_ports
 
 
@@ -37,8 +39,16 @@ def _template_dir() -> Path:
 _CSRF_COOKIE = "mesh_wx_csrf"
 _CSRF_SECRET = secrets.token_bytes(32)
 _CHANNEL_ADMIN_AUTH = HTTPBasic(auto_error=False)
-_ALERT_MAP_CACHE = ZoneGeometryCache()
-_COUNTY_ALERT_CACHE = CountyAlertCache()
+_ALERT_MAP_CACHE = RegionalZoneGeometryCache()
+_AREA_ALERT_CACHE = AreaAlertCache()
+_DASHBOARD_ALERT_TIMEOUT_SECONDS = 2.0
+
+
+def _normalise_meshcore_flood_scope(value: str) -> str:
+    try:
+        return normalise_meshcore_flood_scope(value or "")
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid MeshCore flood scope")
 
 
 def _new_csrf_token() -> str:
@@ -208,6 +218,29 @@ def _dash_ctx(request) -> dict:
     zones = [z.strip() for z in (db.get_setting("zones", "") or "").split(",") if z.strip()]
     forecast = [z for z in zones if len(z) > 2 and z[2] == "Z"]
     county = [z for z in zones if len(z) > 2 and z[2] == "C"]
+    active_routes = []
+    active_destination_ids = set()
+    routed_counties = set()
+    for rule in db.list_routes():
+        destinations = [d for d in rule["destinations"] if d["enabled"]]
+        if not rule["enabled"] or not destinations:
+            continue
+        county_names = [c["county_name"] for c in rule["counties"]]
+        routed_counties.update(c["zone_code"] for c in rule["counties"])
+        active_destination_ids.update(int(d["id"]) for d in destinations)
+        events = (["All warnings"] if rule["all_warnings"] else []) + list(rule["events"])
+        active_routes.append({
+            "name": rule["name"],
+            "counties": county_names,
+            "events": events,
+            "destinations": [
+                "%s - %s ch %d" % (
+                    d["name"], "MeshCore" if d["transport"] == "meshcore" else "Meshtastic",
+                    int(d["channel"]),
+                )
+                for d in destinations
+            ],
+        })
     port = tx.port or ""
     device = "Heltec V3" if ("CP210" in port or "Silicon_Labs" in port) else (port.split("/")[-1] if port else "(none)")
     up = poller.status.uptime_seconds
@@ -229,9 +262,7 @@ def _dash_ctx(request) -> dict:
         if 0 <= a < 7:
             buckets[6 - int(a)] += 1
     spark_line, spark_fill = _spark(buckets)
-    include = list(db.get_setting("filter_include_exact", []) or [])
-    if db.get_setting("filter_include_suffix", []):
-        include = ["All Warnings"] + include
+
     recent = [{
         "event": r["event"], "area": r["area"], "disposition": r["disposition"],
         "detail": r["detail"], "text": r["transmitted_text"], "when": fmt_local(r["ts"], tz),
@@ -292,6 +323,106 @@ def _dash_ctx(request) -> dict:
             % int(abs(skew))))
     health_level = ("critical" if any(l == "critical" for l, _ in problems)
                     else "warn" if problems else "ok")
+    nwws_service = getattr(request.app.state, "nwws", None)
+    nwws_health = getattr(nwws_service, "health", None)
+
+    def _nwws_counter(name):
+        try:
+            return max(0, int(getattr(nwws_health, name, 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    nwws_status = {
+        "state": getattr(getattr(nwws_health, "state", None), "value", "disabled"),
+        "shadow": bool(getattr(request.app.state, "nwws_shadow", True)),
+        "received": _nwws_counter("received"),
+        "delivered": _nwws_counter("delivered"),
+        "ignored": _nwws_counter("ignored"),
+        "malformed": _nwws_counter("malformed"),
+        "dropped": _nwws_counter("dropped"),
+        "reconnects": _nwws_counter("reconnects"),
+        "error_category": getattr(nwws_health, "error_category", None),
+    }
+
+    sdr_service = getattr(request.app.state, "noaa_sdr", None)
+    sdr_health = getattr(sdr_service, "health", None)
+    sdr_config = getattr(sdr_service, "config", None)
+    sdr_state = str(getattr(sdr_health, "state", "disabled"))
+    if sdr_state not in {
+        "new", "disabled", "running", "backoff", "thermal_hold",
+        "missing_tools", "stopped",
+    }:
+        sdr_state = "unknown"
+
+    def _bounded_number(value, low, high, default=0.0):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        return number if low <= number <= high else default
+
+    def _health_time(value: object) -> str:
+        if not isinstance(value, datetime.datetime):
+            return ""
+        if value.tzinfo is None or value.utcoffset() is None:
+            return ""
+        return fmt_local(value.isoformat(), tz)
+
+    def _bounded_count(value: Any, maximum: int = 2_147_483_647) -> int:
+        try:
+            count = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(0, min(maximum, count))
+
+    sdr_enabled = bool(getattr(sdr_config, "enabled", False))
+    sdr_config_error = bool(getattr(request.app.state, "noaa_sdr_config_error", None))
+    temperature_value = getattr(sdr_health, "temperature_c", None)
+    sdr_status = {
+        "enabled": sdr_enabled,
+        "state": sdr_state,
+        "shadow": bool(getattr(request.app.state, "noaa_sdr_shadow", True)),
+        "callsign": str(getattr(sdr_config, "callsign", "WWH37"))[:16],
+        "frequency_mhz": _bounded_number(
+            getattr(sdr_config, "frequency_hz", 162_500_000),
+            162_400_000, 162_550_000, 162_500_000,
+        ) / 1_000_000,
+        "audio_percent": _bounded_number(
+            getattr(sdr_health, "audio_rms", 0.0), 0.0, 1.0,
+        ) * 100,
+        "peak_percent": _bounded_number(
+            getattr(sdr_health, "audio_peak", 0.0), 0.0, 1.0,
+        ) * 100,
+        "temperature_c": (
+            None if temperature_value is None
+            else _bounded_number(temperature_value, -50.0, 150.0)
+        ),
+        "restarts": _bounded_count(getattr(sdr_health, "restarts", 0)),
+        "confirmed_headers": _bounded_count(
+            getattr(sdr_health, "confirmed_headers", 0)
+        ),
+        "confirmed_eom": _bounded_count(getattr(sdr_health, "confirmed_eom", 0)),
+        "last_event_code": str(
+            getattr(sdr_health, "last_event_code", "") or ""
+        )[:3],
+        "last_event_name": str(
+            getattr(sdr_health, "last_event_name", "") or ""
+        )[:95],
+        "last_location_count": _bounded_count(
+            getattr(sdr_health, "last_location_count", 0), 31
+        ),
+        "last_header_local": _health_time(
+            getattr(sdr_health, "last_valid_header", None)
+        ),
+        "last_rwt_local": _health_time(getattr(sdr_health, "last_rwt", None)),
+        "has_error": bool(getattr(sdr_health, "last_error", None)),
+    }
+    if sdr_config_error:
+        problems.append(("warn", "NOAA SDR configuration is invalid; receiver is disabled."))
+    elif sdr_enabled and sdr_state not in {"running", "thermal_hold"}:
+        problems.append(("warn", "NOAA SDR receiver is %s." % sdr_state.replace("_", " ")))
+    health_level = ("critical" if any(level == "critical" for level, _ in problems)
+                    else "warn" if problems else "ok")
 
     return {
         "health_level": health_level,
@@ -301,12 +432,52 @@ def _dash_ctx(request) -> dict:
         "connected": tx.connected, "device": device, "tx_error": tx.last_error,
         "channel_index": int(db.get_setting("channel_index", 0)),
         "zone_count": len(zones), "forecast_count": len(forecast), "county_count": len(county),
+        "active_routes": active_routes,
+        "route_count": len(active_routes),
+        "route_counties": len(routed_counties),
+        "route_destinations": len(active_destination_ids),
         "poll_interval": int(db.get_setting("poll_interval", 120)), "queue_depth": tx.queue_depth,
         "last_poll_local": fmt_local(poller.status.last_poll_time, tz) if poller.status.last_poll_time else "-",
         "uptime_str": uptime_str, "sent_7d": sent_7d, "sent_today": sent_today,
         "spark_line": spark_line, "spark_fill": spark_fill,
-        "include": include, "recent": recent, "last_tx": last_tx,
+        "recent": recent, "last_tx": last_tx,
         "transports": tx.status(),
+        "nwws_status": nwws_status,
+        "sdr_status": sdr_status,
+    }
+
+
+async def _active_alert_ctx(request: Request) -> dict:
+    """Current NWS alerts affecting watched counties; display-only."""
+    db = _db(request)
+    configured = configured_counties(db)
+    contact = str(db.get_setting("nws_contact", "") or "")
+    try:
+        alerts, errors, stale, last_success = await asyncio.wait_for(
+            _AREA_ALERT_CACHE.get_many(configured, contact),
+            timeout=_DASHBOARD_ALERT_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        alerts, errors, stale, last_success = [], ["unavailable"], True, ""
+    county_names = {county["code"]: county["name"] for county in configured}
+    active = []
+    for alert in alerts:
+        if not isinstance(alert, dict) or not bool(alert.get("watched")):
+            continue
+        local_zones = alert.get("local_zones", [])
+        if not isinstance(local_zones, list):
+            local_zones = []
+        names = [county_names.get(str(code), str(code)) for code in local_zones]
+        item = dict(alert)
+        item["local_counties"] = names
+        end = item.get("ends") or item.get("expires")
+        item["until"] = fmt_local(str(end), db.get_setting("display_timezone", "")) if end else ""
+        active.append(item)
+    return {
+        "active_alerts": active,
+        "active_alert_stale": bool(stale),
+        "active_alert_errors": len(errors),
+        "active_alert_last_success": last_success,
     }
 
 
@@ -322,7 +493,9 @@ async def healthz(request: Request):
 # ---- dashboard ---------------------------------------------------------
 @router.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    return render(request, "dashboard.html", **_dash_ctx(request))
+    context = _dash_ctx(request)
+    context.update(await _active_alert_ctx(request))
+    return render(request, "dashboard.html", **context)
 
 
 @router.get("/map", response_class=HTMLResponse)
@@ -335,11 +508,35 @@ async def local_alert_map_data(request: Request):
     db = _db(request)
     configured = configured_counties(db)
     contact = str(db.get_setting("nws_contact", "") or "")
-    boundary_result, alert_result = await asyncio.gather(
-        _ALERT_MAP_CACHE.get_many(configured, contact),
-        _COUNTY_ALERT_CACHE.get_many(configured, contact),
+    alerts, alert_errors, stale, last_success = await _AREA_ALERT_CACHE.get_many(
+        configured, contact,
     )
-    county_features, zone_errors = boundary_result
+    map_zones = {
+        county["code"]: {
+            "code": county["code"], "name": county["name"], "watched": True,
+        }
+        for county in configured
+    }
+    for alert in alerts:
+        affected_zones = alert.get("affected_zones", alert.get("local_zones", []))
+        if not isinstance(affected_zones, list):
+            continue
+        for raw_code in affected_zones:
+            code = str(raw_code or "").strip().upper()
+            if re.fullmatch(r"[A-Z]{2}[CZ]\d{3}", code) and code not in map_zones:
+                map_zones[code] = {"code": code, "name": code, "watched": False}
+    county_features, zone_errors, regional_scope_codes = await _ALERT_MAP_CACHE.get_many(
+        list(map_zones.values()), contact,
+    )
+    regional_scope = set(regional_scope_codes)
+
+    def in_regional_scope(alert: dict) -> bool:
+        if alert.get("watched"):
+            return True
+        affected = alert.get("affected_zones", alert.get("local_zones", []))
+        return isinstance(affected, list) and not regional_scope.isdisjoint(affected)
+
+    alerts = [alert for alert in alerts if in_regional_scope(alert)]
     fetched_names = {
         feature["properties"]["code"]: feature["properties"]["name"]
         for feature in county_features
@@ -348,12 +545,14 @@ async def local_alert_map_data(request: Request):
         {"code": county["code"], "name": fetched_names.get(county["code"], county["name"])}
         for county in configured
     ]
-    alerts, alert_errors, stale, last_success = alert_result
     alert_names = {county["code"]: county["name"] for county in alert_counties}
     for alert in alerts:
         alert["local_counties"] = [
             alert_names.get(code, code) for code in alert["local_zones"]
         ]
+        alert["watched"] = bool(alert.get("watched", alert["local_zones"]))
+    watched_alert_count = sum(1 for alert in alerts if alert["watched"])
+    scope_areas = list(dict.fromkeys(county["code"][:2] for county in configured))
     if not configured:
         error = "No local counties are configured."
     elif alert_errors and not last_success:
@@ -365,11 +564,85 @@ async def local_alert_map_data(request: Request):
         "counties": county_features,
         "county_count": len(configured),
         "alerts": alerts,
+        "watched_alert_count": watched_alert_count,
+        "regional_alert_count": len(alerts) - watched_alert_count,
+        "scope_areas": scope_areas,
         "last_poll_success": last_success,
         "poll_result": result,
         "stale": stale,
         "zone_errors": zone_errors,
         "alert_errors": alert_errors,
+        "error": error,
+    }, headers={"Cache-Control": "no-store"})
+
+
+def _bounded_ha_alert_text(value: Any, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    return text[:limit]
+
+
+def _bounded_ha_alert_list(value: Any, *, limit: int = 32) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [
+        text for item in value[:limit]
+        if (text := _bounded_ha_alert_text(item, 96))
+    ]
+
+
+@router.get("/api/home-assistant/alerts", response_class=JSONResponse)
+async def home_assistant_alert_data(request: Request):
+    try:
+        db = _db(request)
+        configured = configured_counties(db)
+        contact = str(db.get_setting("nws_contact", "") or "")
+        alerts, alert_errors, stale, last_success = await _AREA_ALERT_CACHE.get_many(
+            configured, contact,
+        )
+    except Exception:
+        return JSONResponse({
+            "count": 0,
+            "alerts": [],
+            "last_poll_success": "",
+            "stale": True,
+            "error": "WXDispatch watched-alert data is temporarily unavailable.",
+        }, headers={"Cache-Control": "no-store"})
+    county_names = {county["code"]: county["name"] for county in configured}
+    summaries = []
+    for raw in alerts:
+        if not isinstance(raw, dict) or not raw.get("watched"):
+            continue
+        local_zones = _bounded_ha_alert_list(raw.get("local_zones"))
+        local_counties = _bounded_ha_alert_list(raw.get("local_counties"))
+        if not local_counties:
+            local_counties = [county_names.get(code, code) for code in local_zones]
+        summaries.append({
+            "event": _bounded_ha_alert_text(raw.get("event"), 96),
+            "headline": _bounded_ha_alert_text(raw.get("headline"), 256),
+            "severity": _bounded_ha_alert_text(raw.get("severity"), 24),
+            "urgency": _bounded_ha_alert_text(raw.get("urgency"), 24),
+            "certainty": _bounded_ha_alert_text(raw.get("certainty"), 24),
+            "onset": _bounded_ha_alert_text(raw.get("onset"), 128),
+            "ends": _bounded_ha_alert_text(raw.get("ends"), 128),
+            "expires": _bounded_ha_alert_text(raw.get("expires"), 128),
+            "local_counties": local_counties,
+            "local_zones": local_zones,
+        })
+        if len(summaries) >= 32:
+            break
+    if not configured:
+        error = "No watched counties are configured in WXDispatch."
+    elif alert_errors and not last_success:
+        error = "Current WXDispatch watched-alert data is unavailable."
+    elif alert_errors:
+        error = "Some WXDispatch watched-alert checks failed; results may be incomplete."
+    else:
+        error = ""
+    return JSONResponse({
+        "count": len(summaries),
+        "alerts": summaries,
+        "last_poll_success": _bounded_ha_alert_text(last_success, 128),
+        "stale": bool(stale or alert_errors),
         "error": error,
     }, headers={"Cache-Control": "no-store"})
 
@@ -381,8 +654,10 @@ async def status_partial(request: Request):
 
 @router.get("/partials/dashboard", response_class=HTMLResponse)
 async def dashboard_cols_partial(request: Request):
-    # The recent-alerts list + radios + broadcasting columns, for live polling.
-    return render(request, "_dash_cols.html", **_dash_ctx(request))
+    # Current active alerts + recent-alerts list + radio/routing status.
+    context = _dash_ctx(request)
+    context.update(await _active_alert_ctx(request))
+    return render(request, "_dash_cols.html", **context)
 
 
 @router.get("/partials/ipaws", response_class=HTMLResponse)
@@ -469,7 +744,14 @@ async def resend_log(request: Request, entry_id: int):
     db, tx = _db(request), _tx(request)
     row = db.get_transmit_log(entry_id)
     if row is not None and row["transport"]:
-        await tx.resend(row["transport"], row["text"] or "", int(row["channel"]))
+        followup = row["followup_text"] or ""
+        resend_pair = getattr(tx, "resend_with_followup", None)
+        if followup and resend_pair is not None:
+            await resend_pair(
+                row["transport"], row["text"] or "", followup, int(row["channel"])
+            )
+        else:
+            await tx.resend(row["transport"], row["text"] or "", int(row["channel"]))
     return render(request, "_transmit_rows.html", rows=db.query_transmit_log())
 
 
@@ -601,6 +883,7 @@ async def check_updates(request: Request):
 async def settings_page(request: Request):
     db = _db(request)
     s = db.all_settings()
+    deployment_scope = meshcore_flood_scope_override()
     zones = [z.strip() for z in (s.get("zones", "") or "").split(",") if z.strip()]
     counties_sel = [z for z in zones if len(z) > 2 and z[2] == "C"]
     extra = [z for z in zones if not (len(z) > 2 and z[2] == "C")]
@@ -636,6 +919,11 @@ async def settings_page(request: Request):
         mc_port=s.get("meshcore_port", "") or "",
         mc_host=s.get("meshcore_host", "") or "",
         mc_channel=int(s.get("meshcore_channel", 0) or 0),
+        mc_flood_scope=(deployment_scope if deployment_scope is not None
+                        else (s.get("meshcore_flood_scope", "") or "")),
+        mc_require_flood_scope=(True if deployment_scope is not None
+                                else bool(s.get("meshcore_require_flood_scope", False))),
+        mc_flood_scope_locked=deployment_scope is not None,
         mc_max_channels=max(2, int(s.get("meshcore_max_channels", 8) or 8)),
         meshwx_v4_enabled=bool(s.get("meshwx_v4_enabled", False)),
         meshwx_v4_channel=int(s.get("meshwx_v4_channel", 0) or 0),
@@ -674,6 +962,8 @@ async def save_settings(
     meshcore_port: str = Form(""),
     meshcore_host: str = Form(""),
     meshcore_channel: int = Form(0),
+    meshcore_flood_scope: str = Form(""),
+    meshcore_require_flood_scope: str = Form(""),
     meshwx_v4_enabled: str = Form(""),
     meshwx_v4_channel: int = Form(0),
     meshtastic_test_channel: int = Form(1),
@@ -684,6 +974,9 @@ async def save_settings(
             return max(1, min(5, int(v)))
         except (TypeError, ValueError):
             return 2
+    deployment_scope = meshcore_flood_scope_override()
+    flood_scope = (deployment_scope if deployment_scope is not None
+                   else _normalise_meshcore_flood_scope(meshcore_flood_scope))
     db, tx, poller = _db(request), _tx(request), _poller(request)
     interval = max(POLL_INTERVAL_MIN, int(poll_interval))
 
@@ -711,6 +1004,7 @@ async def save_settings(
     db.set_setting("meshcore_port", meshcore_port.strip())
     db.set_setting("meshcore_host", meshcore_host.strip())
     db.set_setting("meshcore_channel", int(meshcore_channel))
+
     meshwx_channel = max(0, min(255, int(meshwx_v4_channel)))
     try:
         meshcore_max_channels = int(db.get_setting("meshcore_max_channels", 8) or 8)
@@ -723,7 +1017,12 @@ async def save_settings(
     db.set_setting("meshcore_test_channel", int(meshcore_test_channel))
 
     # Rebuild transports from the new settings and (re)connect the enabled ones.
-    await tx.reconfigure()
+    scope_settings = {
+        "meshcore_flood_scope": flood_scope,
+        "meshcore_require_flood_scope": (True if deployment_scope is not None
+                                         else bool(meshcore_require_flood_scope)),
+    }
+    await tx.reconfigure(scope_settings)
 
     poller.poke()
     db.add_event("INFO", "settings saved")
@@ -1147,6 +1446,7 @@ async def edit_routing_rule(request: Request, rule_id: int):
         request, "routing_rule_edit.html", rule=rule,
         destinations=db.list_destinations(), event_groups=_EVENT_GROUPS,
         selected_events=set(rule["events"]),
+        selected_detail_events=set(rule["detail_events"]),
         selected_destinations={destination["id"] for destination in rule["destinations"]},
     )
 
@@ -1174,13 +1474,17 @@ async def create_routing_rule(request: Request):
     events = list(dict.fromkeys(str(value) for value in form.getlist("events")))
     if any(event not in allowed_events for event in events):
         return _channel_form_error(request, "One or more selected event types is invalid.")
+    detail_events = list(dict.fromkeys(
+        str(value) for value in form.getlist("detail_events") if str(value) in events
+    ))
     all_warnings = bool(form.get("all_warnings"))
+    all_warnings_details = bool(form.get("all_warnings_details"))
     if not all_warnings and not events:
         return _channel_form_error(request, "Select all warnings or at least one event type.")
     try:
         db.create_routing_rule(
             name, priority, bool(form.get("enabled")), all_warnings,
-            counties, events, destination_ids,
+            counties, events, destination_ids, detail_events, all_warnings_details,
         )
     except sqlite3.IntegrityError as exc:
         if "routing_rules.name" in str(exc) or "idx_routes_name_unique" in str(exc):
@@ -1216,13 +1520,17 @@ async def update_routing_rule(request: Request, rule_id: int):
     events = list(dict.fromkeys(str(value) for value in form.getlist("events")))
     if any(event not in allowed_events for event in events):
         return _channel_form_error(request, "One or more selected event types is invalid.")
+    detail_events = list(dict.fromkeys(
+        str(value) for value in form.getlist("detail_events") if str(value) in events
+    ))
     all_warnings = bool(form.get("all_warnings"))
+    all_warnings_details = bool(form.get("all_warnings_details"))
     if not all_warnings and not events:
         return _channel_form_error(request, "Select all warnings or at least one event type.")
     try:
         updated = db.update_routing_rule(
             rule_id, name, priority, bool(form.get("enabled")), all_warnings,
-            counties, events, destination_ids,
+            counties, events, destination_ids, detail_events, all_warnings_details,
         )
     except sqlite3.IntegrityError as exc:
         if "routing_rules.name" in str(exc) or "idx_routes_name_unique" in str(exc):

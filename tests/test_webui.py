@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import datetime
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,9 +21,11 @@ class DummyTx:
     connected = False
     queue_depth = 0
 
-    def __init__(self):
+    def __init__(self, db):
+        self.db = db
         self.channel_calls = []
         self.transports = []
+        self.resend_calls = []
 
     async def send_manual(self, text):
         return True
@@ -33,7 +36,17 @@ class DummyTx:
     async def send_to(self, name, text):
         return True, ""
 
-    async def reconfigure(self):
+    async def resend(self, name, text, channel):
+        self.resend_calls.append((name, text, "", channel))
+        return True, ""
+
+    async def resend_with_followup(self, name, text, followup_text, channel):
+        self.resend_calls.append((name, text, followup_text, channel))
+        return True, ""
+
+    async def reconfigure(self, settings=None):
+        for key, value in (settings or {}).items():
+            self.db.set_setting(key, value)
         return None
 
     async def inspect_meshcore_channel(self, index):
@@ -87,13 +100,21 @@ class DummyPoller:
         pass
 
 
+class DummyAreaAlertCache:
+    async def get_many(self, counties, contact):
+        return [], [], False, ""
+
+
 @pytest.fixture
 def web(tmp_path, monkeypatch):
+    import app.web.routes as routes_mod
+
     monkeypatch.setenv("MESHWX_ADMIN_PASSWORD", "correct horse battery staple")
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", DummyAreaAlertCache())
     db = Database(str(tmp_path / "web.db"))
     app = FastAPI()
     app.state.db = db
-    app.state.tx = DummyTx()
+    app.state.tx = DummyTx(db)
     app.state.poller = DummyPoller()
     app.include_router(router)
     with TestClient(app) as client:
@@ -127,6 +148,75 @@ def test_readme_prominently_documents_routing_upgrade_auth_and_acceptance_limits
     assert "logged **sent** only when the radio really keyed up" not in normalized
 
 
+def test_dashboard_exposes_only_sanitized_nwws_health(web):
+    client, _db, _tx = web
+    client.app.state.nwws = SimpleNamespace(health=SimpleNamespace(
+        state=SimpleNamespace(value="connected"), received=12, delivered=4,
+        ignored=7, malformed=1, dropped=0, reconnects=2,
+        error_category=None,
+    ))
+    client.app.state.nwws_shadow = True
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "NWWS-OI connected" in response.text
+    assert "shadow" in response.text
+    assert "12 received" in response.text
+    assert "password" not in response.text.casefold()
+    client.app.state.nwws.health.received = None
+    degraded = client.get("/")
+    assert degraded.status_code == 200
+    assert "0 received" in degraded.text
+
+
+def test_dashboard_exposes_only_sanitized_noaa_sdr_health(web):
+    client, _db, _tx = web
+    client.app.state.noaa_sdr = SimpleNamespace(
+        config=SimpleNamespace(enabled=True, callsign="WWH37", frequency_hz=162_500_000),
+        health=SimpleNamespace(
+            state="running", restarts=0, audio_rms=0.11665, audio_peak=0.17889,
+            temperature_c=69.6, last_valid_header=None, last_rwt=None,
+            confirmed_headers=0, confirmed_eom=0, last_event_code=None,
+            last_event_name=None, last_location_count=0,
+            last_error="SECRET DEVICE DETAIL",
+        ),
+    )
+    client.app.state.noaa_sdr_shadow = True
+    client.app.state.noaa_sdr_config_error = None
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "NOAA SDR WWH37 running" in response.text
+    assert "162.500 MHz" in response.text
+    assert "shadow" in response.text
+    assert "audio 11.7%" in response.text
+    assert "0 confirmed SAME headers" in response.text
+    assert "awaiting first valid SAME header" in response.text
+    assert "SECRET DEVICE DETAIL" not in response.text
+
+    client.app.state.noaa_sdr.health.confirmed_headers = "invalid"
+    client.app.state.noaa_sdr.health.confirmed_eom = float("nan")
+    client.app.state.noaa_sdr.health.last_location_count = object()
+    degraded = client.get("/")
+    assert degraded.status_code == 200
+    assert "0 confirmed SAME headers" in degraded.text
+
+    observed_at = datetime.datetime(2026, 9, 13, 14, 6, tzinfo=datetime.timezone.utc)
+    client.app.state.noaa_sdr.health.confirmed_headers = 1
+    client.app.state.noaa_sdr.health.last_event_code = "RWT"
+    client.app.state.noaa_sdr.health.last_valid_header = observed_at
+    client.app.state.noaa_sdr.health.last_rwt = observed_at
+    observed = client.get("/")
+    assert observed.status_code == 200
+    assert "1 confirmed SAME headers" in observed.text
+    assert "last RWT" in observed.text
+
+    client.app.state.noaa_sdr.health.last_valid_header = datetime.datetime(2026, 9, 13)
+    client.app.state.noaa_sdr.health.last_rwt = object()
+    malformed_time = client.get("/")
+    assert malformed_time.status_code == 200
+
+
 def test_state_changes_require_matching_csrf_token(web):
     client, _db, _tx = web
 
@@ -141,6 +231,26 @@ def test_state_changes_require_matching_csrf_token(web):
     assert accepted.status_code == 200
     assert "accepted by configured radio interfaces" in accepted.text
     assert "over-air delivery is not confirmed" in accepted.text
+
+
+def test_transmit_log_resend_replays_card_and_its_detail(web):
+    client, db, tx = web
+    db.add_transmit_log(
+        1, 20, True, "⚠️ HEAT ADVISORY: Montgomery County", transport="meshcore",
+        destination_id=1, followup_text="DETAIL: Heat index near 105.",
+    )
+    entry_id = db.query_transmit_log()[0]["id"]
+    token = csrf(client)
+
+    response = client.post(
+        f"/transmit-log/resend/{entry_id}", data={"csrf_token": token}
+    )
+
+    assert response.status_code == 200
+    assert tx.resend_calls == [(
+        "meshcore", "⚠️ HEAT ADVISORY: Montgomery County",
+        "DETAIL: Heat index near 105.", 1,
+    )]
 
 
 @pytest.mark.parametrize("action", ["create", "update", "toggle", "delete"])
@@ -390,11 +500,44 @@ def test_local_alert_map_page_uses_pinned_leaflet_and_safe_dom_rendering(web):
     assert "data.zone_errors" in response.text
     assert "data.alert_errors" in response.text
     assert "data.stale" in response.text
+    assert "Current regional alerts" in response.text
+    assert "Watched county" in response.text
+    assert "Regional" in response.text
+    assert "alert.watched" in response.text
+    assert "alert.affected_zones" in response.text
+    assert "new Set" in response.text
+    assert "feature.properties.watched" in response.text
+    assert "item.watched" in response.text
+    assert ".alert-card.watched{background:" in response.text
+    assert "var outline=watched?'#7c3aed':fill;" in response.text
+    assert "L.featureGroup()" in response.text
     assert "if(loading)return" in response.text
     assert ".textContent" in response.text
     assert ".innerHTML" not in response.text
     assert "© OpenStreetMap contributors" in response.text
     assert "https://www.openstreetmap.org/copyright" in response.text
+
+
+def test_local_alert_map_auto_enables_public_radar_for_nearby_alerts(web):
+    client, _db, _tx = web
+
+    response = client.get("/map")
+
+    assert response.status_code == 200
+    assert 'id="radar-toggle"' in response.text
+    assert 'id="radar-opacity"' in response.text
+    assert 'id="radar-status"' in response.text
+    assert "https://mesonet.agron.iastate.edu/cgi-bin/wms/nexrad/n0q.cgi" in response.text
+    assert "L.tileLayer.wms" in response.text
+    assert "nexrad-n0q-900913" in response.text
+    assert "Iowa Environmental Mesonet" in response.text
+    assert "National Weather Service" in response.text
+    assert "Array.isArray(data.alerts)&&data.alerts.length>0" in response.text
+    assert "radarLayer.addTo(map)" in response.text
+    assert "map.removeLayer(radarLayer)" in response.text
+    assert "radarLayer.setOpacity" in response.text
+    assert "radarLayer.setParams" in response.text
+    assert "Radar automatically appears while nearby alerts are active." in response.text
 
 
 def test_local_alert_map_data_uses_county_scoped_alerts_and_configured_route_counties(web, monkeypatch):
@@ -412,12 +555,14 @@ def test_local_alert_map_data_uses_county_scoped_alerts_and_configured_route_cou
 
     class FakeZoneCache:
         async def get_many(self, counties, contact):
-            assert counties == [{"code": "TNC125", "name": "Montgomery County"}]
+            assert counties == [{
+                "code": "TNC125", "name": "Montgomery County", "watched": True,
+            }]
             return [{
                 "type": "Feature",
                 "geometry": geometry,
                 "properties": {"code": "TNC125", "name": "Montgomery County"},
-            }], []
+            }], [], ["TNC125"]
 
     safe_alert = {
         "id": "local-alert",
@@ -441,7 +586,7 @@ def test_local_alert_map_data_uses_county_scoped_alerts_and_configured_route_cou
             return [safe_alert], [], False, "2099-01-01T00:00:00+00:00"
 
     monkeypatch.setattr(routes_mod, "_ALERT_MAP_CACHE", FakeZoneCache())
-    monkeypatch.setattr(routes_mod, "_COUNTY_ALERT_CACHE", FakeAlertCache())
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", FakeAlertCache())
 
     response = client.get("/api/map-data")
 
@@ -463,6 +608,307 @@ def test_local_alert_map_data_uses_county_scoped_alerts_and_configured_route_cou
     assert payload["zone_errors"] == []
     assert payload["alert_errors"] == []
     assert payload["error"] == ""
+
+
+def test_home_assistant_alert_feed_is_bounded_and_watched_only(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    client, db, _tx = web
+    rule_id = db.create_route("home assistant", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+
+    class FakeAreaCache:
+        async def get_many(self, counties, contact):
+            return [
+                {
+                    "id": "watched", "event": "Tornado Warning", "headline": "Local warning",
+                    "area": "Montgomery County", "severity": "Extreme",
+                    "urgency": "Immediate", "certainty": "Observed",
+                    "onset": "2099-01-01T00:00:00+00:00", "ends": "",
+                    "expires": "2099-01-01T01:00:00+00:00",
+                    "local_zones": ["TNC125"], "local_counties": ["Montgomery County"],
+                    "geometry": {"type": "Polygon", "coordinates": [[[1, 2]]]},
+                    "description": "must not leak", "watched": True,
+                    "affected_zones": ["TNC125"], "internal": "must not leak",
+                },
+                {
+                    "id": "regional", "event": "Flood Warning", "headline": "Nearby",
+                    "area": "Davidson County", "severity": "Severe", "urgency": "Expected",
+                    "certainty": "Likely", "onset": "", "ends": "", "expires": "",
+                    "local_zones": [], "local_counties": [], "geometry": None,
+                    "watched": False, "affected_zones": ["TNC037"],
+                },
+            ], [], False, "2099-01-01T00:00:00+00:00"
+
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", FakeAreaCache())
+    history_before = db.query_history()
+
+    response = client.get("/api/home-assistant/alerts")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "count": 1,
+        "alerts": [{
+            "event": "Tornado Warning",
+            "headline": "Local warning",
+            "severity": "Extreme",
+            "urgency": "Immediate",
+            "certainty": "Observed",
+            "onset": "2099-01-01T00:00:00+00:00",
+            "ends": "",
+            "expires": "2099-01-01T01:00:00+00:00",
+            "local_counties": ["Montgomery County"],
+            "local_zones": ["TNC125"],
+        }],
+        "last_poll_success": "2099-01-01T00:00:00+00:00",
+        "stale": False,
+        "error": "",
+    }
+    assert db.query_history() == history_before
+
+
+def test_home_assistant_alert_feed_degrades_without_leaking_cache_errors(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    class BrokenAreaCache:
+        async def get_many(self, counties, contact):
+            raise RuntimeError("private upstream failure must not leak")
+
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", BrokenAreaCache())
+
+    response = web[0].get("/api/home-assistant/alerts")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "count": 0,
+        "alerts": [],
+        "last_poll_success": "",
+        "stale": True,
+        "error": "WXDispatch watched-alert data is temporarily unavailable.",
+    }
+    assert "private upstream failure" not in response.text
+
+
+def test_home_assistant_alert_feed_marks_partial_state_failures(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    client, db, _tx = web
+    rule_id = db.create_route("multi-state", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+
+    class PartialAreaCache:
+        async def get_many(self, counties, contact):
+            return [], ["KY"], False, "2099-01-01T00:00:00+00:00"
+
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", PartialAreaCache())
+
+    response = client.get("/api/home-assistant/alerts")
+
+    assert response.status_code == 200
+    assert response.json()["stale"] is True
+    assert response.json()["error"] == (
+        "Some WXDispatch watched-alert checks failed; results may be incomplete."
+    )
+
+
+def test_home_assistant_alert_feed_degrades_on_database_failure(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    def broken_db(_request):
+        raise RuntimeError("private database failure must not leak")
+
+    monkeypatch.setattr(routes_mod, "_db", broken_db)
+
+    response = web[0].get("/api/home-assistant/alerts")
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 0
+    assert response.json()["stale"] is True
+    assert response.json()["error"] == (
+        "WXDispatch watched-alert data is temporarily unavailable."
+    )
+    assert "private database failure" not in response.text
+
+
+def test_local_alert_map_data_includes_regional_alerts_and_watched_priority(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    client, db, _tx = web
+    rule_id = db.create_route("regional map", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+
+    class FakeZoneCache:
+        async def get_many(self, counties, contact):
+            assert counties == [
+                {"code": "TNC125", "name": "Montgomery County", "watched": True},
+                {"code": "TNC037", "name": "TNC037", "watched": False},
+                {"code": "TNZ001", "name": "TNZ001", "watched": False},
+            ]
+            return [], [], ["TNC125", "TNC037"]
+
+    class FakeAreaCache:
+        async def get_many(self, counties, contact):
+            assert counties == [{"code": "TNC125", "name": "Montgomery County"}]
+            return [
+                {
+                    "id": "watched", "event": "Tornado Warning", "headline": "Local",
+                    "area": "Montgomery County", "severity": "Extreme",
+                    "urgency": "Immediate", "certainty": "Observed", "onset": "",
+                    "ends": "", "expires": "", "local_zones": ["TNC125"],
+                    "local_counties": ["Montgomery County"], "geometry": None,
+                    "watched": True,
+                    "affected_zones": ["TNC125"],
+                },
+                {
+                    "id": "regional", "event": "Flood Warning", "headline": "Nearby",
+                    "area": "Davidson County", "severity": "Severe", "urgency": "Expected",
+                    "certainty": "Likely", "onset": "", "ends": "", "expires": "",
+                    "local_zones": [], "local_counties": [], "geometry": None,
+                    "watched": False,
+                    "affected_zones": ["TNC037"],
+                },
+                {
+                    "id": "outside", "event": "Wind Advisory", "headline": "Distant",
+                    "area": "West Tennessee", "severity": "Moderate", "urgency": "Expected",
+                    "certainty": "Likely", "onset": "", "ends": "", "expires": "",
+                    "local_zones": [], "local_counties": [], "geometry": None,
+                    "watched": False, "affected_zones": ["TNZ001"],
+                },
+            ], [], False, "2099-01-01T00:00:00+00:00"
+
+    monkeypatch.setattr(routes_mod, "_ALERT_MAP_CACHE", FakeZoneCache())
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", FakeAreaCache())
+    history_before = db.query_history()
+
+    response = client.get("/api/map-data")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [alert["id"] for alert in payload["alerts"]] == ["watched", "regional"]
+    assert payload["watched_alert_count"] == 1
+    assert payload["regional_alert_count"] == 1
+    assert payload["scope_areas"] == ["TN"]
+    assert db.query_history() == history_before
+
+
+def test_dashboard_shows_current_watched_alerts_not_regional_context(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    client, db, tx = web
+    destination_id = db.create_destination("Todd mesh", "meshcore", 7, True)
+    db.create_routing_rule(
+        "Todd County", 100, True, True,
+        [("KYC219", "Todd County")], [], [destination_id], [], True,
+    )
+
+    class FakeAreaCache:
+        async def get_many(self, counties, contact):
+            assert counties == [{"code": "KYC219", "name": "Todd County"}]
+            return [
+                {
+                    "id": "watched", "event": "Tornado Warning", "severity": "Extreme",
+                    "area": "Todd County", "headline": "Tornado Warning issued for Todd County",
+                    "ends": "2099-01-01T01:00:00+00:00", "expires": "",
+                    "local_zones": ["KYC219"], "affected_zones": ["KYC219"],
+                    "watched": True,
+                },
+                {
+                    "id": "regional", "event": "Heat Advisory", "severity": "Moderate",
+                    "area": "Nearby County", "headline": "Regional heat",
+                    "ends": "2099-01-01T02:00:00+00:00", "expires": "",
+                    "local_zones": [], "affected_zones": ["KYC047"],
+                    "watched": False,
+                },
+            ], [], False, "2099-01-01T00:00:00+00:00"
+
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", FakeAreaCache())
+    history_before = db.query_history()
+    tx_before = list(tx.transports)
+
+    response = client.get("/")
+    partial = client.get("/partials/dashboard")
+
+    assert response.status_code == 200
+    assert partial.status_code == 200
+    for body in (response.text, partial.text):
+        assert "Active alerts" in body
+        assert "Tornado Warning" in body
+        assert "Todd County" in body
+        assert "Extreme" in body
+        assert "Heat Advisory" not in body
+        assert "No active alerts for watched counties." not in body
+    assert db.query_history() == history_before
+    assert tx.transports == tx_before
+
+
+def test_dashboard_active_alert_section_handles_empty_and_malformed_cache_data(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    client, db, _tx = web
+    destination_id = db.create_destination("Todd mesh", "meshcore", 7, True)
+    db.create_routing_rule(
+        "Todd County", 100, True, True,
+        [("KYC219", "Todd County")], [], [destination_id], [], True,
+    )
+
+    class FakeAreaCache:
+        async def get_many(self, counties, contact):
+            return [{
+                "event": "Malformed local zones", "severity": "Unknown", "watched": True,
+                "area": "Todd County", "local_zones": None,
+            }], ["KY"], True, ""
+
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", FakeAreaCache())
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "Active alerts" in response.text
+    assert "Malformed local zones" in response.text
+    assert "Todd County" in response.text
+    assert "Active NWS data is stale." in response.text
+    assert "Some current alert checks are temporarily unavailable." in response.text
+
+
+def test_dashboard_survives_active_alert_cache_failure(web, monkeypatch):
+    import app.web.routes as routes_mod
+
+    class BrokenAreaCache:
+        async def get_many(self, counties, contact):
+            raise RuntimeError("must not escape into dashboard")
+
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", BrokenAreaCache())
+
+    response = web[0].get("/")
+
+    assert response.status_code == 200
+    assert "Active alerts" in response.text
+    assert "Active alert status is unavailable." in response.text
+    assert "No active alerts for watched counties." not in response.text
+    assert 'class="active-empty unavailable"' in response.text
+    assert "must not escape" not in response.text
+
+
+def test_dashboard_caps_active_alert_lookup_latency(web, monkeypatch):
+    import time
+    import app.web.routes as routes_mod
+
+    class SlowAreaCache:
+        async def get_many(self, counties, contact):
+            import asyncio
+            await asyncio.sleep(0.25)
+            return [], [], False, ""
+
+    monkeypatch.setattr(routes_mod, "_AREA_ALERT_CACHE", SlowAreaCache())
+    monkeypatch.setattr(routes_mod, "_DASHBOARD_ALERT_TIMEOUT_SECONDS", 0.01)
+    started = time.monotonic()
+
+    response = web[0].get("/")
+
+    assert time.monotonic() - started < 0.2
+    assert response.status_code == 200
+    assert "Active alert status is unavailable." in response.text
 
 
 def test_dashboard_broadcast_counts_include_routed_accepted_and_partial_outcomes(web):
@@ -503,6 +949,94 @@ def test_settings_exposes_optional_meshwx_v4_controls(web):
     assert 'name="meshwx_v4_channel"' in response.text
     assert 'name="meshwx_v4_channel" min="1" max="7"' in response.text
     assert "normal county text alerts continue unchanged" in response.text
+
+
+def test_settings_exposes_and_persists_meshcore_flood_scope(web):
+    client, db, _tx = web
+    db.set_setting("meshcore_flood_scope", "#us-tn-clarksville")
+    db.set_setting("meshcore_require_flood_scope", True)
+
+    response = client.get("/settings")
+
+    assert response.status_code == 200
+    assert 'name="meshcore_flood_scope"' in response.text
+    assert 'value="#us-tn-clarksville"' in response.text
+    assert 'name="meshcore_require_flood_scope"' in response.text
+    assert 'name="meshcore_require_flood_scope" checked' in response.text
+    assert "before every MeshCore channel transmission" in response.text
+
+    response = client.post(
+        "/settings",
+        data={
+            "csrf_token": csrf(client),
+            "poll_interval": "120",
+            "nws_contact": "operator@example.com",
+            "meshcore_flood_scope": "us-tn-clarksville",
+            "meshcore_require_flood_scope": "on",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert db.get_setting("meshcore_flood_scope") == "#us-tn-clarksville"
+    assert db.get_setting("meshcore_require_flood_scope") is True
+
+
+def test_deployment_locked_scope_rejects_ui_override(web, monkeypatch):
+    client, db, _tx = web
+    monkeypatch.setenv("MESH_WX_MESHCORE_FLOOD_SCOPE", "#us-tn-clarksville")
+
+    response = client.post(
+        "/settings",
+        data={
+            "csrf_token": csrf(client),
+            "poll_interval": "120",
+            "nws_contact": "operator@example.com",
+            "meshcore_flood_scope": "#wrong-region",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert db.get_setting("meshcore_flood_scope") == "#us-tn-clarksville"
+    assert db.get_setting("meshcore_require_flood_scope") is True
+
+    page = client.get("/settings")
+    assert 'value="#us-tn-clarksville"' in page.text
+    assert "Locked by this deployment" in page.text
+
+
+def test_settings_makes_routing_primary_and_marks_coverage_as_legacy(web):
+    client, _db, _tx = web
+
+    response = client.get("/settings")
+
+    assert response.status_code == 200
+    assert "Routing rules are authoritative" in response.text
+    assert "Legacy coverage and global alert filters" in response.text
+    assert 'href="/routing"' in response.text
+    assert "openHop Console does not decode this binary feed" in response.text
+
+
+def test_dashboard_shows_active_route_details_instead_of_legacy_coverage(web):
+    client, db, _tx = web
+    destination_id = db.create_destination("Montgomery mesh", "meshcore", 7, True)
+    rule_id = db.create_route("Montgomery warnings", 10, True)
+    db.replace_route_counties(rule_id, [("TNC125", "Montgomery County")])
+    db.replace_route_events(rule_id, [], all_warnings=True)
+    db.replace_route_destinations(rule_id, [destination_id])
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "Configured routing" in response.text
+    assert "Montgomery warnings" in response.text
+    assert "Montgomery County" in response.text
+    assert "Montgomery mesh" in response.text
+    assert "MeshCore ch 7" in response.text
+    assert "1 county" in response.text
+    assert "1 routing rule configured" in response.text
+    assert "Watching 1 zones" not in response.text
 
 
 def test_settings_round_trip_enables_structured_feed_only_off_public(web):
@@ -1186,7 +1720,9 @@ def test_rule_edit_form_is_prefilled_with_all_associations(web):
         rule_id,
         [("TNC147", "Robertson County"), ("TNC159", "Smith County")],
     )
-    db.replace_route_events(rule_id, ["Tornado Warning"])
+    db.replace_route_events(
+        rule_id, ["Tornado Warning"], detail_events=["Tornado Warning"]
+    )
     db.replace_route_destinations(rule_id, [selected_destination])
 
     response = client.get(f"/routing/rules/{rule_id}/edit")
@@ -1199,6 +1735,8 @@ def test_rule_edit_form_is_prefilled_with_all_associations(web):
     assert f'name="destination_ids" value="{selected_destination}" checked' in response.text
     assert f'name="destination_ids" value="{other_destination}" checked' not in response.text
     assert 'name="events" value="Tornado Warning" checked' in response.text
+    assert 'name="detail_events" value="Tornado Warning" checked' in response.text
+    assert 'name="detail_events" value="Heat Advisory" checked' in response.text
     assert 'name="all_warnings"' in response.text
     assert 'name="all_warnings" type="checkbox" checked' not in response.text
     assert 'name="enabled" type="checkbox" checked' not in response.text
@@ -1223,7 +1761,9 @@ def test_rule_update_changes_every_field_and_deduplicates_associations(web):
             "priority": "7",
             "enabled": "on",
             "all_warnings": "on",
+            "all_warnings_details": "on",
             "events": ["Heat Advisory", "Heat Advisory"],
+            "detail_events": ["Heat Advisory", "Heat Advisory"],
             "counties": (
                 "TNC159 | Smith County\nTNC021 | Cheatham County\n"
                 "TNC159 | Smith County"
@@ -1245,10 +1785,44 @@ def test_rule_update_changes_every_field_and_deduplicates_associations(web):
         ("TNC021", "Cheatham County"), ("TNC159", "Smith County"),
     ]
     assert rule["events"] == ["Heat Advisory"]
+    assert rule["detail_events"] == ["Heat Advisory"]
+    assert rule["all_warnings_details"] is True
     assert [destination["id"] for destination in rule["destinations"]] == [
         first_destination, second_destination,
     ]
     assert not db._conn.in_transaction
+
+
+def test_new_route_event_detail_checkboxes_default_enabled(web):
+    client, db, _tx = web
+    destination_id = db.create_destination("Montgomery", "meshcore", 1)
+
+    page = client.get("/routing")
+
+    assert page.status_code == 200
+    assert 'name="detail_events" value="Heat Advisory" checked' in page.text
+    assert 'type="checkbox" name="all_warnings_details" checked' in page.text
+
+    token = client.cookies.get("mesh_wx_csrf")
+    response = client.post(
+        "/routing/rules",
+        data={
+            "csrf_token": token,
+            "name": "Mixed details",
+            "priority": "10",
+            "enabled": "on",
+            "events": ["Heat Advisory", "Dense Fog Advisory"],
+            "detail_events": ["Heat Advisory"],
+            "counties": "TNC125 | Montgomery County",
+            "destination_ids": str(destination_id),
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    route = db.list_routes()[0]
+    assert route["events"] == ["Dense Fog Advisory", "Heat Advisory"]
+    assert route["detail_events"] == ["Heat Advisory"]
 
 
 def test_rule_toggle_is_exposed_and_flips_only_enabled_state(web):

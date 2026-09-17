@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <b>Status: v2.3.0.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
+  <b>Status: v2.4.3.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
 </p>
 
 ---
@@ -61,16 +61,29 @@ channel. Built after living through Hurricane Helene's comms blackout.
 - **No spam.** Never rebroadcasts the same alert; sends one concise *update* when a warning
   materially changes and a *cancellation* when it clears. Old state auto-expires.
 - **Fits a LoRa packet.** Alerts are trimmed to ≤195 bytes, e.g.
-  `[WX] Tornado Warning: Charleston +2 more until 8:45 PM EDT`.
-- **Optional rich warning cards.** WXDispatch can dual-cast active warnings as
+  `⚠️ TORNADO WARNING: Charleston County +2 counties until 8:45 PM`.
+- **openHop Console alert cards.** Routed alerts remain ordinary `GRP_TXT` messages but use
+  the Console HOWL form `⚠️ SEVERITY: headline`. A sending companion whose name includes
+  `Bot` is rendered as a card while every normal MeshCore client still sees readable text.
+- **Optional alert details.** Each event in a routing rule can send one paced `DETAIL:`
+  follow-up containing concise NWS-authored hazard facts and, when available, protective
+  instructions. Details go only after the alert card is accepted, retry independently, and
+  resend only when their meaningful content changes. If an alert contains nothing useful,
+  WXDispatch stays silent.
+- **Optional MeshWX v4 binary feed.** WXDispatch can also dual-cast active warnings as
   COBS-encoded MeshWX v4 `0x20`/`0x21` binary frames on a dedicated non-Public
-  MeshCore hash channel. Compatible clients render structured warning cards while
-  the existing county text channels continue unchanged.
+  MeshCore hash channel. This is only for clients with a MeshWX v4 decoder; openHop Console
+  otherwise displays it as `[data 0xFFFF]`, so leave it disabled for Console-only setups.
+- **Fail-closed MeshCore flood scoping.** Operators can require an exact regional flood scope.
+  WXDispatch selects it immediately before every text or binary channel send while holding the
+  same transport lock; a missing scope, rejected command, timeout, or link error blocks the payload.
 - **Dry-run by default.** Automated alerts are logged, not transmitted, until you flip it on.
 - **A real dashboard.** Live radio status, recent alerts, 7-day activity, transmit log,
   and a per-radio **Send test** button to key up each radio on the bench.
-- **Local alert map.** Shows every configured county and its current county-scoped NWS
-  alerts, including multi-county events, partial lookup failures, and stale-data warnings.
+- **Local alert map.** Shows active alerts in the same-state portion of the NWS forecast-office
+  coverage area serving your configured counties. Watched counties and their alerts are emphasized
+  above lighter regional context, while partial lookup failures and stale-data warnings remain
+  visible. Map-only regional awareness does not change alert routing or radio transmission.
 
 ## Install
 
@@ -143,15 +156,17 @@ No Python install required. Windows may warn about an unrecognized app the first
 2. **NOAA → NWS contact**: set this to your email address. The NWS API
    [requires a contact string](https://www.weather.gov/documentation/services-web-api)
    in every request; leaving the default placeholder can get you rate-limited or blocked.
-3. **Coverage**: pick your state, check your counties.
-4. **What to broadcast**: leave *All Warnings* on; add any watches/advisories you want.
-5. **Radios**: enable Meshtastic and/or MeshCore. For each, choose **USB** or **network (IP/TCP)**, click **Connect and load channels**, then pick which channel carries live alerts and which carries test messages.
-6. Save, then open **Routing**. Create and enable at least one destination, then create and
-   enable a county/event rule that uses it. WXDispatch never creates routing rules automatically.
-7. Go to **Troubleshoot → Send test**. A success response means the request was accepted by
+3. **Radios**: enable Meshtastic and/or MeshCore. For each, choose **USB** or **network (IP/TCP)**, click **Connect and load channels**, then pick which channel carries live alerts and which carries test messages.
+4. Save, then open **Routing**. Create and enable at least one destination, then create and
+   enable a county/event rule that uses it. Routing rules are authoritative: their counties
+   automatically drive NWS polling and the local map, and their event selections control each
+   destination. Each selected event also has a **Send details** checkbox, enabled by default;
+   uncheck it when that event should remain a one-message alert. The collapsed legacy
+   coverage/global-filter controls are not needed for routed setups.
+5. Go to **Troubleshoot → Send test**. A success response means the request was accepted by
    Meshtastic node software or accepted by MeshCore companion software; it does **not** prove
    over-air delivery. Confirm reception on a separate listening node.
-8. Only after routing and reception are verified, turn **dry-run off** on the dashboard. WXDispatch
+6. Only after routing and reception are verified, turn **dry-run off** on the dashboard. WXDispatch
    blocks LIVE mode when no enabled rule has an enabled destination.
 
 Upgrading an existing installation uses the same safety rule: **Upgrades intentionally create
@@ -166,7 +181,10 @@ themselves.
   for example a WiFi connected node at its IP address (optionally `host:port`). On USB the
   board can renumber its port on replug; leave the port blank to auto-discover, or set it.
 - **MeshCore**: flash the board with the **USB (companion)** firmware, *not* repeater
-  firmware. Repeater firmware exposes no serial API, so WXDispatch can't drive it.
+  firmware. Repeater firmware exposes no serial API, so WXDispatch can't drive it. The Settings
+  page can select and require a flood region scope. Managed deployments should set
+  `MESH_WX_MESHCORE_FLOOD_SCOPE` instead; this locks the exact scope in the UI and makes scope
+  enforcement mandatory for every MeshCore channel transmission.
 ### Confirmed radios
 
 Hardware verified working with WXDispatch, and over which connection. WXDispatch speaks the standard
@@ -242,8 +260,70 @@ lives in the UI and the database.
 | -------------- | ---------------------------------------- | ------------------ |
 | `MESH_WX_PORT` | `8000` (`8110` for the systemd service)  | HTTP port          |
 | `MESH_WX_HOST` | `0.0.0.0`                                | HTTP bind address  |
-|| `MESH_WX_DB`   | per-OS data dir (see below)              | SQLite file path   |
-|| `MESHWX_ADMIN_PASSWORD` | unset | Enables MeshCore companion channel set/clear and all-slot inventory; HTTP Basic username is `admin` |
+| `MESH_WX_DB`   | per-OS data dir (see below)              | SQLite file path   |
+| `MESHWX_ADMIN_PASSWORD` | unset | Enables MeshCore companion channel set/clear and all-slot inventory; HTTP Basic username is `admin` |
+| `MESH_WX_MESHCORE_FLOOD_SCOPE` | unset | Locks an exact MeshCore hash scope (for example `#us-tn-clarksville`) and fails closed if it is blank, malformed, or cannot be selected before a send |
+| `MESH_WX_NWWS_ENABLED` | `false` | Starts the optional NWWS-OI receiver |
+| `MESH_WX_NWWS_USERNAME` | unset | NWWS-OI account localpart (not a full JID) |
+| `MESH_WX_NWWS_PASSWORD_FILE` | unset | Private regular file containing the NWWS password |
+| `MESH_WX_NWWS_OFFICES` | `KOHX` | Comma-separated four-letter office allowlist |
+| `MESH_WX_NWWS_SHADOW` | `true` | Observe and validate products without routing them to radios |
+| `MESH_WX_NOAA_SDR_ENABLED` | `false` | Start the optional receive-only NOAA Weather Radio decoder |
+| `MESH_WX_NOAA_SDR_DEVICE_SERIAL` | unset | Exact RTL-SDR serial to claim; required when enabled |
+| `MESH_WX_NOAA_SDR_FREQUENCY_HZ` | unset | One validated NOAA channel in hertz; WWH37 is `162500000` |
+| `MESH_WX_NOAA_SDR_CALLSIGN` | `WWH37` | Bounded receiver/transmitter label shown in health |
+| `MESH_WX_NOAA_SDR_GAIN` | `auto` | RTL-SDR gain in dB, or `auto`; Rocky is initially qualified at `40.2` |
+| `MESH_WX_NOAA_SDR_PPM` | `0` | RTL-SDR frequency correction from -200 through 200 ppm |
+| `MESH_WX_NOAA_SDR_SHADOW` | `true` | Decode and observe confirmed SAME headers without radio delivery |
+
+NWWS-OI stays disabled unless explicitly enabled. Native systemd installs may place the
+non-secret values above in `/etc/mesh-wx/nwws.env`; the password itself must remain in a
+separate service-readable `0600` file. Start in shadow mode and verify the sanitized
+NWWS-OI counters on the dashboard before setting `MESH_WX_NWWS_SHADOW=false`.
+
+`MESH_WX_MESHCORE_FLOOD_SCOPE` is a deployment safety control, not a channel secret. When it is
+present, its normalized hash scope overrides the database, the WebUI cannot disable or replace it,
+and an empty or invalid value prevents WXDispatch from constructing its transports. The MeshCore
+protocol acknowledges scope selection but does not expose the current transient scope for readback;
+WXDispatch therefore requires a successful scope command immediately before each serialized send
+and never sends the payload after a rejection, timeout, or transport exception. Native systemd
+installs load this value from the optional `/etc/mesh-wx/meshcore.env`, for example:
+
+```text
+MESH_WX_MESHCORE_FLOOD_SCOPE=#us-tn-clarksville
+```
+
+### NOAA Weather Radio SDR
+
+The optional SDR source is disabled by default and has no transmit capability. On Debian or
+Raspberry Pi OS, install its receiver tools and reserve RTL2832U hardware for userspace with:
+
+```bash
+sudo MESHWX_INSTALL_NOAA_SDR=1 ./packaging/install-linux.sh
+```
+
+Native installs load non-secret settings from `/etc/mesh-wx/noaa-sdr.env`. Rocky's initial
+WWH37 configuration is:
+
+```text
+MESH_WX_NOAA_SDR_ENABLED=true
+MESH_WX_NOAA_SDR_DEVICE_SERIAL=00000001
+MESH_WX_NOAA_SDR_FREQUENCY_HZ=162500000
+MESH_WX_NOAA_SDR_CALLSIGN=WWH37
+MESH_WX_NOAA_SDR_RECEIVER_ID=rocky-attic
+MESH_WX_NOAA_SDR_GAIN=40.2
+MESH_WX_NOAA_SDR_PPM=0
+MESH_WX_NOAA_SDR_SHADOW=true
+```
+
+The receiver runs `rtl_fm` into `multimon-ng`, requires two matching bounded SAME headers,
+and rejects tests, administrative messages, and invalid locations. Confirmed eligible headers are
+projected through WXDispatch's normal filtering and deduplication machinery **in shadow mode only**,
+so they create no radio delivery. Direct SDR routing is deliberately rejected until source-neutral
+REST/NWWS/SAME correlation is implemented; this prevents duplicate broadcasts of the same hazard.
+Use a real alert or scheduled weekly SAME test to validate reception. The dashboard should show a
+stable receiver, nonzero audio, no thermal stop, and the expected county scope. Raw SAME headers and
+device errors are never rendered in the dashboard.
 
 When `MESHWX_ADMIN_PASSWORD` is unset, channel set/clear fail closed with HTTP 503 and the UI
 marks channel administration disabled. The password is read from the process environment and is
@@ -254,6 +334,26 @@ separate channel secret is accepted or stored. Anyone who knows the exact hash-c
 derive the same key. **Load all channels** reads every device-reported slot, including empty slots,
 in one operation. That inventory requires administrator authentication because it reveals all exact
 hash-channel names; channel keys are never returned or displayed.
+
+### Password-protected guest view
+
+The optional **WXDispatch guest view** is a separate read-only process with exactly six routes:
+the guest dashboard at `/`, regional alert map at `/map`, NOAA history at `/history`, IPAWS history
+at `/ipaws`, the fixed map-data endpoint, and `/healthz`. The dashboard and history pages are
+presentation-only: history is queried through a bounded SQLite `mode=ro` connection, internal
+identifiers, sender addresses, and stored error details are omitted, and no guest request can alter
+routing, delivery state, alert history, or radio state. It contains no transmit log, routing, settings,
+manual transmission, troubleshooting, write, OpenAPI, or documentation routes. Run it with
+`mesh-wx-guest.service`; the backend authenticates HTTP Basic username `guest`.
+
+For public access, put the guest process behind HTTPS and use **Pangolin header authentication**
+in extended compatibility mode. Pangolin challenges for HTTP Basic username `guest` and passes the
+same credential to the guest backend. Because the Pangolin-to-backend hop is HTTP, keep port `8111`
+on a trusted private network and never expose it directly to the internet. The password is read from
+`/etc/mesh-wx/guest-password`; that file must be an absolute, regular, non-symlink file owned by the
+service account with mode `0600`, and it must contain a 16–256 character password. It is never placed in the unit, repository, URL, page, or logs. Expose
+the guest service only through HTTPS. A reverse proxy or tunnel must target guest port `8111` and
+must not expose port `8110`, which remains the private operator interface.
 
 The default database location when `MESH_WX_DB` is unset deliberately retains the original
 MeshWX paths so upgrades reuse existing settings and history:
@@ -288,9 +388,9 @@ power, and a path to the National Weather Service. Plan for both.
   internet, so if your cable or fiber dies with the grid, it goes quiet. A satellite
   link such as Starlink, on its own battery or solar, keeps alerts flowing when
   terrestrial service is down.
-- **Know the limit.** With no internet and no backup path, WXDispatch cannot fetch new
-  alerts. It is a bridge from the NWS to your mesh, not a weather source of its own.
-  Keep a NOAA Weather Radio as the offline fallback.
+- **Know the limit.** Without internet, REST/NWWS/IPAWS feeds are unavailable. An enabled,
+  independently powered NOAA SDR can still observe local SAME headers, but its coverage is limited
+  to the selected transmitter and confirmed reception. Keep additional official warning methods.
 
 ## Credits
 
