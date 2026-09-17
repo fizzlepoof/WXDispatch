@@ -14,6 +14,12 @@ import logging
 from dataclasses import replace
 from datetime import datetime, timezone
 
+from .arbitration import (
+    ArbitrationDeliveryOutcome,
+    ArbitrationOutcome,
+    classify_rest_feature,
+    rest_product_timestamp,
+)
 from .config import POLL_HARD_TIMEOUT, POLL_INTERVAL_MIN
 from .dedupe import decide
 from .detail_formatter import build_alert_detail
@@ -22,7 +28,7 @@ from .formatter import build_routed_mesh_text
 from .meshwx_v4 import encode_alert
 from .models import Alert
 from .nws import NWSClient, NWSError
-from .nwws import parse_vtec, vtec_correlation_key, vtec_event_year
+from .nwws import parse_vtec_parameter, vtec_correlation_key, vtec_event_year
 from .routing import RoutedDestination, route_alert
 
 logger = logging.getLogger("mesh_wx.poller")
@@ -39,17 +45,29 @@ def _vtec_identity(feature: dict) -> str | None:
     vtec_lines = parameters.get("VTEC") if isinstance(parameters, dict) else None
     if not isinstance(vtec_lines, list) or len(vtec_lines) != 1:
         return None
-    issue_text = props.get("effective") or props.get("sent") or props.get("onset")
     try:
-        vtec = parse_vtec(vtec_lines[0]) if isinstance(vtec_lines[0], str) else None
-        if vtec is None:
-            return None
-        issue = datetime.fromisoformat(str(issue_text).replace("Z", "+00:00"))
-        if issue.tzinfo is None:
+        vtec = parse_vtec_parameter(vtec_lines[0])
+        issue = rest_product_timestamp(props)
+        if vtec is None or issue is None:
             return None
         return vtec_correlation_key(vtec, vtec_event_year(vtec, issue))
     except (TypeError, ValueError):
         return None
+
+
+def _vtec_action(feature: dict) -> str | None:
+    if not isinstance(feature, dict):
+        return None
+    props = feature.get("properties")
+    parameters = props.get("parameters") if isinstance(props, dict) else None
+    vtec_lines = parameters.get("VTEC") if isinstance(parameters, dict) else None
+    if not isinstance(vtec_lines, list) or len(vtec_lines) != 1:
+        return None
+    try:
+        vtec = parse_vtec_parameter(vtec_lines[0])
+    except (TypeError, ValueError):
+        return None
+    return vtec.action if vtec is not None else None
 
 
 def _delivery_hash(alert: Alert, matched_areas) -> str:
@@ -101,9 +119,10 @@ class PollerStatus:
 
 
 class WxPoller:
-    def __init__(self, db, transmit_manager):
+    def __init__(self, db, transmit_manager, *, arbiter=None):
         self._db = db
         self._tx = transmit_manager
+        self._arbiter = arbiter
         self.status = PollerStatus()
         self._task: asyncio.Task | None = None
         self._wake = asyncio.Event()
@@ -152,6 +171,29 @@ class WxPoller:
         """Wake the loop early (e.g. after a settings change)."""
         self._wake.set()
 
+    def set_arbiter(self, arbiter) -> None:
+        self._arbiter = arbiter
+
+    async def deliver_arbitrated(
+        self, feature: dict, destination_ids, source: str, canonical_id: str,
+        on_result,
+    ) -> None:
+        """Deliver one arbitration winner only to its claimed destinations."""
+        settings = self._db.all_settings()
+        followup_id = getattr(on_result, "arbitration_followup_id", None)
+        await self._process(
+            feature,
+            FilterRules.from_settings(settings),
+            settings.get("display_timezone", ""),
+            int(settings.get("channel_index", 0)),
+            bool(settings.get("dry_run", True)),
+            allowed_destination_ids={int(value) for value in destination_ids},
+            arbitration_canonical_id=canonical_id,
+            arbitration_source=source,
+            arbitration_followup_id=followup_id,
+            on_delivery_result=on_result,
+        )
+
     async def ingest_feature(self, feature: dict, *, source: str, shadow: bool) -> bool:
         """Process an externally received NWS feature through the shared path."""
         alert = Alert.from_feature(feature)
@@ -163,6 +205,21 @@ class WxPoller:
                 source, alert.event[:80], alert.area_desc[:80],
             )
             return True
+        if self._arbiter is not None:
+            if source == "noaa_sdr":
+                outcome = await self._arbiter.ingest(feature, source="same")
+                return outcome is ArbitrationOutcome.HANDLED
+            if source == "nwws":
+                action = _vtec_action(feature)
+                if action in {"CON", "EXT", "CAN", "EXP"}:
+                    rebound = await self._arbiter.prepare_followup(feature)
+                    if rebound is not None:
+                        await self._arbiter.deliver_prepared_followup(rebound)
+                else:
+                    logger.info(
+                        "nwws initial observed while SAME-primary arbitration is active"
+                    )
+                return True
         settings = self._db.all_settings()
         await self._process(
             feature,
@@ -424,12 +481,49 @@ class WxPoller:
 
         for feature in features:
             try:
+                if self._arbiter is not None:
+                    props = feature.get("properties", {}) if isinstance(feature, dict) else {}
+                    message_type = (
+                        props.get("messageType", "Alert")
+                        if isinstance(props, dict) else "Alert"
+                    )
+                    if (
+                        message_type in ("Update", "Cancel")
+                        or _vtec_action(feature) in {"CON", "EXT", "CAN", "EXP"}
+                    ):
+                        classification = classify_rest_feature(feature)
+                        if classification is ArbitrationOutcome.INELIGIBLE:
+                            await self._process(feature, rules, tz_name, channel, dry_run)
+                            continue
+                        if classification is ArbitrationOutcome.REJECTED:
+                            logger.warning(
+                                "invalid SAME-capable REST %s suppressed",
+                                message_type,
+                            )
+                            continue
+                        rebound = await self._arbiter.prepare_followup(feature)
+                        if rebound is None:
+                            logger.warning(
+                                "unbound REST %s suppressed in SAME-primary mode",
+                                message_type,
+                            )
+                            continue
+                        await self._arbiter.deliver_prepared_followup(rebound)
+                        continue
+                    outcome = await self._arbiter.ingest(feature, source="rest")
+                    if outcome is not ArbitrationOutcome.INELIGIBLE:
+                        continue
                 await self._process(feature, rules, tz_name, channel, dry_run)
             except Exception as exc:
                 logger.exception("error processing feature")
                 self._db.add_error("poller", f"process error: {exc}")
 
-    async def _process(self, feature, rules, tz_name, channel, dry_run) -> None:
+    async def _process(
+        self, feature, rules, tz_name, channel, dry_run, *,
+        allowed_destination_ids=None, arbitration_canonical_id=None,
+        arbitration_source=None, arbitration_followup_id=None,
+        on_delivery_result=None,
+    ) -> None:
         feature = self._correlate_feature(feature)
         alert = Alert.from_feature(feature)
         if not alert.nws_id:
@@ -487,8 +581,41 @@ class WxPoller:
         targets = self._delivery_targets(
             alert, prior_rows, target_pending, clearing_pending_rows=active_pending,
         )
+        if (
+            arbitration_source == "followup"
+            and arbitration_canonical_id is not None
+            and allowed_destination_ids is not None
+        ):
+            targeted = {target[0].destination_id for target in targets}
+            disposition = "cancelled" if alert.message_type == "Cancel" else "cleared"
+            for destination_id in sorted(set(allowed_destination_ids) - targeted):
+                destination = self._persisted_arbitration_destination(
+                    arbitration_canonical_id, destination_id
+                )
+                if destination is not None:
+                    targets.append((destination, arbitration_canonical_id, disposition))
         targets = [target for target in targets
                    if self._pending_key(alert, target[0]) not in self._pending_deliveries]
+        if allowed_destination_ids is not None:
+            targets = [
+                target for target in targets
+                if target[0].destination_id in allowed_destination_ids
+            ]
+        if on_delivery_result is not None and allowed_destination_ids is not None:
+            targeted = {target[0].destination_id for target in targets}
+            for destination_id in sorted(set(allowed_destination_ids) - targeted):
+                outcome = ArbitrationDeliveryOutcome.PERMANENT_NO_TARGET
+                if (
+                    arbitration_source == "followup"
+                    and self._destination_enabled(destination_id)
+                ):
+                    outcome = ArbitrationDeliveryOutcome.RETRYABLE_FAILURE
+                result = on_delivery_result(
+                    destination_id, outcome,
+                    "claimed destination could not be delivered",
+                )
+                if asyncio.iscoroutine(result):
+                    asyncio.create_task(result)
         if not targets:
             self._retry_detail_if_needed(alert, prior_rows)
             if not self._db.history_exists(alert.nws_id):
@@ -520,6 +647,13 @@ class WxPoller:
                     alert.nws_id, alert.event, alert.area_desc, "dry_run", routed[0][3],
                     "%d destination(s) simulated" % len(routed),
                 )
+            if on_delivery_result is not None:
+                for destination, _root_id, _disposition, _text in routed:
+                    result = on_delivery_result(
+                        destination.destination_id, False, "dry-run"
+                    )
+                    if asyncio.iscoroutine(result):
+                        asyncio.create_task(result)
             return
 
         if self._db.history_exists(alert.nws_id):
@@ -533,7 +667,9 @@ class WxPoller:
                 "%d destination(s) queued" % len(routed),
             )
 
-        outcomes = {"remaining": len(routed), "accepted": 0, "errors": []}
+        outcomes = {
+            "remaining": len(routed), "current": 0, "accepted": 0, "errors": [],
+        }
 
         for destination, root_id, disposition, text in routed:
             fail_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -546,6 +682,12 @@ class WxPoller:
                 expires=alert.expires,
                 msg_hash=_delivery_hash(alert, destination.matched_areas),
                 disposition=disposition,
+                arbitration_canonical_id=(
+                    arbitration_canonical_id if arbitration_source == "followup" else None
+                ),
+                arbitration_followup_id=(
+                    arbitration_followup_id if arbitration_source == "followup" else None
+                ),
             )
             pending_key = self._pending_key(alert, destination)
             chain_key = (root_id, destination.destination_id)
@@ -570,24 +712,88 @@ class WxPoller:
                 if called[0]:
                     return
                 called[0] = True
+                current = True
+                atomic_error = ""
+                durable_success_pending = False
+                arbitrated = (
+                    arbitration_canonical_id is not None
+                    and arbitration_source is not None
+                )
+                if ok and arbitrated and on_delivery_result is not None:
+                    try:
+                        if arbitration_source == "followup":
+                            current = self._db.accept_arbitrated_followup(
+                                canonical_id=arbitration_canonical_id,
+                                followup_id=arbitration_followup_id,
+                                destination_id=dest.destination_id,
+                                attempt_id=attempt,
+                            )
+                        else:
+                            current = self._db.accept_arbitrated_delivery(
+                                canonical_id=arbitration_canonical_id,
+                                destination_id=dest.destination_id,
+                                source=arbitration_source,
+                                attempt_id=attempt,
+                            )
+                    except Exception as exc:
+                        atomic_error = str(exc)
+                        try:
+                            self._db.reconcile_successful_arbitration_transmits()
+                        except Exception:
+                            pass
+                        attempt_row = self._db.get_delivery_attempt(attempt)
+                        if attempt_row is not None and attempt_row["state"] == "accepted":
+                            atomic_error = ""
+                        elif self._db.has_successful_delivery_transmit(attempt):
+                            durable_success_pending = True
+                            current = False
+                        else:
+                            ok = False
+                            callback_result = on_delivery_result(
+                                dest.destination_id, False, atomic_error
+                            )
+                            if asyncio.iscoroutine(callback_result):
+                                asyncio.create_task(callback_result)
+                            elif callback_result is False:
+                                current = False
+                elif on_delivery_result is not None:
+                    callback_result = on_delivery_result(
+                        dest.destination_id, bool(ok), err or ""
+                    )
+                    if asyncio.iscoroutine(callback_result):
+                        asyncio.create_task(callback_result)
+                    elif callback_result is False:
+                        current = False
                 try:
-                    if ok:
-                        self._db.finalize_delivery_attempt(attempt, "accepted")
-                        self._record_delivery(a, dest, root, disp)
+                    if durable_success_pending:
+                        outcomes["errors"].append(
+                            atomic_error or "successful transport awaiting reconciliation"
+                        )
+                    elif not current:
+                        self._db.finalize_delivery_attempt(
+                            attempt, "superseded", "superseded"
+                        )
+                    elif ok:
+                        if not arbitrated:
+                            self._db.finalize_delivery_attempt(attempt, "accepted")
+                            self._record_delivery(a, dest, root, disp)
                         outcomes["accepted"] += 1
                         self._queue_detail_if_needed(a, dest, root, disp)
                         self._queue_meshwx_if_needed(a)
                     else:
+                        failure = atomic_error or err
                         attempt_state = ("superseded" if err == "superseded" else
                                          "skipped" if err == "predecessor was not accepted" else
                                          "failed")
-                        self._db.finalize_delivery_attempt(attempt, attempt_state, err)
-                        outcomes["errors"].append(err or "not accepted")
+                        self._db.finalize_delivery_attempt(attempt, attempt_state, failure)
+                        outcomes["errors"].append(failure or "not accepted")
                         self.status.last_broadcast_failure = ts
                         self.status.last_broadcast_failure_text = t
                         self._db.add_error("broadcast", "NOT SENT to %s ch %d (will retry): %s" %
                                            (dest.transport, dest.channel, t))
                         self._db.add_event("ALARM", "BROADCAST FAILED, will retry: %s" % a.event)
+                    if current:
+                        outcomes["current"] += 1
                 finally:
                     self._pending_deliveries.pop(key, None)
                     if conditional:
@@ -595,7 +801,7 @@ class WxPoller:
                     if chain not in self._conditional_chains:
                         self._discard_chain_result(chain)
                     outcomes["remaining"] -= 1
-                    if outcomes["remaining"] == 0:
+                    if outcomes["remaining"] == 0 and outcomes["current"]:
                         accepted = outcomes["accepted"]
                         final = ("accepted" if accepted == len(routed) else
                                  "partial" if accepted else "failed")
@@ -603,6 +809,7 @@ class WxPoller:
                         if outcomes["errors"]:
                             detail += ": " + "; ".join(outcomes["errors"])
                         self._db.update_history(a.nws_id, final, detail=detail)
+
 
             try:
                 followup_text = (
@@ -613,6 +820,11 @@ class WxPoller:
                 )
                 card_enqueue = getattr(self._tx, "enqueue_destination_card", None)
                 chain_enqueue = getattr(self._tx, "enqueue_destination_chain", None)
+                durable_attempt = (
+                    {"delivery_attempt_id": attempt_id}
+                    if getattr(self._tx, "supports_delivery_attempt_id", False)
+                    else {}
+                )
                 if card_enqueue is not None:
                     card_enqueue(
                         text, destination.transport, destination.channel,
@@ -620,12 +832,14 @@ class WxPoller:
                         followup_text=followup_text,
                         require_prior_success=require_prior,
                         on_result=_on_result,
+                        **durable_attempt,
                     )
                 elif chain_enqueue is not None:
                     chain_enqueue(
                         text, destination.transport, destination.channel,
                         destination.destination_id, chain_key,
                         require_prior_success=require_prior, on_result=_on_result,
+                        **durable_attempt,
                     )
                 else:
                     self._tx.enqueue_destination(
@@ -656,6 +870,38 @@ class WxPoller:
     def _destination_enabled(self, destination_id: int) -> bool:
         row = self._db.get_destination(destination_id)
         return row is not None and bool(row["enabled"])
+
+    def _persisted_arbitration_destination(
+        self, canonical_id: str, destination_id: int,
+    ) -> RoutedDestination | None:
+        """Rebuild an outbox recipient even when current alert coverage moved away."""
+        row = self._db.get_destination(destination_id)
+        if row is None or not bool(row["enabled"]):
+            return None
+        candidate = self._db.get_arbitration_candidate(canonical_id)
+        if candidate is None:
+            return None
+        try:
+            ugcs = set(json.loads(candidate["correlation_ugcs"] or "[]"))
+        except (TypeError, ValueError):
+            ugcs = set()
+        areas = []
+        details_enabled = False
+        for route in self._db.routing_rows():
+            if int(route["destination_id"]) != destination_id:
+                continue
+            if ugcs and str(route["zone_code"]).strip().upper() not in ugcs:
+                continue
+            area = str(route["county_name"]).strip()
+            if area and area not in areas:
+                areas.append(area)
+            details_enabled = details_enabled or bool(route["detail_enabled"])
+        if not areas:
+            areas = [str(row["name"])]
+        return RoutedDestination(
+            destination_id, str(row["name"]), str(row["transport"]),
+            int(row["channel"]), tuple(areas), details_enabled,
+        )
 
     def _discard_chain_result(self, chain_key) -> None:
         """Bound transmitter chain bookkeeping without requiring a manager API."""
@@ -767,8 +1013,8 @@ class WxPoller:
 
 
 def _format_cancel(alert: Alert, tz_name: str) -> str:
-    from .formatter import PREFIX, _area_string
     from .config import MAX_PAYLOAD_BYTES
+    from .formatter import PREFIX, _area_string
 
     area = _area_string(alert.area_desc)
     body = f"CANCELLED: {alert.event}"

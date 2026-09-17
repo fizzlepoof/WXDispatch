@@ -500,6 +500,7 @@ class QueueItem:
     correlation_key: object = None
     require_prior_success: bool = False
     followup_text: str = ""
+    delivery_attempt_id: int | None = None
 
 
 def _build_transports(db) -> dict:
@@ -538,6 +539,8 @@ def _build_transports(db) -> dict:
 
 class TransmitManager:
     """Serializes node access, paces bursts, fans out to all enabled transports."""
+
+    supports_delivery_attempt_id = True
 
     def __init__(self, db):
         self._db = db
@@ -875,7 +878,8 @@ class TransmitManager:
     def enqueue_destination_chain(self, text: str, transport: str, channel: int,
                                   destination_id: int, correlation_key,
                                   require_prior_success: bool = False,
-                                  on_result=None) -> bool:
+                                  on_result=None,
+                                  delivery_attempt_id: int | None = None) -> bool:
         if transport not in self._transports:
             if on_result:
                 self._safe_result(on_result, False, "unknown transport")
@@ -885,13 +889,15 @@ class TransmitManager:
             transport=transport, channel=channel, destination_id=destination_id,
             correlation_key=correlation_key,
             require_prior_success=require_prior_success,
+            delivery_attempt_id=delivery_attempt_id,
         )
 
     def enqueue_destination_card(self, text: str, transport: str, channel: int,
                                  destination_id: int, correlation_key,
                                  followup_text: str = "",
                                  require_prior_success: bool = False,
-                                 on_result=None) -> bool:
+                                 on_result=None,
+                                 delivery_attempt_id: int | None = None) -> bool:
         if transport not in self._transports:
             if on_result:
                 self._safe_result(on_result, False, "unknown transport")
@@ -901,6 +907,7 @@ class TransmitManager:
             transport=transport, channel=channel, destination_id=destination_id,
             correlation_key=correlation_key, followup_text=followup_text,
             require_prior_success=require_prior_success,
+            delivery_attempt_id=delivery_attempt_id,
         )
 
     def enqueue_destination_detail(self, text: str, transport: str, channel: int,
@@ -938,7 +945,8 @@ class TransmitManager:
 
     def _enqueue(self, lane, text, on_test, log_tx, on_result, transport=None,
                  channel=None, destination_id=None, correlation_key=None,
-                 require_prior_success=False, followup_text="") -> bool:
+                 require_prior_success=False, followup_text="",
+                 delivery_attempt_id=None) -> bool:
         dropped = len(lane) == lane.maxlen
         if dropped:
             # The item we are about to drop never gets a send: report it failed so
@@ -951,7 +959,8 @@ class TransmitManager:
                               destination_id=destination_id,
                               correlation_key=correlation_key,
                               require_prior_success=require_prior_success,
-                              followup_text=followup_text))
+                              followup_text=followup_text,
+                              delivery_attempt_id=delivery_attempt_id))
         self._queue_event.set()
         if dropped:
             logger.warning("transmit queue full; dropped oldest")
@@ -1232,7 +1241,8 @@ class TransmitManager:
                     self._db.add_transmit_log(ch, blen, ok, item.text, False,
                                               error=("" if ok else err), transport=t.name,
                                               destination_id=item.destination_id,
-                                              followup_text=item.followup_text)
+                                              followup_text=item.followup_text,
+                                              delivery_attempt_id=item.delivery_attempt_id)
                 any_ok = any_ok or ok
                 if not ok:
                     last = err

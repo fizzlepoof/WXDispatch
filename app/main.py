@@ -8,21 +8,24 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from . import __version__
+from .arbitration import WeatherArbiter
 from .config import load_bootstrap, load_noaa_sdr_config, load_nwws_config
 from .db import Database
-from .logging_setup import setup_logging
-from .poller import WxPoller
 from .ipaws import IpawsPoller
+from .logging_setup import setup_logging
+from .noaa_same import SameEndMessage, SameObservation
+from .noaa_sdr import (
+    NoaaSdrConfig,
+    NoaaSdrSupervisor,
+    project_same_to_feature,
+    raspberry_pi_temperature,
+)
+from .nwws import NWWSProduct, project_to_feature
+from .nwws_runtime import NWWSRuntimeService
+from .poller import WxPoller
 from .transmit import TransmitManager
 from .watchdog import Liveness
 from .web.routes import router
-from .nwws import NWWSProduct, project_to_feature
-from .nwws_runtime import NWWSRuntimeService
-from .noaa_same import SameEndMessage, SameObservation
-from .noaa_sdr import (
-    NoaaSdrConfig, NoaaSdrSupervisor, project_same_to_feature,
-    raspberry_pi_temperature,
-)
 
 logger = logging.getLogger("mesh_wx.main")
 
@@ -63,6 +66,18 @@ async def _heartbeat(liveness: Liveness) -> None:
         await asyncio.sleep(5)
 
 
+async def _run_weather_arbitration(arbiter, *, interval: float = 1.0) -> None:
+    """Release expired REST fallbacks independently of the REST poll cadence."""
+    while True:
+        try:
+            await arbiter.release_due()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("weather arbitration fallback release failed")
+        await asyncio.sleep(interval)
+
+
 async def _startup_serial(db: Database, tx: TransmitManager) -> None:
     """Auto-discover a Meshtastic serial node if enabled and none saved, then
     connect every enabled transport (Meshtastic + MeshCore)."""
@@ -100,6 +115,15 @@ async def lifespan(app: FastAPI):
         on_product=_nwws_product_handler(poller, shadow=nwws_config.shadow),
     )
     noaa_sdr_config = load_noaa_sdr_config()
+    weather_arbiter = None
+    arbitration_task = None
+    if noaa_sdr_config.receiver.enabled and not noaa_sdr_config.shadow:
+        weather_arbiter = WeatherArbiter(db, poller.deliver_arbitrated)
+        poller.set_arbiter(weather_arbiter)
+        arbitration_task = asyncio.create_task(
+            _run_weather_arbitration(weather_arbiter),
+            name="same-rest-arbitration",
+        )
     noaa_sdr = NoaaSdrSupervisor(
         noaa_sdr_config.receiver,
         callback=_noaa_sdr_handler(
@@ -118,6 +142,8 @@ async def lifespan(app: FastAPI):
     app.state.noaa_sdr = noaa_sdr
     app.state.noaa_sdr_shadow = noaa_sdr_config.shadow
     app.state.noaa_sdr_config_error = noaa_sdr_config.error
+    app.state.weather_arbiter = weather_arbiter
+    app.state.arbitration_task = arbitration_task
 
     # Liveness watchdog: force a restart if the event loop ever wedges.
     liveness = Liveness(stall_seconds=90.0)
@@ -147,13 +173,22 @@ async def lifespan(app: FastAPI):
             startup_task.cancel()
         if not noaa_sdr_task.done():
             noaa_sdr_task.cancel()
+        if arbitration_task is not None and not arbitration_task.done():
+            arbitration_task.cancel()
         try:
             await noaa_sdr_task
         except asyncio.CancelledError:
             pass
+        if arbitration_task is not None:
+            try:
+                await arbitration_task
+            except asyncio.CancelledError:
+                pass
         await nwws.stop()
         await poller.stop()
         await ipaws.stop()
+        if weather_arbiter is not None:
+            await weather_arbiter.drain()
         await tx.stop()
         db.close()
 
@@ -169,6 +204,7 @@ app = create_app()
 
 def main() -> None:
     import sys
+
     import uvicorn
 
     # On Windows, asyncio defaults to the ProactorEventLoop, but the MeshCore

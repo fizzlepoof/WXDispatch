@@ -12,8 +12,13 @@ from app.config import NoaaSdrAppConfig, load_noaa_sdr_config
 from app.main import _noaa_sdr_handler, create_app
 from app.noaa_same import SameEndMessage, SameObservation, parse_same
 from app.noaa_sdr import (
-    NoaaSdrConfig, NoaaSdrHealth, NoaaSdrSupervisor, build_multimon_argv,
-    build_rtl_fm_argv, project_same_to_feature, raspberry_pi_temperature,
+    NoaaSdrConfig,
+    NoaaSdrHealth,
+    NoaaSdrSupervisor,
+    build_multimon_argv,
+    build_rtl_fm_argv,
+    project_same_to_feature,
+    raspberry_pi_temperature,
 )
 
 
@@ -89,7 +94,7 @@ def test_sdr_env_requires_explicit_serial_and_frequency_when_enabled(monkeypatch
     assert configured.error == "configuration"
 
 
-def test_sdr_env_rejects_unsafe_direct_routing(monkeypatch) -> None:
+def test_sdr_env_allows_direct_routing_when_safe_arbiter_is_available(monkeypatch) -> None:
     monkeypatch.setenv("MESH_WX_NOAA_SDR_ENABLED", "true")
     monkeypatch.setenv("MESH_WX_NOAA_SDR_DEVICE_SERIAL", "000123")
     monkeypatch.setenv("MESH_WX_NOAA_SDR_FREQUENCY_HZ", "162500000")
@@ -99,9 +104,9 @@ def test_sdr_env_rejects_unsafe_direct_routing(monkeypatch) -> None:
 
     configured = load_noaa_sdr_config()
 
-    assert configured.receiver.enabled is False
-    assert configured.shadow is True
-    assert configured.error == "direct-routing-unsupported"
+    assert configured.receiver.enabled is True
+    assert configured.shadow is False
+    assert configured.error is None
 
 
 def test_sdr_env_loads_wwh37_shadow_configuration(monkeypatch) -> None:

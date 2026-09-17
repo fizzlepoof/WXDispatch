@@ -103,15 +103,6 @@ def load_noaa_sdr_config() -> NoaaSdrAppConfig:
     shadow = _env_bool("MESH_WX_NOAA_SDR_SHADOW", True)
     if not enabled:
         return NoaaSdrAppConfig(receiver=NoaaSdrConfig(enabled=False), shadow=shadow)
-    # SAME lacks a source-neutral CAP/VTEC identity. Until correlation is
-    # implemented, direct routing alongside REST/NWWS could transmit one
-    # hazard twice. Fail closed if direct SDR routing is requested.
-    if not shadow:
-        return NoaaSdrAppConfig(
-            receiver=NoaaSdrConfig(enabled=False), shadow=True,
-            error="direct-routing-unsupported",
-        )
-
     serial = os.environ.get("MESH_WX_NOAA_SDR_DEVICE_SERIAL", "").strip()
     frequency_text = os.environ.get("MESH_WX_NOAA_SDR_FREQUENCY_HZ", "").strip()
     if not serial or not frequency_text:

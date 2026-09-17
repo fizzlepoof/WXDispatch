@@ -17,10 +17,39 @@ from app.nwws import (
     parse_product_metadata,
     parse_ugc,
     parse_vtec,
+    parse_vtec_parameter,
     project_to_feature,
     vtec_correlation_key,
 )
 from app.models import Alert
+
+
+EXACT_VTEC = "/O.NEW.KOHX.TO.W.0042.260905T0100Z-260905T0200Z/"
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029"])
+@pytest.mark.parametrize("wrapper", ["junk{separator}{vtec}", "{vtec}{separator}junk"])
+def test_exact_vtec_parameter_rejects_unicode_line_wrapped_junk(
+    separator: str, wrapper: str,
+) -> None:
+    assert parse_vtec_parameter(
+        wrapper.format(separator=separator, vtec=EXACT_VTEC)
+    ) is None
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029"])
+@pytest.mark.parametrize("second_first", [False, True])
+def test_exact_vtec_parameter_rejects_unicode_separated_second_record(
+    separator: str, second_first: bool,
+) -> None:
+    second = EXACT_VTEC.replace(".0042.", ".0043.")
+    records = [second, EXACT_VTEC] if second_first else [EXACT_VTEC, second]
+
+    assert parse_vtec_parameter(separator.join(records)) is None
+
+
+def test_exact_vtec_parameter_accepts_one_valid_record() -> None:
+    assert parse_vtec_parameter(EXACT_VTEC) is not None
 
 
 OFFICIAL_STANZA = b"""<message type='groupchat' from='nwws@host/resource' to='client@example'>

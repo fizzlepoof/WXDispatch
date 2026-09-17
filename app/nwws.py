@@ -19,6 +19,10 @@ _SAFE_OFFICE = re.compile(r"[A-Z]{4}")
 _SAFE_WMO = re.compile(r"[A-Z]{4}[0-9]{2}")
 _SAFE_AWIPS = re.compile(r"[A-Z0-9]{3,9}")
 _SAFE_PROCESS = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_EXACT_OPERATIONAL_VTEC = re.compile(
+    r"/O\.[A-Za-z]{3}\.[A-Z]{4}\.[A-Za-z]{2}\.[A-Za-z]\."
+    r"[0-9]{4}\.[0-9]{6}T[0-9]{4}Z-[0-9]{6}T[0-9]{4}Z/"
+)
 _WMO_HEADER = re.compile(
     r"([A-Z]{4}[0-9]{2})[ \t]+([A-Z]{4})[ \t]+([0-9]{6})"
     r"(?:[ \t]+(?:COR|AMD|(?:AA|CC|RR)[A-X]))?"
@@ -360,6 +364,13 @@ def parse_vtec(text: str) -> VTEC | None:
             end=end,
         )
     return None
+
+
+def parse_vtec_parameter(value: object) -> VTEC | None:
+    """Parse one exact operational VTEC parameter value, without wrappers."""
+    if not isinstance(value, str) or _EXACT_OPERATIONAL_VTEC.fullmatch(value) is None:
+        return None
+    return parse_vtec(value)
 
 
 def parse_product_metadata(text: str) -> ProductMetadata:
