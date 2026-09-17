@@ -74,6 +74,9 @@ channel. Built after living through Hurricane Helene's comms blackout.
   COBS-encoded MeshWX v4 `0x20`/`0x21` binary frames on a dedicated non-Public
   MeshCore hash channel. This is only for clients with a MeshWX v4 decoder; openHop Console
   otherwise displays it as `[data 0xFFFF]`, so leave it disabled for Console-only setups.
+- **Fail-closed MeshCore flood scoping.** Operators can require an exact regional flood scope.
+  WXDispatch selects it immediately before every text or binary channel send while holding the
+  same transport lock; a missing scope, rejected command, timeout, or link error blocks the payload.
 - **Dry-run by default.** Automated alerts are logged, not transmitted, until you flip it on.
 - **A real dashboard.** Live radio status, recent alerts, 7-day activity, transmit log,
   and a per-radio **Send test** button to key up each radio on the bench.
@@ -178,7 +181,10 @@ themselves.
   for example a WiFi connected node at its IP address (optionally `host:port`). On USB the
   board can renumber its port on replug; leave the port blank to auto-discover, or set it.
 - **MeshCore**: flash the board with the **USB (companion)** firmware, *not* repeater
-  firmware. Repeater firmware exposes no serial API, so WXDispatch can't drive it.
+  firmware. Repeater firmware exposes no serial API, so WXDispatch can't drive it. The Settings
+  page can select and require a flood region scope. Managed deployments should set
+  `MESH_WX_MESHCORE_FLOOD_SCOPE` instead; this locks the exact scope in the UI and makes scope
+  enforcement mandatory for every MeshCore channel transmission.
 ### Confirmed radios
 
 Hardware verified working with WXDispatch, and over which connection. WXDispatch speaks the standard
@@ -256,6 +262,7 @@ lives in the UI and the database.
 | `MESH_WX_HOST` | `0.0.0.0`                                | HTTP bind address  |
 | `MESH_WX_DB`   | per-OS data dir (see below)              | SQLite file path   |
 | `MESHWX_ADMIN_PASSWORD` | unset | Enables MeshCore companion channel set/clear and all-slot inventory; HTTP Basic username is `admin` |
+| `MESH_WX_MESHCORE_FLOOD_SCOPE` | unset | Locks an exact MeshCore hash scope (for example `#us-tn-clarksville`) and fails closed if it is blank, malformed, or cannot be selected before a send |
 | `MESH_WX_NWWS_ENABLED` | `false` | Starts the optional NWWS-OI receiver |
 | `MESH_WX_NWWS_USERNAME` | unset | NWWS-OI account localpart (not a full JID) |
 | `MESH_WX_NWWS_PASSWORD_FILE` | unset | Private regular file containing the NWWS password |
@@ -273,6 +280,18 @@ NWWS-OI stays disabled unless explicitly enabled. Native systemd installs may pl
 non-secret values above in `/etc/mesh-wx/nwws.env`; the password itself must remain in a
 separate service-readable `0600` file. Start in shadow mode and verify the sanitized
 NWWS-OI counters on the dashboard before setting `MESH_WX_NWWS_SHADOW=false`.
+
+`MESH_WX_MESHCORE_FLOOD_SCOPE` is a deployment safety control, not a channel secret. When it is
+present, its normalized hash scope overrides the database, the WebUI cannot disable or replace it,
+and an empty or invalid value prevents WXDispatch from constructing its transports. The MeshCore
+protocol acknowledges scope selection but does not expose the current transient scope for readback;
+WXDispatch therefore requires a successful scope command immediately before each serialized send
+and never sends the payload after a rejection, timeout, or transport exception. Native systemd
+installs load this value from the optional `/etc/mesh-wx/meshcore.env`, for example:
+
+```text
+MESH_WX_MESHCORE_FLOOD_SCOPE=#us-tn-clarksville
+```
 
 ### NOAA Weather Radio SDR
 

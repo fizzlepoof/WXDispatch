@@ -21,7 +21,8 @@ class DummyTx:
     connected = False
     queue_depth = 0
 
-    def __init__(self):
+    def __init__(self, db):
+        self.db = db
         self.channel_calls = []
         self.transports = []
         self.resend_calls = []
@@ -43,7 +44,9 @@ class DummyTx:
         self.resend_calls.append((name, text, followup_text, channel))
         return True, ""
 
-    async def reconfigure(self):
+    async def reconfigure(self, settings=None):
+        for key, value in (settings or {}).items():
+            self.db.set_setting(key, value)
         return None
 
     async def inspect_meshcore_channel(self, index):
@@ -111,7 +114,7 @@ def web(tmp_path, monkeypatch):
     db = Database(str(tmp_path / "web.db"))
     app = FastAPI()
     app.state.db = db
-    app.state.tx = DummyTx()
+    app.state.tx = DummyTx(db)
     app.state.poller = DummyPoller()
     app.include_router(router)
     with TestClient(app) as client:
@@ -946,6 +949,61 @@ def test_settings_exposes_optional_meshwx_v4_controls(web):
     assert 'name="meshwx_v4_channel"' in response.text
     assert 'name="meshwx_v4_channel" min="1" max="7"' in response.text
     assert "normal county text alerts continue unchanged" in response.text
+
+
+def test_settings_exposes_and_persists_meshcore_flood_scope(web):
+    client, db, _tx = web
+    db.set_setting("meshcore_flood_scope", "#us-tn-clarksville")
+    db.set_setting("meshcore_require_flood_scope", True)
+
+    response = client.get("/settings")
+
+    assert response.status_code == 200
+    assert 'name="meshcore_flood_scope"' in response.text
+    assert 'value="#us-tn-clarksville"' in response.text
+    assert 'name="meshcore_require_flood_scope"' in response.text
+    assert 'name="meshcore_require_flood_scope" checked' in response.text
+    assert "before every MeshCore channel transmission" in response.text
+
+    response = client.post(
+        "/settings",
+        data={
+            "csrf_token": csrf(client),
+            "poll_interval": "120",
+            "nws_contact": "operator@example.com",
+            "meshcore_flood_scope": "us-tn-clarksville",
+            "meshcore_require_flood_scope": "on",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert db.get_setting("meshcore_flood_scope") == "#us-tn-clarksville"
+    assert db.get_setting("meshcore_require_flood_scope") is True
+
+
+def test_deployment_locked_scope_rejects_ui_override(web, monkeypatch):
+    client, db, _tx = web
+    monkeypatch.setenv("MESH_WX_MESHCORE_FLOOD_SCOPE", "#us-tn-clarksville")
+
+    response = client.post(
+        "/settings",
+        data={
+            "csrf_token": csrf(client),
+            "poll_interval": "120",
+            "nws_contact": "operator@example.com",
+            "meshcore_flood_scope": "#wrong-region",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert db.get_setting("meshcore_flood_scope") == "#us-tn-clarksville"
+    assert db.get_setting("meshcore_require_flood_scope") is True
+
+    page = client.get("/settings")
+    assert 'value="#us-tn-clarksville"' in page.text
+    assert "Locked by this deployment" in page.text
 
 
 def test_settings_makes_routing_primary_and_marks_coverage_as_legacy(web):

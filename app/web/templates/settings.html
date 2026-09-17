@@ -131,6 +131,14 @@
 
       {% set radio='meshcore' %}{% set live_field='meshcore_channel' %}{% set test_field='meshcore_test_channel' %}{% set live_val=mc_channel %}{% set test_val=mc_test %}{% set channels=mc_channels %}{% set connected=mc_connected %}{% set model=mc_model %}{% set error='' %}
       <div style="margin-top:10px;">{% include "_radio_channels.html" %}</div>
+      <div style="margin-top:14px;">
+        <label>Flood region scope for MeshCore sends</label>
+        <input name="meshcore_flood_scope" maxlength="32" value="{{ mc_flood_scope }}"
+               placeholder="#us-tn-clarksville" {% if mc_flood_scope_locked %}readonly{% endif %}>
+        <label class="chk"><input type="checkbox" name="meshcore_require_flood_scope" {% if mc_require_flood_scope %}checked{% endif %} {% if mc_flood_scope_locked %}disabled{% endif %}> Require a scope and block all unscoped MeshCore sends</label>
+        {% if mc_flood_scope_locked %}<p class="hint"><b>Locked by this deployment.</b> Change the server environment and restart WXDispatch to select a different scope.</p>{% endif %}
+        <p class="hint">WXDispatch applies this exact region scope immediately before every MeshCore channel transmission, including routed alerts, tests, resends, and the structured feed. If the scope is required but blank, or the companion rejects it, WXDispatch fails closed instead of sending unscoped.</p>
+      </div>
       <div class="row" style="margin-top:14px;">
         <label class="chk"><input type="checkbox" name="meshwx_v4_enabled" {% if meshwx_v4_enabled %}checked{% endif %}> <b>Structured MeshWX v4 warning cards</b></label>
         <div>

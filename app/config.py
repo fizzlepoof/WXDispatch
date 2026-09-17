@@ -73,6 +73,38 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def normalise_meshcore_flood_scope(value: str) -> str:
+    """Return a canonical MeshCore hash scope or raise on unsafe input."""
+    if not isinstance(value, str):
+        raise TypeError("MeshCore flood scope must be text")
+    scope = value.strip()
+    if not scope:
+        return ""
+    if not scope.startswith("#"):
+        scope = "#" + scope
+    if scope == "#" or "\x00" in scope:
+        raise ValueError("MeshCore flood scope is invalid")
+    if len(scope.encode("utf-8")) > 32:
+        raise ValueError("MeshCore flood scope must be at most 32 UTF-8 bytes")
+    return scope
+
+
+def meshcore_flood_scope_override() -> str | None:
+    """Read an optional deployment-locked scope from the environment.
+
+    Presence of the variable means the deployment intends to enforce a scope,
+    so an empty or malformed value is a startup error rather than permission to
+    transmit without one.
+    """
+    raw = os.environ.get("MESH_WX_MESHCORE_FLOOD_SCOPE")
+    if raw is None:
+        return None
+    scope = normalise_meshcore_flood_scope(raw)
+    if not scope:
+        raise ValueError("Deployment MeshCore flood scope must not be blank")
+    return scope
+
+
 def load_nwws_config() -> NWWSAppConfig:
     """Load optional NWWS settings without reading the credential itself."""
     password_path = os.environ.get("MESH_WX_NWWS_PASSWORD_FILE", "").strip()
@@ -164,6 +196,8 @@ DEFAULT_SETTINGS: dict = {
     "meshcore_port": "",
     "meshcore_host": "",
     "meshcore_channel": 0,
+    "meshcore_flood_scope": "",
+    "meshcore_require_flood_scope": False,
     "meshcore_repeat": 2,
     "meshcore_test_channel": 1,
     "meshwx_v4_enabled": False,

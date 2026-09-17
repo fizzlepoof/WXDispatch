@@ -14,6 +14,9 @@ WorkingDirectory=__DIR__
 Environment=MESH_WX_HOST=0.0.0.0
 Environment=MESH_WX_PORT=8110
 Environment=MESH_WX_DB=__DIR__/data/mesh-wx.db
+# Optional deployment-locked MeshCore flood scope. When present, this overrides
+# the database and makes successful scope selection mandatory before each send.
+EnvironmentFile=-/etc/mesh-wx/meshcore.env
 # Optional NWWS-OI metadata only. The password itself stays in the private file
 # named by MESH_WX_NWWS_PASSWORD_FILE; a missing env file leaves NWWS disabled.
 EnvironmentFile=-/etc/mesh-wx/nwws.env

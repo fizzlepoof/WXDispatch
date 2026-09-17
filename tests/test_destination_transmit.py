@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from meshcore import EventType
 
@@ -111,9 +113,20 @@ class Commands:
     def __init__(self, result_type=EventType.OK):
         self.result_type = result_type
         self.raw = []
+        self.scope_result_type = EventType.OK
+        self.scope_calls = []
+        self.channel_messages = []
+        self.events = []
 
     async def send_chan_msg(self, channel, text):
+        self.channel_messages.append((channel, text))
+        self.events.append(("message", channel, text))
         return type("Result", (), {"type": self.result_type, "payload": {}})()
+
+    async def set_flood_scope(self, scope):
+        self.scope_calls.append(scope)
+        self.events.append(("scope", scope))
+        return type("Result", (), {"type": self.scope_result_type, "payload": {}})()
 
     async def send_device_query(self):
         return type(
@@ -133,6 +146,182 @@ async def test_meshcore_success_means_accepted_by_companion_without_flood_counte
     await tx.send_text("weather", 2)
 
 
+async def test_meshcore_text_applies_configured_scope_immediately_before_send():
+    commands = Commands()
+    tx = MeshCoreTransmitter(
+        "tcp", host="unused", flood_scope="#us-tn-clarksville"
+    )
+    tx._mc = type("Companion", (), {"commands": commands})()
+
+    await tx.send_text("weather", 2)
+
+    assert commands.events == [
+        ("scope", "#us-tn-clarksville"),
+        ("message", 2, "weather"),
+    ]
+
+
+async def test_meshcore_scope_failure_prevents_unscoped_text_send():
+    commands = Commands()
+    commands.scope_result_type = EventType.ERROR
+    tx = MeshCoreTransmitter(
+        "tcp", host="unused", flood_scope="#us-tn-clarksville"
+    )
+    tx._mc = type("Companion", (), {"commands": commands})()
+
+    with pytest.raises(TxUnsent, match="scope"):
+        await tx.send_text("weather", 2)
+
+    assert commands.channel_messages == []
+
+
+async def test_meshcore_scope_timeout_prevents_text_send():
+    class TimeoutCommands(Commands):
+        async def set_flood_scope(self, scope):
+            raise TimeoutError
+
+    commands = TimeoutCommands()
+    tx = MeshCoreTransmitter(
+        "tcp", host="unused", flood_scope="#us-tn-clarksville"
+    )
+    tx._mc = type("Companion", (), {"commands": commands})()  # type: ignore[assignment]
+
+    with pytest.raises(asyncio.TimeoutError):
+        await tx.send_text("weather", 2)
+
+    assert commands.channel_messages == []
+
+
+async def test_meshcore_required_blank_scope_prevents_text_and_binary_sends():
+    commands = Commands()
+    tx = MeshCoreTransmitter("tcp", host="unused", require_flood_scope=True)
+    tx._mc = type("Companion", (), {"commands": commands})()
+
+    with pytest.raises(TxUnsent, match="required"):
+        await tx.send_text("weather", 2)
+    with pytest.raises(TxUnsent, match="required"):
+        await tx.send_binary(b"payload", 7)
+
+    assert commands.channel_messages == []
+    assert commands.raw == []
+
+
+def test_manager_builds_meshcore_transport_with_persisted_scope():
+    db = Database(":memory:")
+    db.set_setting("meshcore_flood_scope", "#us-tn-clarksville")
+    db.set_setting("meshcore_require_flood_scope", True)
+
+    manager = TransmitManager(db)
+    tx = manager._transports["meshcore"].make()
+
+    assert tx.flood_scope == "#us-tn-clarksville"
+    assert tx.require_flood_scope is True
+
+
+def test_deployment_scope_environment_overrides_database_and_requires_scope(monkeypatch):
+    db = Database(":memory:")
+    db.set_setting("meshcore_flood_scope", "#wrong-region")
+    db.set_setting("meshcore_require_flood_scope", False)
+    monkeypatch.setenv("MESH_WX_MESHCORE_FLOOD_SCOPE", "#us-tn-clarksville")
+
+    tx = TransmitManager(db)._transports["meshcore"].make()
+
+    assert tx.flood_scope == "#us-tn-clarksville"
+    assert tx.require_flood_scope is True
+
+
+@pytest.mark.parametrize("scope", ["", "#", "#" + "x" * 32])
+def test_invalid_deployment_scope_fails_closed_during_transport_build(monkeypatch, scope):
+    monkeypatch.setenv("MESH_WX_MESHCORE_FLOOD_SCOPE", scope)
+
+    with pytest.raises(ValueError):
+        TransmitManager(Database(":memory:"))
+
+
+async def test_scope_setting_persists_only_after_inflight_transmission_lock_releases():
+    db = Database(":memory:")
+    manager = TransmitManager(db)
+    await manager._lock.acquire()
+
+    task = asyncio.create_task(manager.reconfigure({
+        "meshcore_flood_scope": "#us-tn-clarksville",
+        "meshcore_require_flood_scope": True,
+    }))
+    await asyncio.sleep(0)
+
+    assert db.get_setting("meshcore_flood_scope", "") == ""
+
+    manager._lock.release()
+    await task
+
+    assert db.get_setting("meshcore_flood_scope") == "#us-tn-clarksville"
+    assert db.get_setting("meshcore_require_flood_scope") is True
+
+
+async def test_concurrent_scope_reconfiguration_keeps_database_and_transport_together():
+    db = Database(":memory:")
+    manager = TransmitManager(db)
+    await manager._lock.acquire()
+
+    older = asyncio.create_task(manager.reconfigure({
+        "meshcore_flood_scope": "#us-tn-middle",
+        "meshcore_require_flood_scope": True,
+    }))
+    await asyncio.sleep(0)
+    newer = asyncio.create_task(manager.reconfigure({
+        "meshcore_flood_scope": "#us-tn-clarksville",
+        "meshcore_require_flood_scope": True,
+    }))
+    await asyncio.sleep(0)
+    manager._lock.release()
+    await asyncio.gather(older, newer)
+
+    assert db.get_setting("meshcore_flood_scope") == "#us-tn-clarksville"
+    active = manager._transports["meshcore"].make()
+    assert active.flood_scope == "#us-tn-clarksville"
+
+
+async def test_reconfigure_connect_is_serialized_against_send(monkeypatch):
+    db = Database(":memory:")
+    db.set_setting("meshcore_enabled", True)
+    db.set_setting("meshcore_conn", "tcp")
+    db.set_setting("meshcore_host", "radio.invalid:4000")
+    manager = TransmitManager(db)
+    connect_started = asyncio.Event()
+    release_connect = asyncio.Event()
+    ensure_calls = 0
+    active_ensures = 0
+    max_active_ensures = 0
+
+    async def blocked_ensure(transport):
+        nonlocal ensure_calls, active_ensures, max_active_ensures
+        ensure_calls += 1
+        active_ensures += 1
+        max_active_ensures = max(max_active_ensures, active_ensures)
+        connect_started.set()
+        await release_connect.wait()
+        transport.tx = FakeRadio()
+        transport.connected = True
+        active_ensures -= 1
+        return True
+
+    monkeypatch.setattr(manager, "_ensure", blocked_ensure)
+    reconfigure = asyncio.create_task(manager.reconfigure())
+    await connect_started.wait()
+
+    send = asyncio.create_task(manager.send_to("meshcore", "test"))
+    await asyncio.sleep(0)
+
+    assert ensure_calls == 1
+    assert max_active_ensures == 1
+    assert not send.done()
+
+    release_connect.set()
+    await reconfigure
+    assert await send == (True, "")
+    assert ensure_calls == 1
+
+
 async def test_meshcore_binary_channel_send_uses_raw_channel_data_command():
     commands = Commands()
     tx = MeshCoreTransmitter("tcp", host="unused")
@@ -142,6 +331,19 @@ async def test_meshcore_binary_channel_send_uses_raw_channel_data_command():
     data, expected = commands.raw[0]
     assert data == b"\x3e\x07\xff\xff\xff\x04\x20\xff"
     assert expected == [EventType.OK, EventType.ERROR]
+
+
+async def test_meshcore_binary_applies_configured_scope_before_send():
+    commands = Commands()
+    tx = MeshCoreTransmitter(
+        "tcp", host="unused", flood_scope="#us-tn-clarksville"
+    )
+    tx._mc = type("Companion", (), {"commands": commands})()
+
+    await tx.send_binary(b"\x04\x20\xff", 7)
+
+    assert commands.scope_calls == ["#us-tn-clarksville"]
+    assert commands.raw
 
 
 async def test_meshcore_binary_channel_send_rejects_oversize_before_companion_call():

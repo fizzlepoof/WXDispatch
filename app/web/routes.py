@@ -22,7 +22,9 @@ import httpx
 from .. import __version__
 from ..alert_map import AreaAlertCache, RegionalZoneGeometryCache, configured_counties
 from ..config import (MAX_PAYLOAD_BYTES, POLL_INTERVAL_MIN, IPAWS_EVENT_TYPES,
-                      GITHUB_LATEST_RELEASE_API, GITHUB_RELEASES_URL)
+                      GITHUB_LATEST_RELEASE_API, GITHUB_RELEASES_URL,
+                      meshcore_flood_scope_override,
+                      normalise_meshcore_flood_scope)
 from ..serial_discovery import list_all_ports
 
 
@@ -40,6 +42,13 @@ _CHANNEL_ADMIN_AUTH = HTTPBasic(auto_error=False)
 _ALERT_MAP_CACHE = RegionalZoneGeometryCache()
 _AREA_ALERT_CACHE = AreaAlertCache()
 _DASHBOARD_ALERT_TIMEOUT_SECONDS = 2.0
+
+
+def _normalise_meshcore_flood_scope(value: str) -> str:
+    try:
+        return normalise_meshcore_flood_scope(value or "")
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid MeshCore flood scope")
 
 
 def _new_csrf_token() -> str:
@@ -874,6 +883,7 @@ async def check_updates(request: Request):
 async def settings_page(request: Request):
     db = _db(request)
     s = db.all_settings()
+    deployment_scope = meshcore_flood_scope_override()
     zones = [z.strip() for z in (s.get("zones", "") or "").split(",") if z.strip()]
     counties_sel = [z for z in zones if len(z) > 2 and z[2] == "C"]
     extra = [z for z in zones if not (len(z) > 2 and z[2] == "C")]
@@ -909,6 +919,11 @@ async def settings_page(request: Request):
         mc_port=s.get("meshcore_port", "") or "",
         mc_host=s.get("meshcore_host", "") or "",
         mc_channel=int(s.get("meshcore_channel", 0) or 0),
+        mc_flood_scope=(deployment_scope if deployment_scope is not None
+                        else (s.get("meshcore_flood_scope", "") or "")),
+        mc_require_flood_scope=(True if deployment_scope is not None
+                                else bool(s.get("meshcore_require_flood_scope", False))),
+        mc_flood_scope_locked=deployment_scope is not None,
         mc_max_channels=max(2, int(s.get("meshcore_max_channels", 8) or 8)),
         meshwx_v4_enabled=bool(s.get("meshwx_v4_enabled", False)),
         meshwx_v4_channel=int(s.get("meshwx_v4_channel", 0) or 0),
@@ -947,6 +962,8 @@ async def save_settings(
     meshcore_port: str = Form(""),
     meshcore_host: str = Form(""),
     meshcore_channel: int = Form(0),
+    meshcore_flood_scope: str = Form(""),
+    meshcore_require_flood_scope: str = Form(""),
     meshwx_v4_enabled: str = Form(""),
     meshwx_v4_channel: int = Form(0),
     meshtastic_test_channel: int = Form(1),
@@ -957,6 +974,9 @@ async def save_settings(
             return max(1, min(5, int(v)))
         except (TypeError, ValueError):
             return 2
+    deployment_scope = meshcore_flood_scope_override()
+    flood_scope = (deployment_scope if deployment_scope is not None
+                   else _normalise_meshcore_flood_scope(meshcore_flood_scope))
     db, tx, poller = _db(request), _tx(request), _poller(request)
     interval = max(POLL_INTERVAL_MIN, int(poll_interval))
 
@@ -984,6 +1004,7 @@ async def save_settings(
     db.set_setting("meshcore_port", meshcore_port.strip())
     db.set_setting("meshcore_host", meshcore_host.strip())
     db.set_setting("meshcore_channel", int(meshcore_channel))
+
     meshwx_channel = max(0, min(255, int(meshwx_v4_channel)))
     try:
         meshcore_max_channels = int(db.get_setting("meshcore_max_channels", 8) or 8)
@@ -996,7 +1017,12 @@ async def save_settings(
     db.set_setting("meshcore_test_channel", int(meshcore_test_channel))
 
     # Rebuild transports from the new settings and (re)connect the enabled ones.
-    await tx.reconfigure()
+    scope_settings = {
+        "meshcore_flood_scope": flood_scope,
+        "meshcore_require_flood_scope": (True if deployment_scope is not None
+                                         else bool(meshcore_require_flood_scope)),
+    }
+    await tx.reconfigure(scope_settings)
 
     poller.poke()
     db.add_event("INFO", "settings saved")

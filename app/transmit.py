@@ -18,7 +18,14 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from .config import BURST_GAP_SECONDS, REPEAT_GAP_SECONDS, QUEUE_MAX, MAX_PAYLOAD_BYTES
+from .config import (
+    BURST_GAP_SECONDS,
+    REPEAT_GAP_SECONDS,
+    QUEUE_MAX,
+    MAX_PAYLOAD_BYTES,
+    meshcore_flood_scope_override,
+    normalise_meshcore_flood_scope,
+)
 
 
 class TxUnsent(Exception):
@@ -250,9 +257,35 @@ class MeshCoreTransmitter(Transmitter):
     # app's previous eight-slot behavior rather than probing arbitrary indexes.
     FALLBACK_MAX_CHANNELS = 8
 
-    def __init__(self, conn: str, port: str = "", host: str = "", baud: int = 115200):
+    def __init__(self, conn: str, port: str = "", host: str = "", baud: int = 115200,
+                 flood_scope: str = "", require_flood_scope: bool = False):
         self.conn, self.port, self.host, self.baud = conn, port, host, baud
+        self.flood_scope = normalise_meshcore_flood_scope(flood_scope)
+        self.require_flood_scope = bool(require_flood_scope)
         self._mc = None
+
+    async def _apply_flood_scope(self) -> None:
+        """Select the configured scope immediately before a channel send.
+
+        The companion scope is mutable state. TransmitManager serializes radio
+        operations under its shared lock, so setting it here cannot leak across
+        concurrent WXDispatch sends. A failed scope command fails closed rather
+        than transmitting over an unscoped flood.
+        """
+        if not self.flood_scope:
+            if self.require_flood_scope:
+                raise TxUnsent(
+                    "scope", "flood scope is required; refusing unscoped send"
+                )
+            return
+        if self._mc is None:
+            raise RuntimeError("not connected")
+        from meshcore import EventType
+        result = await self._mc.commands.set_flood_scope(self.flood_scope)
+        if getattr(result, "type", None) != EventType.OK:
+            raise TxUnsent(
+                "scope", "companion rejected flood scope; refusing unscoped send"
+            )
 
     async def _device_info(self) -> dict:
         if self._mc is None:
@@ -384,6 +417,7 @@ class MeshCoreTransmitter(Transmitter):
         if self._mc is None:
             raise RuntimeError("not connected")
         from meshcore import EventType
+        await self._apply_flood_scope()
         res = await self._mc.commands.send_chan_msg(channel, text)
         result_type = getattr(res, "type", None)
         if result_type != EventType.OK:
@@ -404,6 +438,7 @@ class MeshCoreTransmitter(Transmitter):
         if not payload or len(payload) > 163:
             raise TxUnsent("too_large", "binary channel data must contain 1-163 bytes")
         from meshcore import EventType
+        await self._apply_flood_scope()
         data = b"\x3e" + bytes([channel, 0xFF]) + (0xFFFF).to_bytes(2, "little") + payload
         with _suppress_meshcore_dependency_logging():
             result = await self._mc.commands.send(data, [EventType.OK, EventType.ERROR])
@@ -526,12 +561,29 @@ def _build_transports(db) -> dict:
         repeat=rep("meshtastic_repeat"), test_channel=num("meshtastic_test_channel", 1),
     )
     mc_conn = g("meshcore_conn", "serial") or "serial"
+    deployment_scope = meshcore_flood_scope_override()
+    meshcore_scope = (
+        deployment_scope
+        if deployment_scope is not None
+        else (g("meshcore_flood_scope", "") or "")
+    )
+    meshcore_scope_required = (
+        True
+        if deployment_scope is not None
+        else bool(g("meshcore_require_flood_scope", False))
+    )
     mc = Transport(
         name="meshcore", label="MeshCore",
         enabled=bool(g("meshcore_enabled", False)),
         conn=mc_conn, channel=num("meshcore_channel", 0),
         target=(g("meshcore_host", "") if mc_conn == "tcp" else g("meshcore_port", "")) or "",
-        make=lambda: MeshCoreTransmitter(mc_conn, g("meshcore_port", "") or "", g("meshcore_host", "") or ""),
+        make=lambda: MeshCoreTransmitter(
+            mc_conn,
+            g("meshcore_port", "") or "",
+            g("meshcore_host", "") or "",
+            flood_scope=meshcore_scope,
+            require_flood_scope=meshcore_scope_required,
+        ),
         repeat=rep("meshcore_repeat"), test_channel=num("meshcore_test_channel", 1),
     )
     return {"meshtastic": mt, "meshcore": mc}
@@ -574,10 +626,14 @@ class TransmitManager:
             if t.tx:
                 await t.tx.close()
 
-    async def reconfigure(self) -> None:
+    async def reconfigure(self, settings: dict | None = None) -> None:
         """Rebuild transports from settings and connect the enabled ones.
-        Called at startup and after a settings save."""
+        Called at startup and after a settings save. Settings supplied here are
+        committed under the transmit lock so no send can cross the activation
+        boundary with the previous transport configuration."""
         async with self._lock:
+            for key, value in (settings or {}).items():
+                self._db.set_setting(key, value)
             for t in self._transports.values():
                 if t.tx:
                     try:
@@ -586,8 +642,12 @@ class TransmitManager:
                         pass
             self._transports = _build_transports(self._db)
             targets = [t for t in self._transports.values() if t.enabled and t.target]
-        for t in targets:
-            await self._ensure(t)
+            # Connection establishment is part of the configuration boundary.
+            # Keeping it under the shared lock prevents sends (or a newer
+            # reconfiguration) from racing this transport or opening an obsolete
+            # transport after it has already been replaced.
+            for t in targets:
+                await self._ensure(t)
 
     # ---- status / compat ------------------------------------------------
     @property
