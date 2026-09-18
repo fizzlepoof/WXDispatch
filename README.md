@@ -1,6 +1,10 @@
 <h1 align="center">WXDispatch</h1>
 
 <p align="center">
+  <a href="https://github.com/fizzlepoof/WXDispatch/actions/workflows/ci.yml"><img src="https://github.com/fizzlepoof/WXDispatch/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+</p>
+
+<p align="center">
   <b>Off-grid weather warnings.</b> WXDispatch watches the National Weather Service and
   broadcasts the alerts that matter over your <a href="https://meshtastic.org/">Meshtastic</a>
   and/or <a href="https://meshcore.co.uk/">MeshCore</a> radios, so your mesh keeps getting
@@ -12,7 +16,7 @@
 </p>
 
 <p align="center">
-  <b>Status: v2.4.3.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
+  <b>Status: v2.4.4.</b> Verified on a Heltec V3 for Meshtastic and MeshCore, over USB and over the network.
 </p>
 
 ---
