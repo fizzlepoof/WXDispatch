@@ -51,6 +51,20 @@ mesh has no way to *know* a warning was issued. WXDispatch bridges that gap: it 
 worth sending, formats it to fit a LoRa packet, and transmits it to everyone on your
 channel. Built after living through Hurricane Helene's comms blackout.
 
+## Screenshots
+
+### Operations dashboard
+
+![WXDispatch operations dashboard showing radio health, routing status, and active alerts](docs/images/wxdispatch-dashboard.png)
+
+### Local alert map
+
+![WXDispatch local alert map showing watched counties, regional alerts, and optional NEXRAD radar](docs/images/wxdispatch-local-alert-map.png)
+
+### NOAA alert history
+
+![WXDispatch NOAA alert history showing routed warning messages and delivery acceptance](docs/images/wxdispatch-noaa-history.png)
+
 ## Features
 
 - **Dual radio, side by side.** Run Meshtastic, MeshCore, or **both at once**: every
