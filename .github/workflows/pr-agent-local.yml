@@ -1,0 +1,98 @@
+name: Local PR-Agent advisory review
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+# Requires repository opt-in and a direct local model endpoint.
+# No PR checkout: the stock Action reads the diff through the GitHub API.
+permissions:
+  contents: read
+
+concurrency:
+  group: local-pr-agent-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    if: >-
+      github.repository == 'fizzlepoof/WXDispatch' &&
+      vars.PR_AGENT_PILOT_ENABLED == 'true' &&
+      vars.PR_AGENT_LOCAL_API_BASE != '' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft
+    runs-on: [self-hosted, linux, x64, pr-agent-local]
+    timeout-minutes: 30
+    env:
+      UV_PYTHON_DOWNLOADS: never
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Check out only the pinned upstream tool (not PR code)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: The-PR-Agent/pr-agent
+          ref: e673a02076ce09a4726c3d0c3cc85780e59ca52b # v0.50.0
+          path: pr-agent-tool
+          persist-credentials: false
+      - name: Prepare an isolated, locked tool environment
+        working-directory: pr-agent-tool
+        shell: bash
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/pr-agent-uv-cache
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/pr-agent-venv
+        run: |
+          set -euo pipefail
+          "$HOME/.local/bin/uv" tool run --from uv==0.13.5 uv sync \
+            --frozen --no-dev --extra github --python /usr/bin/python3
+      - name: Review with local Qwen (advisory only)
+        working-directory: pr-agent-tool
+        shell: bash
+        run: '"$UV_PROJECT_ENVIRONMENT/bin/python" -m pr_agent.servers.github_action_runner'
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/pr-agent-venv
+          TMPDIR: ${{ runner.temp }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The private router currently accepts a non-secret compatibility key.
+          OPENAI_KEY: local-no-key-required
+          OPENAI.API_BASE: ${{ vars.PR_AGENT_LOCAL_API_BASE }}
+          CONFIG.MODEL: openai/vllm-sr/qwen3.8-flash-next-iq3_s
+          CONFIG.FALLBACK_MODELS: '[]'
+          CONFIG.CUSTOM_MODEL_MAX_TOKENS: '163840'
+          CONFIG.MAX_MODEL_TOKENS: '32000'
+          CONFIG.MAX_OUTPUT_TOKENS: '8192'
+          CONFIG.AI_TIMEOUT: '600'
+          CONFIG.NUM_RETRIES: '0'
+          CONFIG.USE_REPO_SETTINGS_FILE: 'false'
+          CONFIG.USE_GLOBAL_SETTINGS_FILE: 'false'
+          CONFIG.USE_GROUP_SETTINGS_FILE: 'false'
+          CONFIG.ENABLE_AUTO_APPROVAL: 'false'
+          CONFIG.PUBLISH_OUTPUT_PROGRESS: 'false'
+          CONFIG.OUTPUT_RUN_DETAILS: 'true'
+          CONFIG.REACTION_ON_START: ''
+          LITELLM.EXTRA_BODY: '{"chat_template_kwargs":{"enable_thinking":true}}'
+          GITHUB.IGNORE_BOT_PR: 'false'
+          GITHUB_ACTION_CONFIG.PR_ACTIONS: '["opened","reopened","ready_for_review","synchronize"]'
+          GITHUB_ACTION_CONFIG.AUTO_REVIEW: 'true'
+          GITHUB_ACTION_CONFIG.AUTO_DESCRIBE: 'false'
+          GITHUB_ACTION_CONFIG.AUTO_IMPROVE: 'false'
+          GITHUB_ACTION_CONFIG.FAIL_ON_TOOL_ERRORS: 'true'
+          GITHUB_ACTION_CONFIG.HANDLE_PUSH_TRIGGER: 'false'
+          PR_REVIEWER.REVIEW_HEADING: Local PR-Agent advisory review
+          PR_REVIEWER.EXTRA_INSTRUCTIONS: |
+            Prioritize actionable correctness, security and data-integrity defects introduced or materially worsened by this diff.
+            - For each finding, identify the concrete execution path, realistic triggering condition, violated requirement and resulting impact. Do not turn a hypothetical violation of an upstream schema into a normal-operation failure without evidence that this contract must be handled.
+            - Inspect available callers, existing defaults, deployment documentation and surrounding code before asserting a failure. Account for existing validation, cleanup and publication safeguards. Distinguish newly broken behavior from pre-existing or explicitly documented deployment prerequisites.
+            - Do not invent vendor-specific protocol syntax, mandatory configuration fields or runtime defaults. If the available evidence does not establish the claimed incompatibility, do not present that speculation as a defect.
+            - Emit one finding per distinct root cause; consolidate repeated manifestations and point to the most relevant changed lines.
+            - Do not fill a finding quota. Preserve independently grounded serious findings even when the overall change is small. An empty findings list is appropriate when no concrete defect is established, not a declaration that the PR is correct.
+          PR_REVIEWER.PERSISTENT_COMMENT: 'true'
+          PR_REVIEWER.FINAL_UPDATE_MESSAGE: 'false'
+          PR_REVIEWER.ENABLE_REVIEW_LABELS_SECURITY: 'false'
+          PR_REVIEWER.ENABLE_REVIEW_LABELS_EFFORT: 'false'
+          PR_REVIEWER.ENABLE_REVIEW_COVERAGE_FOOTER: 'true'
+          PR_REVIEWER.NUM_MAX_FINDINGS: '10'
+          PR_REVIEWER.REQUIRE_FAILURE_MODES: 'true'
+          PR_REVIEWER.ENABLE_LARGE_PR_CHUNKING: 'true'
+          PR_REVIEWER.MAX_NUMBER_OF_CALLS: '3'
